@@ -142,6 +142,8 @@ video{ display:block; width:100%; height:auto; max-height:62vh; }
 
 .transcript{ flex: 1 1 auto;                          /* fill remaining height */
   overflow-y: auto;                         /* own scrollbar here */
+  scrollbar-color: var(--accent) var(--handle-bg);
+  scrollbar-width: thin;
   padding:12px; 
   display:flex; 
   flex-direction:column; 
