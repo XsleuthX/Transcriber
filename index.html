@@ -32,28 +32,31 @@
         <select id="fpsSelect">
           <option value="24">24</option>
           <option value="25">25</option>
-          <option value="30" selected>30</option>
+          <option value="30"selected>30</option>
           <option value="50">50</option>
           <option value="60">60</option>
         </select>
       </div>
       <button id="btnExport" class="btn btn-gold">Export SRT</button>
+      <button id="btnExportVtt" class="btn btn-gold">Export VTT</button>
       <a class="btn btn-outline" href="README.html" target="_blank" rel="noopener">Guide</a>
     </nav>
   </header>
 
   <main class="wrap">
     <aside class="panel video-panel">
+      </div>
       <div class="frame">
         <div class="frame-inner">
           <video id="player" controls playsinline></video>
+          <div id="captionOverlay" class="caption-overlay"></div>
         </div>
       </div>
 
       <div class="tcbar">
         <div class="tc-label">Timecode</div>
         <div id="tcPanel" class="tc">00:00:00:00</div>
-        <div class="tc-hint">@ <span id="tcFps">30</span> fps</div>
+        <div class="tc-hint">@ <span id="tcFps">25</span> fps</div>
       </div>
 
       <div id="status" class="status">Ready</div>
@@ -68,7 +71,7 @@
         <div class="legend">
           <span class="dot active-dot"></span> playing
           <span class="sep">•</span>
-          <span class="kbd">Click timestamp</span> to seek
+          <span class="kbd">Click timestamp to seek</span> 
         </div>
       </header>
 
@@ -93,5 +96,6 @@
   </template>
 
   <script type="module" src="app.js"></script>
+  <input id="srtInput" type="file" accept=".srt,.vtt,text/vtt,text/plain">
 </body>
 </html>
