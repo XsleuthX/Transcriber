@@ -19,11 +19,11 @@
       </div>
     </div>
     <nav class="toolbar">
-      <label class="btn btn-ghost">
+      <label class="btn btn-gold">
         <input type="file" id="fileInput" accept="video/*,audio/*" hidden>
         <span>Import Video</span>
       </label>
-      <label class="btn btn-ghost">
+      <label class="btn btn-gold">
         <input type="file" id="srtInput" accept=".srt,.vtt" hidden>
         <span>Import SRT/VTT</span>
       </label>
@@ -37,8 +37,8 @@
           <option value="60">60</option>
         </select>
       </div>
-      <button id="btnExport" class="btn btn-gold">Export SRT</button>
-      <button id="btnExportVtt" class="btn btn-gold">Export VTT</button>
+      <button id="btnExport" class="btn btn-outline">Export SRT</button>
+      <button id="btnExportVtt" class="btn btn-outline">Export VTT</button>
       <a class="btn btn-outline" href="README.html" target="_blank" rel="noopener">Guide</a>
     </nav>
   </header>
@@ -62,6 +62,13 @@
       <div id="status" class="status">Ready</div>
       <div class="smallprint">
         Tip: Generate captions with your platform script (whisper‑cli) and import here.
+        <hr>
+        Tip: Drag caption to reorder sequence.
+        <hr>
+        Tip: Click/Drag to edit caption timecode, keyboard ← arrow → enabled for frame by frame tunning.
+        <hr>
+        Tip: Set video frame before SRT/VTT import.
+        <hr>
       </div>
     </aside>
 
@@ -96,6 +103,5 @@
   </template>
 
   <script type="module" src="app.js"></script>
-  <input id="srtInput" type="file" accept=".srt,.vtt,text/vtt,text/plain">
 </body>
 </html>
