@@ -16,6 +16,7 @@ const overlayEl   = document.getElementById('captionOverlay');
 
 /* State */
 let entries = []; // [{ start, end, text, orig }]
+let initialEntries = []; // the pristine cues as imported (never mutated)
 let fps = 30;
 
 /* Drag & scroll suppression */
@@ -125,6 +126,16 @@ function clearDropClasses(){
   [...transcriptEl.children].forEach(el => el.classList.remove('drop-before','drop-after','dragging'));
 }
 
+function flushEditsFromDOM() {
+  [...transcriptEl.children].forEach(row => {
+    const i = +row.dataset.index;
+    const t = row.querySelector('.text');
+    if (entries[i] && t) {
+      entries[i].text = t.textContent;  // capture latest edits
+    }
+  });
+}
+
 /* ---------- Render transcript ---------- */
 function renderTranscript(){
   const st = transcriptEl.scrollTop; // keep scroll
@@ -152,6 +163,8 @@ function renderTranscript(){
     selectRow(i, { scroll: false });
     });
     textEl.addEventListener('blur', clearManualSelection);
+    textEl.addEventListener('input',           ev => { entries[i].text = ev.currentTarget.textContent; });
+    textEl.addEventListener('compositionend',  ev => { entries[i].text = ev.currentTarget.textContent; });
 
     // context menu
     node.addEventListener('contextmenu', (ev) => {
@@ -208,6 +221,7 @@ function renderTranscript(){
 }
 
 function performReorder(srcIndex, targetIndex, pos){
+  flushEditsFromDOM();               // sync edits
   if (srcIndex < 0 || targetIndex < 0 || srcIndex === targetIndex) { clearDropClasses(); return; }
   const st = transcriptEl.scrollTop;
   const item = entries.splice(srcIndex, 1)[0];
@@ -405,28 +419,49 @@ fileInput.addEventListener('change', () => {
   statusEl.textContent = `Loaded: ${f.name} (${Math.round(f.size/1024/1024)} MB)`;
   entries = []; renderTranscript();
 });
+
+
 srtInput.addEventListener('change', async () => {
   const f = srtInput.files[0];
   if (!f) return;
+
   const text = await f.text();
-  let parsed;
   const name = (f.name || '').toLowerCase();
-  if (name.endsWith('.vtt')) parsed = parseVTT(text);
-  else if (name.endsWith('.srt')) parsed = parseSRT(text);
-  else parsed = parseAuto(text);
-  entries = parsed.map(e => ({...e, orig:{ start:e.start, end:e.end, text:e.text }}));
+  const parsed =
+    name.endsWith('.vtt') ? parseVTT(text) :
+    name.endsWith('.srt') ? parseSRT(text) :
+    parseAuto(text);
+
+  // IMPORTANT: use (e, idx) — not just (e)
+  initialEntries = parsed.map((e, idx) => ({
+    start: e.start,
+    end:   e.end,
+    text:  e.text,
+    index: idx,         // stable pointer to the original cue
+  }));
+
+  entries = parsed.map((e, idx) => ({
+    start: e.start,
+    end:   e.end,
+    text:  e.text,
+    orig:  { start: e.start, end: e.end, text: e.text }, // snapshot
+    origIndex: idx,                                      // pointer into initialEntries
+  }));
+
   renderTranscript();
   statusEl.textContent = `Imported ${entries.length} captions from ${f.name}`;
 });
 
 /* ---------- Exports ---------- */
 btnExport.addEventListener('click', () => {
+  flushEditsFromDOM(); 
   if (!entries.length) { alert('No transcript to export.'); return; }
   const srt = toSRT(entries);
   download(suggestBaseName() + '.srt', srt, 'text/plain;charset=utf-8');
 });
 if (btnExportVtt){
   btnExportVtt.addEventListener('click', () => {
+    flushEditsFromDOM(); 
     const vtt = buildVTT(entries);
     download(suggestBaseName() + '.vtt', vtt, 'text/vtt');
   });
@@ -470,6 +505,7 @@ function ensureContextMenu(){
   const btnAdd    = document.createElement('button'); btnAdd.textContent    = 'Add Caption';
 
   btnDelete.addEventListener('click', () => {
+    flushEditsFromDOM(); 
     if (ctxIndex>=0){
       const st = transcriptEl.scrollTop;
       entries.splice(ctxIndex,1);
@@ -479,13 +515,37 @@ function ensureContextMenu(){
       selectRow(Math.min(ctxIndex, entries.length-1), {scroll:false});
     }
   });
+
   btnReset.addEventListener('click', () => {
-    if (ctxIndex>=0 && entries[ctxIndex]?.orig){
-      const o = entries[ctxIndex].orig;
-      entries[ctxIndex].start = o.start; entries[ctxIndex].end = o.end; entries[ctxIndex].text = o.text;
-      hideContextMenu(); updateRowUI(ctxIndex); selectRow(ctxIndex,{scroll:false});
+    if (ctxIndex < 0) return;
+    flushEditsFromDOM?.();
+  
+    const row = entries[ctxIndex];
+    if (!row) return;
+  
+    if (row.origIndex != null && initialEntries[row.origIndex]) {
+      const o = initialEntries[row.origIndex];
+      row.start = o.start;
+      row.end   = o.end;
+      row.text  = o.text;
+    } else if (row.orig) {
+      row.start = row.orig.start;
+      row.end   = row.orig.end;
+      row.text  = row.orig.text;
+    } else {
+      // brand-new caption: pick your policy
+      row.text = '';
     }
+  
+    updateRowUI(ctxIndex);
+    selectRow(ctxIndex, { scroll: false });
+  
+    const active = getActiveIndex(player.currentTime);
+    if (active === ctxIndex) updateOverlay(active);
+  
+    hideContextMenu();
   });
+
   btnAdd.addEventListener('click', () => {
     if (ctxIndex < 0) return;
   
@@ -501,7 +561,12 @@ function ensureContextMenu(){
       if (end < start) end = start + (1 / f);
     }
   
-    const newCap = { start, end, text: '', orig: { start, end, text: '' } };
+    const newCap = {start, end, text: '',
+    orig: { start, end, text: '' }, // optional snapshot
+    origIndex: null,                // <-- new cue, no origin in import
+    isNew: true
+  };
+
     const st = transcriptEl.scrollTop;
     const newIndex = ctxIndex + 1;
   
@@ -599,7 +664,6 @@ function ensureStyleControls(){
         </select>
       </label>
       <label>Color <input id="capColor" class="ui-dark-color" type="color" value="#ffffff"></label>
-      <span class="muted">(affects the on-video overlay)</span>
     `;
     const tcContainer = tcPanel?.parentElement || player.parentElement || document.body;
     tcContainer.insertAdjacentElement('afterend', bar);
