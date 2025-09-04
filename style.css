@@ -59,7 +59,11 @@ body{
 }
 .btn:hover{ transform: translateY(-1px); box-shadow: var(--shadow); }
 .btn-ghost{ background:linear-gradient(180deg, #0e1115, #0b0d11); height: 35px;}
-.btn-outline{ background:transparent; height: 35px;}
+.btn-outline{  
+  border:1px solid var(--gold-2);
+  background: var(--bg-elev);
+  color:var(--gold-2); font-weight:600; height: 35px;
+}
 .btn-gold{
   border:none;
   background: linear-gradient(180deg, var(--gold-2), var(--gold));
