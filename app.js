@@ -1,3 +1,4 @@
+
 import { parseSRT, parseVTT, parseAuto, toSRT } from './srt.js';
 
 /* DOM */
@@ -17,7 +18,7 @@ const overlayEl   = document.getElementById('captionOverlay');
 /* State */
 let entries = []; // [{ start, end, text, orig }]
 let initialEntries = []; // the pristine cues as imported (never mutated)
-let fps = 30;
+let fps = 25;
 
 /* Drag & scroll suppression */
 let dragSrcIndex = -1;
@@ -54,6 +55,57 @@ const pad2 = n => String(n).padStart(2,'0');
 const getFPS = () => parseInt(fpsSelect?.value ?? 30, 10) || 30;
 const secToFrames = (s, f=getFPS()) => Math.max(0, Math.round(s * f));
 const framesToSec = (fr, f=getFPS()) => Math.max(0, fr / f);
+
+/* ---------- Selection & caret helpers (for contentEditable) ---------- */
+function getCaretOffset(el){
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0) return 0;
+  const range = sel.getRangeAt(0);
+  const preRange = range.cloneRange();
+  preRange.selectNodeContents(el);
+  preRange.setEnd(range.endContainer, range.endOffset);
+  return preRange.toString().length;
+}
+function setCaretOffset(el, offset){
+  const range = document.createRange();
+  const sel = window.getSelection();
+  let remaining = offset;
+  // Walk down text nodes to place caret
+  function walk(node){
+    if (node.nodeType === Node.TEXT_NODE){
+      const len = node.textContent.length;
+      if (remaining <= len){
+        range.setStart(node, Math.max(0, remaining));
+        range.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        return true;
+      } else {
+        remaining -= len;
+      }
+    } else {
+      for (let i=0;i<node.childNodes.length;i++){
+        if (walk(node.childNodes[i])) return true;
+      }
+    }
+    return false;
+  }
+  walk(el);
+}
+function insertPlainTextAtCursor(text){
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0) return;
+  const range = sel.getRangeAt(0);
+  range.deleteContents();
+  const node = document.createTextNode(text);
+  range.insertNode(node);
+  // move caret after inserted node
+  const newRange = document.createRange();
+  newRange.setStart(node, node.textContent.length);
+  newRange.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(newRange);
+}
 
 /* ---------- Timecode helpers ---------- */
 function formatTimecodeFromSeconds(sec, f=getFPS()){
@@ -95,9 +147,9 @@ function buildVTT(items) {
     const z = (n, w=2) => String(n).padStart(w, '0');
     return `${z(hh)}:${z(mm)}:${z(ss)}.${String(mmm).padStart(3,'0')}`;
   };
-  let out = 'WEBVTT\n\n';
+  let out = 'WEBVTT\\n\\n';
   items.forEach((seg) => {
-    out += `${toVttTime(seg.start)} --> ${toVttTime(seg.end)}\n${(seg.text||'').trim()}\n\n`;
+    out += `${toVttTime(seg.start)} --> ${toVttTime(seg.end)}\\n${(seg.text||'').trim()}\\n\\n`;
   });
   return out;
 }
@@ -156,11 +208,90 @@ function renderTranscript(){
 
     const textEl = node.querySelector('.text');
     textEl.textContent = e.text || '';
-
-    // When you click into text, highlight row and hold selection; clear on blur
+    textEl.setAttribute('contenteditable', 'true'); // ensure editable
+    // Seek and select on click; also highlight on focus
+    textEl.addEventListener('mousedown', () => {
+      const startT = Math.max(0, entries[i].start) + 0.001;
+      try { player.currentTime = startT; } catch {}
+      holdManualSelection(i, 2000);
+      selectRow(i, { scroll: false });
+    });
     textEl.addEventListener('focus', () => {
-    holdManualSelection(i, 60_000);   // hold while editing
-    selectRow(i, { scroll: false });
+      holdManualSelection(i, 60000);
+      selectRow(i, { scroll: false });
+    });
+
+
+    // --- 1) Force paste as plain text (strip source formatting) ---
+    textEl.addEventListener('paste', (ev) => {
+      ev.preventDefault();
+      const clip = ev.clipboardData || window.clipboardData;
+      const txt = clip ? (clip.getData('text/plain') || '') : '';
+      insertPlainTextAtCursor(txt);
+      // update model
+      entries[i].text = textEl.textContent;
+    });
+
+
+    // --- 2) Enter to split caption at caret ---
+    textEl.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' && !ev.shiftKey){
+        ev.preventDefault();
+        const caret = getCaretOffset(textEl);
+        const full  = textEl.textContent || '';
+        const left  = full.slice(0, caret).trimEnd();
+        const right = full.slice(caret).trimStart();
+
+        // Snapshot original timing
+        const origStart = entries[i].start;
+        const origEnd   = entries[i].end;
+        const hasNext   = (i + 1) < entries.length;
+        const nextIn    = hasNext ? entries[i+1].start : origEnd;
+
+        const f = getFPS();
+        const startF = secToFrames(origStart, f);
+        const endF   = secToFrames(origEnd,   f);
+        let midF = Math.floor((startF + endF) / 2);
+
+        // Ensure valid durations (at least 1 frame if possible)
+        if (midF <= startF) midF = startF + 1;
+
+        const midSec = framesToSec(midF, f);
+
+        // Apply text updates
+        entries[i].text = left;
+
+        // 1) Rule: keep IN; set OUT to midpoint
+        entries[i].end = midSec;
+
+        // 2) New cue: IN = midpoint; OUT = next line's IN (or original OUT if no next)
+        let newStart = midSec;
+        let newEnd   = hasNext ? nextIn : origEnd;
+        if (newEnd <= newStart) newEnd = newStart + (1 / f);
+
+        const newCap = {
+          start: newStart,
+          end:   newEnd,
+          text:  right,
+          orig:  { start: newStart, end: newEnd, text: right },
+          origIndex: null,
+          isNew: true
+        };
+
+        const st = transcriptEl.scrollTop;
+        entries.splice(i+1, 0, newCap);
+        renderTranscript();
+        transcriptEl.scrollTop = st;
+
+        suppressAutoScrollUntil = nowMs() + 800;
+        holdManualSelection(i+1, 2000);
+        selectRow(i+1, { scroll:false });
+        const newTxt = transcriptEl.querySelector(`[data-index="${i+1}"] .text`);
+        if (newTxt){
+          focusNoScroll(newTxt);
+          setCaretOffset(newTxt, 0);
+        }
+      }
     });
     textEl.addEventListener('blur', clearManualSelection);
     textEl.addEventListener('input',           ev => { entries[i].text = ev.currentTarget.textContent; });
