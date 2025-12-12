@@ -871,6 +871,95 @@ function buildSearchRegex(q, isCase, whole){
   return { re: new RegExp(pattern, flags) };
 }
 
+/* ---------- Copy with timecodes ---------- */
+function getRowIndexFromNode(node){
+  if (!node) return -1;
+  let el = (node.nodeType === Node.ELEMENT_NODE) ? node : node.parentElement;
+  while (el && el !== document){
+    if (el.hasAttribute && el.hasAttribute('data-index')){
+      return parseInt(el.getAttribute('data-index'), 10);
+    }
+    el = el.parentElement;
+  }
+  return -1;
+}
+
+function buildCopyPayload(sel){
+  const f = getFPS();
+  if (!sel || sel.rangeCount === 0) return '';
+
+  const range = sel.getRangeAt(0);
+
+  // If selection is outside transcript, bail
+  const startIdx = getRowIndexFromNode(range.startContainer);
+  const endIdx   = getRowIndexFromNode(range.endContainer);
+  if (startIdx < 0 || endIdx < 0) return '';
+
+  const [from, to] = startIdx <= endIdx ? [startIdx, endIdx] : [endIdx, startIdx];
+
+  const blocks = [];
+  for (let i = from; i <= to; i++){
+    const e = entries[i];
+    if (!e) continue;
+
+    // Determine selected text portion for edge rows
+    let txt = e.text || '';
+
+    // If selection starts/ends in this row's .text, slice appropriately
+    const rowEl = transcriptEl.querySelector(`[data-index="${i}"]`);
+    const textEl = rowEl ? rowEl.querySelector('.text') : null;
+
+    if (textEl && (i === startIdx || i === endIdx)){
+      // Map selection offsets relative to this element
+      const full = textEl.textContent || '';
+
+      const computeOffset = (container, offset) => {
+        const r = document.createRange();
+        r.setStart(textEl, 0);
+        r.setEnd(container, offset);
+        return r.toString().length;
+      };
+
+      if (i === startIdx){
+        const startOff = computeOffset(range.startContainer, range.startOffset);
+        txt = full.slice(startOff);
+      }
+      if (i === endIdx){
+        const endOff = computeOffset(range.endContainer, range.endOffset);
+        if (i === startIdx){
+          // selection entirely within one row
+          const startOff = computeOffset(range.startContainer, range.startOffset);
+          txt = full.slice(startOff, endOff);
+        } else {
+          txt = full.slice(0, endOff);
+        }
+      }
+    }
+
+    const inTc  = formatTimecodeFromSeconds(e.start, f);
+    const outTc = formatTimecodeFromSeconds(e.end,   f);
+    blocks.push(`${inTc} --> ${outTc}\n${txt}`.trimEnd());
+  }
+
+  return blocks.join('\\n\\n');
+}
+
+transcriptEl.addEventListener('copy', (ev) => {
+  const sel = window.getSelection();
+  const payload = buildCopyPayload(sel);
+  if (payload){
+    ev.preventDefault();
+    if (ev.clipboardData){
+      ev.clipboardData.setData('text/plain', payload);
+      // Also set HTML with <pre> to preserve line breaks in Google Docs
+      const html = `<pre>${payload.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>`;
+      ev.clipboardData.setData('text/html', html);
+    } else if (window.clipboardData){
+      window.clipboardData.setData('Text', payload);
+    }
+  }
+});
+
 /* ---------- Init ---------- */
 function init(){
   tcFps.textContent = fps;
