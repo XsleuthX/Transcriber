@@ -585,15 +585,17 @@ srtInput.addEventListener('change', async () => {
 
 /* ---------- Exports ---------- */
 btnExport.addEventListener('click', () => {
-  flushEditsFromDOM(); 
+  const items = useSourceTc ? entries.map(e => ({...e, start: e.start + sourceTcSec, end: e.end + sourceTcSec})) : entries;
+flushEditsFromDOM(); 
   if (!entries.length) { alert('No transcript to export.'); return; }
-  const srt = toSRT(useSourceTc ? entries.map(e => ({...e, start: e.start + sourceTcSec, end: e.end + sourceTcSec})) : entries);
+  const srt = toSRT(items);
   download(suggestBaseName() + '.srt', srt, 'text/plain;charset=utf-8');
 });
 if (btnExportVtt){
   btnExportVtt.addEventListener('click', () => {
-    flushEditsFromDOM(); 
-    const vtt = buildVTT(useSourceTc ? entries.map(e => ({...e, start: e.start + sourceTcSec, end: e.end + sourceTcSec})) : entries);
+  const items = useSourceTc ? entries.map(e => ({...e, start: e.start + sourceTcSec, end: e.end + sourceTcSec})) : entries;
+flushEditsFromDOM(); 
+    const vtt = buildVTT(items);
     download(suggestBaseName() + '.vtt', vtt, 'text/vtt');
   });
 }
@@ -872,31 +874,38 @@ function buildSearchRegex(q, isCase, whole){
 }
 
 /* ---------- Timecode Origin (Source TC) ---------- */
-let sourceTcSec = 0;         // seconds equivalent of source HH:MM:SS:FF
-let useSourceTc = false;     // toggle for source-based display/export
+let sourceTcSec = 0;         // seconds offset corresponding to HH:MM:SS:FF source timecode
+let useSourceTc = false;     // if true, display/export timecodes with source offset
 
+// Format with origin: adds source offset to a base time in seconds for display/export
 const fmtTC = (sec, f=getFPS()) => formatTimecodeFromSeconds(Math.max(0, sec + (useSourceTc ? sourceTcSec : 0)), f);
 
+// Parse from displayed TC back to base seconds
 function parseDisplayedTcToSeconds(text, f=getFPS()){
-  const base = parseTimecodeToSeconds(text, f);
-  if (base == null) return null;
-  return Math.max(0, base - (useSourceTc ? sourceTcSec : 0));
+  const s = parseTimecodeToSeconds(text, f);
+  if (s == null) return null;
+  return Math.max(0, s - (useSourceTc ? sourceTcSec : 0));
 }
 
+// UI: input + toggle to control source TC origin
 function ensureTcOriginBar(){
   if (document.getElementById('tcOriginBar')) return;
+
   const bar = document.createElement('div');
   bar.id = 'tcOriginBar';
-  bar.className = 'stylebar'; // reuse dark bar styling if present
+  bar.style.cssText = 'margin-top:8px;padding:8px;display:flex;gap:12px;align-items:center;background:#0e1116;border:1px solid rgba(255,255,255,.06);border-radius:10px;color:#fff;font-size:13px';
+
   bar.innerHTML = `
-    <label>Source TC (HH:MM:SS:FF)
-      <input id="srcTcInput" class="ui-dark-input" type="text" placeholder="10:51:54:18" style="width:140px">
+    <label style="display:flex;align-items:center;gap:6px">
+      Source TC (HH:MM:SS:FF):
+      <input id="srcTcInput" type="text" placeholder="10:51:54:18" style="width:140px;background:#131720;color:#fff;border:1px solid #2a2f3a;border-radius:6px;padding:6px 8px;height:32px">
     </label>
     <label style="display:flex;align-items:center;gap:6px">
       <input id="useSrcTcToggle" type="checkbox">
       Use source timecode for display/export
     </label>
   `;
+
   const anchor = tcPanel?.parentElement || player?.parentElement || document.body;
   anchor.insertAdjacentElement('afterend', bar);
 
@@ -904,8 +913,9 @@ function ensureTcOriginBar(){
   const chk = bar.querySelector('#useSrcTcToggle');
 
   const apply = () => {
-    const s = parseTimecodeToSeconds(inp.value, getFPS());
-    sourceTcSec = (s != null) ? s : 0;
+    const f = getFPS();
+    const s = parseTimecodeToSeconds(inp.value, f);
+    sourceTcSec = s != null ? s : 0;
     useSourceTc = chk.checked;
     renderTranscript();
   };
@@ -914,6 +924,86 @@ function ensureTcOriginBar(){
   inp.addEventListener('blur', apply);
   chk.addEventListener('change', apply);
 }
+
+/* ---------- Copy with timecodes (respects source toggle) ---------- */
+function getRowIndexFromNode(node){
+  if (!node) return -1;
+  let el = (node.nodeType === Node.ELEMENT_NODE) ? node : node.parentElement;
+  while (el && el !== document){
+    if (el.hasAttribute && el.hasAttribute('data-index')){
+      return parseInt(el.getAttribute('data-index'), 10);
+    }
+    el = el.parentElement;
+  }
+  return -1;
+}
+
+function buildCopyPayload(sel){
+  const f = getFPS();
+  if (!sel || sel.rangeCount === 0) return '';
+
+  const range = sel.getRangeAt(0);
+
+  const startIdx = getRowIndexFromNode(range.startContainer);
+  const endIdx   = getRowIndexFromNode(range.endContainer);
+  if (startIdx < 0 || endIdx < 0) return '';
+
+  const [from, to] = startIdx <= endIdx ? [startIdx, endIdx] : [endIdx, startIdx];
+
+  const blocks = [];
+  for (let i = from; i <= to; i++){
+    const e = entries[i];
+    if (!e) continue;
+    let txt = e.text || '';
+
+    const rowEl = transcriptEl.querySelector(`[data-index="${i}"]`);
+    const textEl = rowEl ? rowEl.querySelector('.text') : null;
+
+    if (textEl && (i === startIdx || i === endIdx)){
+      const full = textEl.textContent || '';
+      const computeOffset = (container, offset) => {
+        const r = document.createRange();
+        r.setStart(textEl, 0);
+        r.setEnd(container, offset);
+        return r.toString().length;
+      };
+      if (i === startIdx){
+        const startOff = computeOffset(range.startContainer, range.startOffset);
+        txt = full.slice(startOff);
+      }
+      if (i === endIdx){
+        const endOff = computeOffset(range.endContainer, range.endOffset);
+        if (i === startIdx){
+          const startOff = computeOffset(range.startContainer, range.startOffset);
+          txt = full.slice(startOff, endOff);
+        } else {
+          txt = full.slice(0, endOff);
+        }
+      }
+    }
+
+    const inTc  = fmtTC(e.start, f);
+    const outTc = fmtTC(e.end,   f);
+    blocks.push(`${inTc} --> ${outTc}\n${txt}`.trimEnd());
+  }
+
+  return blocks.join('\\n\\n');
+}
+
+transcriptEl.addEventListener('copy', (ev) => {
+  const sel = window.getSelection();
+  const payload = buildCopyPayload(sel);
+  if (payload){
+    ev.preventDefault();
+    if (ev.clipboardData){
+      ev.clipboardData.setData('text/plain', payload);
+      const html = `<pre>${payload.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>`;
+      ev.clipboardData.setData('text/html', html);
+    } else if (window.clipboardData){
+      window.clipboardData.setData('Text', payload);
+    }
+  }
+});
 
 /* ---------- Init ---------- */
 function init(){
