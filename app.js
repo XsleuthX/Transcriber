@@ -349,6 +349,10 @@ function renderTranscript(){
   });
 
   transcriptEl.scrollTop = st; // restore
+
+  // Keep TXT single box in sync
+  if (isTxtMode) { try { updateTxtBox(); } catch {} }
+
 }
 
 function performReorder(srcIndex, targetIndex, pos){
@@ -512,6 +516,8 @@ player.addEventListener('timeupdate', () => {
   // Keep overlay in sync
   const activeIdx = getActiveIndex(t);
   updateOverlay(activeIdx);
+
+  if (isTxtMode) return;
 
   // If user just added/focused a row, keep that row highlighted & do not auto-scroll
   if (manualSelectIndex >= 0 && now < manualHoldUntil) {
@@ -987,6 +993,115 @@ transcriptEl.addEventListener('copy', (ev) => {
 /* ---------- View Mode: SRT / TXT ---------- */
 let isTxtMode = false;
 
+let txtBoxEl = null;
+let txtCueMap = []; // [{ i, start, end }] offsets in txtBoxEl.value for each cue text chunk
+const TXT_SEP = "\n"; // join cues without blank lines
+
+function ensureTxtBox(){
+  if (txtBoxEl && document.body.contains(txtBoxEl)) return txtBoxEl;
+  txtBoxEl = document.getElementById('txtBigBox');
+  if (txtBoxEl) return txtBoxEl;
+
+  txtBoxEl = document.createElement('textarea');
+  txtBoxEl.id = 'txtBigBox';
+  txtBoxEl.spellcheck = false;
+  txtBoxEl.readOnly = true;
+  txtBoxEl.style.cssText = `
+    width:100%;
+    min-height:360px;
+    resize:vertical;
+    background:#0e1116;
+    color:#e9edf1;
+    border:1px solid rgba(255,255,255,.08);
+    border-radius:12px;
+    padding:12px;
+    font-size:14px;
+    line-height:1.5;
+    box-sizing:border-box;
+    margin-top:8px;
+    white-space:pre;
+  `;
+
+  // Place it where the transcript is, for easy copy/select
+  const parent = transcriptEl?.parentElement || document.body;
+  parent.insertBefore(txtBoxEl, transcriptEl);
+
+  // Copy from this big TXT box should still include IN/OUT timecodes
+  txtBoxEl.addEventListener('copy', (ev) => {
+    const payload = buildCopyPayloadFromTxtBox();
+    if (!payload) return;
+    ev.preventDefault();
+    if (ev.clipboardData){
+      ev.clipboardData.setData('text/plain', payload);
+      const html = `<pre>${payload.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>`;
+      ev.clipboardData.setData('text/html', html);
+    } else if (window.clipboardData){
+      window.clipboardData.setData('Text', payload);
+    }
+  });
+
+  return txtBoxEl;
+}
+
+function buildTxtValueAndMap(){
+  const chunks = [];
+  txtCueMap = [];
+  let pos = 0;
+
+  for (let i=0; i<entries.length; i++){
+    const t = String(entries[i]?.text ?? '').replace(/\r\n/g, "\n").trimEnd();
+    const start = pos;
+    const end = start + t.length;
+    txtCueMap.push({ i, start, end });
+    chunks.push(t);
+    pos = end + TXT_SEP.length;
+  }
+  return chunks.join(TXT_SEP);
+}
+
+function updateTxtBox(){
+  if (!isTxtMode) return;
+  const box = ensureTxtBox();
+  box.value = buildTxtValueAndMap();
+}
+
+function buildCopyPayloadFromTxtBox(){
+  const box = ensureTxtBox();
+  const a0 = box.selectionStart ?? 0;
+  const b0 = box.selectionEnd ?? 0;
+  const selStart = Math.min(a0, b0);
+  const selEnd   = Math.max(a0, b0);
+  if (selEnd <= selStart) return '';
+
+  // Determine which cues overlap selection
+  const hits = [];
+  for (const m of txtCueMap){
+    const a = Math.max(selStart, m.start);
+    const b = Math.min(selEnd, m.end);
+    if (b > a) hits.push({ ...m, a, b });
+  }
+  if (!hits.length) return '';
+
+  const f = getFPS();
+  const blocks = [];
+  for (let k=0; k<hits.length; k++){
+    const h = hits[k];
+    const e = entries[h.i];
+    if (!e) continue;
+
+    const full = String(e.text ?? '').replace(/\r\n/g, "\n").trimEnd();
+    const relA = Math.max(0, h.a - h.start);
+    const relB = Math.max(relA, h.b - h.start);
+    const txt = full.slice(relA, relB);
+
+    const inTc  = (typeof fmtTC === 'function') ? fmtTC(e.start, f) : formatTimecodeFromSeconds(e.start, f);
+    const outTc = (typeof fmtTC === 'function') ? fmtTC(e.end,   f) : formatTimecodeFromSeconds(e.end,   f);
+    blocks.push(`${inTc} --> ${outTc}\n${txt}`.trimEnd());
+  }
+  return blocks.join("\n\n");
+}
+
+
 function ensureViewModeBar(){
   if (document.getElementById('viewModeBar')) return;
 
@@ -1033,6 +1148,18 @@ function ensureViewModeBar(){
   const apply = () => {
     btnSrt.classList.toggle('active', !isTxtMode);
     btnTxt.classList.toggle('active',  isTxtMode);
+
+    if (isTxtMode){
+      ensureTxtBox();
+      updateTxtBox();
+      if (transcriptEl) transcriptEl.style.display = 'none';
+      if (txtBoxEl) txtBoxEl.style.display = 'block';
+    } else {
+      if (transcriptEl) transcriptEl.style.display = '';
+      if (txtBoxEl) txtBoxEl.style.display = 'none';
+    }
+
+    // still keep class for any CSS that relies on it
     transcriptEl.classList.toggle('txt-mode', isTxtMode);
   };
 
