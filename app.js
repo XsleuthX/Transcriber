@@ -308,7 +308,7 @@ function renderTranscript(){
     meta.innerHTML = `
       <span class="timepill in-pill"  id="in-pill-${i}"  title="Drag or type; ←/→ to nudge">${fmtTC(e.start, f)}</span>
       <span class="arrow">→</span>
-      <span class="timepill out-pill" id="out-pill-${i}" title="Drag or type; ←/→ to nudge">${fmtTC(e.end, f)}</span>
+      <span class="timepill out-pill" id="out-pill-${i}" title="Drag or type; ←/→ to nudge">${formatTimecodeFromSeconds(e.end, f)}</span>
       <span class="len-pill" id="len-pill-${i}" title="Duration (SS:FF)">${formatDurationSF(Math.max(e.end - e.start, 0), f)}</span>
     `;
     node.appendChild(meta);
@@ -587,14 +587,13 @@ srtInput.addEventListener('change', async () => {
 btnExport.addEventListener('click', () => {
   flushEditsFromDOM(); 
   if (!entries.length) { alert('No transcript to export.'); return; }
-  const srt = toSRT(entries);
+  const srt = toSRT(useSourceTc ? entries.map(e => ({...e, start: e.start + sourceTcSec, end: e.end + sourceTcSec})) : entries);
   download(suggestBaseName() + '.srt', srt, 'text/plain;charset=utf-8');
 });
 if (btnExportVtt){
   btnExportVtt.addEventListener('click', () => {
-  flushEditsFromDOM(); 
-    const items = useSourceTc ? entries.map(e => ({...e, start: e.start + sourceTcSec, end: e.end + sourceTcSec})) : entries;
-  const vtt = buildVTT(items);
+    flushEditsFromDOM(); 
+    const vtt = buildVTT(useSourceTc ? entries.map(e => ({...e, start: e.start + sourceTcSec, end: e.end + sourceTcSec})) : entries);
     download(suggestBaseName() + '.vtt', vtt, 'text/vtt');
   });
 }
@@ -873,38 +872,31 @@ function buildSearchRegex(q, isCase, whole){
 }
 
 /* ---------- Timecode Origin (Source TC) ---------- */
-let sourceTcSec = 0;         // seconds offset corresponding to HH:MM:SS:FF source timecode
-let useSourceTc = false;     // if true, display/export timecodes with source offset
+let sourceTcSec = 0;         // seconds equivalent of source HH:MM:SS:FF
+let useSourceTc = false;     // toggle for source-based display/export
 
-// Format with origin: adds source offset to a base time in seconds for display/export
 const fmtTC = (sec, f=getFPS()) => formatTimecodeFromSeconds(Math.max(0, sec + (useSourceTc ? sourceTcSec : 0)), f);
 
-// Parse from displayed TC back to base seconds
 function parseDisplayedTcToSeconds(text, f=getFPS()){
-  const s = parseTimecodeToSeconds(text, f);
-  if (s == null) return null;
-  return Math.max(0, s - (useSourceTc ? sourceTcSec : 0));
+  const base = parseTimecodeToSeconds(text, f);
+  if (base == null) return null;
+  return Math.max(0, base - (useSourceTc ? sourceTcSec : 0));
 }
 
-// UI: input + toggle to control source TC origin
 function ensureTcOriginBar(){
   if (document.getElementById('tcOriginBar')) return;
-
   const bar = document.createElement('div');
   bar.id = 'tcOriginBar';
-  bar.style.cssText = 'margin-top:8px;padding:8px;display:flex;gap:12px;align-items:center;background:#0e1116;border:1px solid rgba(255,255,255,.06);border-radius:10px;color:#fff;font-size:13px';
-
+  bar.className = 'stylebar'; // reuse dark bar styling if present
   bar.innerHTML = `
-    <label style="display:flex;align-items:center;gap:6px">
-      Source TC (HH:MM:SS:FF):
-      <input id="srcTcInput" type="text" placeholder="10:51:54:18" style="width:140px;background:#131720;color:#fff;border:1px solid #2a2f3a;border-radius:6px;padding:6px 8px;height:32px">
+    <label>Source TC (HH:MM:SS:FF)
+      <input id="srcTcInput" class="ui-dark-input" type="text" placeholder="10:51:54:18" style="width:140px">
     </label>
     <label style="display:flex;align-items:center;gap:6px">
       <input id="useSrcTcToggle" type="checkbox">
       Use source timecode for display/export
     </label>
   `;
-
   const anchor = tcPanel?.parentElement || player?.parentElement || document.body;
   anchor.insertAdjacentElement('afterend', bar);
 
@@ -912,11 +904,9 @@ function ensureTcOriginBar(){
   const chk = bar.querySelector('#useSrcTcToggle');
 
   const apply = () => {
-    const f = getFPS();
-    const s = parseTimecodeToSeconds(inp.value, f);
-    sourceTcSec = s != null ? s : 0;
+    const s = parseTimecodeToSeconds(inp.value, getFPS());
+    sourceTcSec = (s != null) ? s : 0;
     useSourceTc = chk.checked;
-    // Repaint UI
     renderTranscript();
   };
 
