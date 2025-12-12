@@ -350,7 +350,6 @@ function renderTranscript(){
 
   transcriptEl.scrollTop = st; // restore
 
-  // Keep TXT single box in sync
   if (isTxtMode) { try { updateTxtBox(); } catch {} }
 
 }
@@ -488,8 +487,8 @@ function updateRowUI(index){
   const inPill  = row.querySelector(`#in-pill-${index}`);
   const outPill = row.querySelector(`#out-pill-${index}`);
   const lenPill = row.querySelector(`#len-pill-${index}`);
-  if (inPill)  inPill.textContent  = fmtTC(e.start, f);
-  if (outPill) outPill.textContent = fmtTC(e.end,   f);
+  if (inPill)  inPill.textContent  = formatTimecodeFromSeconds(e.start, f);
+  if (outPill) outPill.textContent = formatTimecodeFromSeconds(e.end,   f);
   if (lenPill) lenPill.textContent = formatDurationSF(Math.max(e.end - e.start, 0), f);
 }
 
@@ -591,16 +590,16 @@ srtInput.addEventListener('change', async () => {
 
 /* ---------- Exports ---------- */
 btnExport.addEventListener('click', () => {
-  flushEditsFromDOM();
-  const items = useSourceTc ? entries.map(e => ({...e, start: e.start + sourceTcSec, end: e.end + sourceTcSec})) : entries; 
+  const items = useSourceTc ? entries.map(e => ({...e, start: e.start + sourceTcSec, end: e.end + sourceTcSec})) : entries;
+flushEditsFromDOM(); 
   if (!entries.length) { alert('No transcript to export.'); return; }
   const srt = toSRT(items);
   download(suggestBaseName() + '.srt', srt, 'text/plain;charset=utf-8');
 });
 if (btnExportVtt){
   btnExportVtt.addEventListener('click', () => {
-    flushEditsFromDOM();
-    const items = useSourceTc ? entries.map(e => ({...e, start: e.start + sourceTcSec, end: e.end + sourceTcSec})) : entries; 
+  const items = useSourceTc ? entries.map(e => ({...e, start: e.start + sourceTcSec, end: e.end + sourceTcSec})) : entries;
+flushEditsFromDOM(); 
     const vtt = buildVTT(items);
     download(suggestBaseName() + '.vtt', vtt, 'text/vtt');
   });
@@ -990,12 +989,9 @@ transcriptEl.addEventListener('copy', (ev) => {
 });
 
 
-/* ---------- View Mode: SRT / TXT ---------- */
+/* ---------- View Mode: SRT / TXT (Single Text Area) ---------- */
 let isTxtMode = false;
-
 let txtBoxEl = null;
-let txtCueMap = []; // [{ i, start, end }] offsets in txtBoxEl.value for each cue text chunk
-const TXT_SEP = "\n"; // join cues without blank lines
 
 function ensureTxtBox(){
   if (txtBoxEl && document.body.contains(txtBoxEl)) return txtBoxEl;
@@ -1008,7 +1004,7 @@ function ensureTxtBox(){
   txtBoxEl.readOnly = true;
   txtBoxEl.style.cssText = `
     width:100%;
-    min-height:360px;
+    min-height:420px;
     resize:vertical;
     background:#0e1116;
     color:#e9edf1;
@@ -1018,94 +1014,89 @@ function ensureTxtBox(){
     font-size:14px;
     line-height:1.5;
     box-sizing:border-box;
-    margin-top:8px;
+    margin-top:10px;
     white-space:pre;
   `;
 
-  // Place it where the transcript is, for easy copy/select
   const parent = transcriptEl?.parentElement || document.body;
   parent.insertBefore(txtBoxEl, transcriptEl);
 
-  // Copy from this big TXT box should still include IN/OUT timecodes
-  txtBoxEl.addEventListener('copy', (ev) => {
-    const payload = buildCopyPayloadFromTxtBox();
-    if (!payload) return;
-    ev.preventDefault();
-    if (ev.clipboardData){
-      ev.clipboardData.setData('text/plain', payload);
-      const html = `<pre>${payload.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>`;
-      ev.clipboardData.setData('text/html', html);
-    } else if (window.clipboardData){
-      window.clipboardData.setData('Text', payload);
-    }
-  });
-
   return txtBoxEl;
-}
-
-function buildTxtValueAndMap(){
-  const chunks = [];
-  txtCueMap = [];
-  let pos = 0;
-
-  for (let i=0; i<entries.length; i++){
-    const t = String(entries[i]?.text ?? '').replace(/\r\n/g, "\n").trimEnd();
-    const start = pos;
-    const end = start + t.length;
-    txtCueMap.push({ i, start, end });
-    chunks.push(t);
-    pos = end + TXT_SEP.length;
-  }
-  return chunks.join(TXT_SEP);
 }
 
 function updateTxtBox(){
   if (!isTxtMode) return;
   const box = ensureTxtBox();
-  box.value = buildTxtValueAndMap();
+  // Join cues line-by-line (no blank lines), preserve any internal line breaks
+  const text = entries.map(e => String(e?.text ?? '').replace(/\r\n/g, "\n").trimEnd()).join("\n");
+  box.value = text;
 }
 
-function buildCopyPayloadFromTxtBox(){
+/** Build timecoded payload for the currently selected range in TXT box.
+ *  If nothing is selected, copy all cues with timecodes.
+ */
+function buildTimecodedPayloadFromTxtSelection(){
+  const f = getFPS();
   const box = ensureTxtBox();
   const a0 = box.selectionStart ?? 0;
   const b0 = box.selectionEnd ?? 0;
   const selStart = Math.min(a0, b0);
   const selEnd   = Math.max(a0, b0);
-  if (selEnd <= selStart) return '';
 
-  // Determine which cues overlap selection
-  const hits = [];
-  for (const m of txtCueMap){
-    const a = Math.max(selStart, m.start);
-    const b = Math.min(selEnd, m.end);
-    if (b > a) hits.push({ ...m, a, b });
-  }
-  if (!hits.length) return '';
-
-  const f = getFPS();
+  // Map offsets to cues by reconstructing the same joined string offsets
   const blocks = [];
-  for (let k=0; k<hits.length; k++){
-    const h = hits[k];
-    const e = entries[h.i];
-    if (!e) continue;
+  let pos = 0;
 
-    const full = String(e.text ?? '').replace(/\r\n/g, "\n").trimEnd();
-    const relA = Math.max(0, h.a - h.start);
-    const relB = Math.max(relA, h.b - h.start);
-    const txt = full.slice(relA, relB);
+  const hasSelection = selEnd > selStart;
 
-    const inTc  = (typeof fmtTC === 'function') ? fmtTC(e.start, f) : formatTimecodeFromSeconds(e.start, f);
-    const outTc = (typeof fmtTC === 'function') ? fmtTC(e.end,   f) : formatTimecodeFromSeconds(e.end,   f);
-    blocks.push(`${inTc} --> ${outTc}\n${txt}`.trimEnd());
+  for (let i=0; i<entries.length; i++){
+    const e = entries[i];
+    const t = String(e?.text ?? '').replace(/\r\n/g, "\n").trimEnd();
+    const start = pos;
+    const end   = start + t.length;
+
+    const include = !hasSelection || (Math.min(selEnd, end) > Math.max(selStart, start));
+    if (include){
+      let sliceText = t;
+      if (hasSelection){
+        const a = Math.max(selStart, start);
+        const b = Math.min(selEnd, end);
+        const relA = Math.max(0, a - start);
+        const relB = Math.max(relA, b - start);
+        sliceText = t.slice(relA, relB);
+      }
+      const inTc  = (typeof fmtTC === 'function') ? fmtTC(e.start, f) : formatTimecodeFromSeconds(e.start, f);
+      const outTc = (typeof fmtTC === 'function') ? fmtTC(e.end,   f) : formatTimecodeFromSeconds(e.end,   f);
+      blocks.push(`${inTc} --> ${outTc}\n${sliceText}`.trimEnd());
+    }
+
+    pos = end + 1; // + "\n"
   }
+
   return blocks.join("\n\n");
 }
 
+async function copyTextToClipboard(payload){
+  if (!payload) return;
+  try {
+    await navigator.clipboard.writeText(payload);
+  } catch {
+    // Fallback for older browsers
+    const ta = document.createElement('textarea');
+    ta.value = payload;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    ta.remove();
+  }
+}
 
 function ensureViewModeBar(){
   if (document.getElementById('viewModeBar')) return;
 
-  // Style once
+  // Styles once
   if (!document.getElementById('viewModeStyle')){
     const st = document.createElement('style');
     st.id = 'viewModeStyle';
@@ -1113,37 +1104,39 @@ function ensureViewModeBar(){
       .seg-toggle { display:inline-flex; background:#0e1116; border:1px solid rgba(255,255,255,.08); border-radius:10px; overflow:hidden }
       .seg-toggle .seg{ background:transparent; color:#e9edf1; border:0; padding:8px 12px; cursor:pointer; font-size:13px }
       .seg-toggle .seg.active{ background:#1a2230 }
-      /* TXT mode: hide any timecode UI, but keep DOM for copy/export */
-      #transcript.txt-mode .stamp,
-      #transcript.txt-mode .caption-meta { display:none !important; }
-      #transcript.txt-mode .line { padding:4px 0 !important; border:none !important; margin:0 !important; }
+      .txt-tools{ display:flex; gap:8px; align-items:center; }
+      .txt-tools .btn{ height:34px; }
     `;
     document.head.appendChild(st);
   }
 
   const bar = document.createElement('div');
   bar.id = 'viewModeBar';
-  bar.style.cssText = 'margin-top:8px;padding:6px;display:flex;gap:8px;align-items:center;';
-
+  bar.style.cssText = 'margin-top:8px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;';
   bar.innerHTML = `
     <div class="seg-toggle" role="group" aria-label="View Mode">
       <button id="btnModeSrt" class="seg active" type="button">SRT</button>
       <button id="btnModeTxt" class="seg" type="button">TXT</button>
     </div>
+    <div class="txt-tools" id="txtTools" style="display:none">
+      <button class="btn btn-outline" id="btnCopyTc" type="button">Copy with timecodes</button>
+      <span style="opacity:.7;font-size:12px">Select text in the big box to copy a range (or copy all)</span>
+    </div>
   `;
 
-  // Place it right under the Source TC bar if present, otherwise under the video style bar, otherwise under tc panel
-  const anchor =
+  // Insert under the Source TC bar if present, otherwise under the timecode panel container
+  const anchorEl =
     document.getElementById('tcOriginBar') ||
-    document.getElementById('videoStyleBar') ||
     tcPanel?.parentElement ||
     player?.parentElement ||
     document.body;
 
-  anchor.insertAdjacentElement('afterend', bar);
+  anchorEl.insertAdjacentElement('afterend', bar);
 
   const btnSrt = bar.querySelector('#btnModeSrt');
   const btnTxt = bar.querySelector('#btnModeTxt');
+  const txtTools = bar.querySelector('#txtTools');
+  const btnCopyTc = bar.querySelector('#btnCopyTc');
 
   const apply = () => {
     btnSrt.classList.toggle('active', !isTxtMode);
@@ -1154,17 +1147,23 @@ function ensureViewModeBar(){
       updateTxtBox();
       if (transcriptEl) transcriptEl.style.display = 'none';
       if (txtBoxEl) txtBoxEl.style.display = 'block';
+      if (txtTools) txtTools.style.display = 'flex';
     } else {
       if (transcriptEl) transcriptEl.style.display = '';
       if (txtBoxEl) txtBoxEl.style.display = 'none';
+      if (txtTools) txtTools.style.display = 'none';
     }
-
-    // still keep class for any CSS that relies on it
-    transcriptEl.classList.toggle('txt-mode', isTxtMode);
   };
 
   btnSrt.addEventListener('click', () => { isTxtMode = false; apply(); });
   btnTxt.addEventListener('click', () => { isTxtMode = true;  apply(); });
+
+  btnCopyTc.addEventListener('click', async () => {
+    // Ensure latest edits are captured before building payload
+    try { flushEditsFromDOM(); } catch {}
+    const payload = buildTimecodedPayloadFromTxtSelection();
+    await copyTextToClipboard(payload);
+  });
 
   apply();
 }
