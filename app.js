@@ -203,7 +203,7 @@ function renderTranscript(){
     node.draggable = true;
 
     const header = node.querySelector('.stamp');
-    header.textContent = `[${fmtTC(e.start, f)}]`;
+    header.textContent = `[${formatTimecodeFromSeconds(e.start, f)}]`;
     header.onclick = () => { player.currentTime = Math.max(0, e.start) + 0.001; player.play(); };
 
     const textEl = node.querySelector('.text');
@@ -306,9 +306,9 @@ function renderTranscript(){
     const meta = document.createElement('div');
     meta.className = 'caption-meta';
     meta.innerHTML = `
-      <span class="timepill in-pill"  id="in-pill-${i}"  title="Drag or type; ←/→ to nudge">${fmtTC(e.start, f)}</span>
+      <span class="timepill in-pill"  id="in-pill-${i}"  title="Drag or type; ←/→ to nudge">${formatTimecodeFromSeconds(e.start, f)}</span>
       <span class="arrow">→</span>
-      <span class="timepill out-pill" id="out-pill-${i}" title="Drag or type; ←/→ to nudge">${fmtTC(e.end, f)}</span>
+      <span class="timepill out-pill" id="out-pill-${i}" title="Drag or type; ←/→ to nudge">${formatTimecodeFromSeconds(e.end, f)}</span>
       <span class="len-pill" id="len-pill-${i}" title="Duration (SS:FF)">${formatDurationSF(Math.max(e.end - e.start, 0), f)}</span>
     `;
     node.appendChild(meta);
@@ -398,7 +398,7 @@ function enablePillEditing(pillEl, index, isIn, durFrames){
 
   pillEl.addEventListener('blur', () => {
     const f = getFPS();
-    const parsed = parseDisplayedTcToSeconds(pillEl.textContent, f);
+    const parsed = parseTimecodeToSeconds(pillEl.textContent, f);
     if (parsed == null){ pillEl.textContent = original; return; }
     const frames = secToFrames(parsed, f);
     commitFrames(index, isIn, frames, durFrames);
@@ -480,7 +480,7 @@ function updateRowUI(index){
   if (!row) return;
   const e = entries[index];
   const header = row.querySelector('.stamp');
-  if (header) header.textContent = `[${fmtTC(e.start, f)}]`;
+  if (header) header.textContent = `[${formatTimecodeFromSeconds(e.start, f)}]`;
   const inPill  = row.querySelector(`#in-pill-${index}`);
   const outPill = row.querySelector(`#out-pill-${index}`);
   const lenPill = row.querySelector(`#len-pill-${index}`);
@@ -536,7 +536,7 @@ player.addEventListener('timeupdate', () => {
 /* ---------- Live timecode ---------- */
 function updateLiveTimecode(){
   const t = player?.currentTime || 0;
-  tcPanel.textContent = fmtTC(t, getFPS());
+  tcPanel.textContent = formatTimecodeFromSeconds(t, getFPS());
   const p = tcPanel.parentElement;
   if (p && !p.classList.contains('tc-centered')) p.classList.add('tc-centered');
   requestAnimationFrame(updateLiveTimecode);
@@ -585,17 +585,15 @@ srtInput.addEventListener('change', async () => {
 
 /* ---------- Exports ---------- */
 btnExport.addEventListener('click', () => {
-  const items = useSourceTc ? entries.map(e => ({...e, start: e.start + sourceTcSec, end: e.end + sourceTcSec})) : entries;
-flushEditsFromDOM(); 
+  flushEditsFromDOM(); 
   if (!entries.length) { alert('No transcript to export.'); return; }
-  const srt = toSRT(items);
+  const srt = toSRT(entries);
   download(suggestBaseName() + '.srt', srt, 'text/plain;charset=utf-8');
 });
 if (btnExportVtt){
   btnExportVtt.addEventListener('click', () => {
-  const items = useSourceTc ? entries.map(e => ({...e, start: e.start + sourceTcSec, end: e.end + sourceTcSec})) : entries;
-flushEditsFromDOM(); 
-    const vtt = buildVTT(items);
+    flushEditsFromDOM(); 
+    const vtt = buildVTT(entries);
     download(suggestBaseName() + '.vtt', vtt, 'text/vtt');
   });
 }
@@ -873,115 +871,55 @@ function buildSearchRegex(q, isCase, whole){
   return { re: new RegExp(pattern, flags) };
 }
 
-/* ---------- Timecode Origin (Source TC) ---------- */
-let sourceTcSec = 0;
-let useSourceTc = false;
-const fmtTC = (sec, f=getFPS()) => formatTimecodeFromSeconds(Math.max(0, sec + (useSourceTc ? sourceTcSec : 0)), f);
-function parseDisplayedTcToSeconds(text, f=getFPS()){
-  const s = parseTimecodeToSeconds(text, f);
-  if (s == null) return null;
-  return Math.max(0, s - (useSourceTc ? sourceTcSec : 0));
-}
-function ensureTcOriginBar(){
-  if (document.getElementById('tcOriginBar')) return;
+/* ---------- View Mode: SRT / TXT ---------- */
+let isTxtMode = false;
+
+function ensureViewModeBar(){
+  if (document.getElementById('viewModeBar')) return;
+
   const bar = document.createElement('div');
-  bar.id = 'tcOriginBar';
-  bar.style.cssText = 'margin-top:8px;padding:8px;display:flex;gap:12px;align-items:center;background:#0e1116;border:1px solid rgba(255,255,255,.06);border-radius:10px;color:#fff;font-size:13px';
+  bar.id = 'viewModeBar';
+  bar.style.cssText = 'margin-top:8px;padding:6px;display:flex;gap:8px;align-items:center;';
+
   bar.innerHTML = `
-    <label style="display:flex;align-items:center;gap:6px">
-      Source TC (HH:MM:SS:FF):
-      <input id="srcTcInput" type="text" placeholder="10:51:54:18" style="width:140px;background:#131720;color:#fff;border:1px solid #2a2f3a;border-radius:6px;padding:6px 8px;height:32px">
-    </label>
-    <label style="display:flex;align-items:center;gap:6px">
-      <input id="useSrcTcToggle" type="checkbox">
-      Use source timecode for display/export
-    </label>
+    <div class="seg-toggle" role="group" aria-label="View Mode">
+      <button id="btnModeSrt" class="seg active" type="button">SRT</button>
+      <button id="btnModeTxt" class="seg" type="button">TXT</button>
+    </div>
   `;
-  const anchor = tcPanel?.parentElement || player?.parentElement || document.body;
+
+  // Insert near the existing bars
+  const anchor = document.getElementById('tcOriginBar')?.parentElement || tcPanel?.parentElement || player?.parentElement || document.body;
   anchor.insertAdjacentElement('afterend', bar);
-  const inp = bar.querySelector('#srcTcInput');
-  const chk = bar.querySelector('#useSrcTcToggle');
+
+  // Minimal styles
+  const st = document.createElement('style');
+  st.textContent = `
+    .seg-toggle { display:inline-flex; background:#0e1116; border:1px solid rgba(255,255,255,.08); border-radius:10px; overflow:hidden }
+    .seg-toggle .seg{ background:transparent; color:#e9edf1; border:0; padding:8px 12px; cursor:pointer; font-size:13px }
+    .seg-toggle .seg.active{ background:#1a2230 }
+    /* TXT mode hides timecode UI */
+    #transcript.txt-mode .stamp,
+    #transcript.txt-mode .caption-meta { display:none !important; }
+    #transcript.txt-mode .line { padding:4px 0; border:none; margin:0; }
+  `;
+  document.head.appendChild(st);
+
+  const btnSrt = bar.querySelector('#btnModeSrt');
+  const btnTxt = bar.querySelector('#btnModeTxt');
+
   const apply = () => {
-    const f = getFPS();
-    const s = parseTimecodeToSeconds(inp.value, f);
-    sourceTcSec = s != null ? s : 0;
-    useSourceTc = chk.checked;
+    btnSrt.classList.toggle('active', !isTxtMode);
+    btnTxt.classList.toggle('active',  isTxtMode);
+    transcriptEl.classList.toggle('txt-mode', isTxtMode);
     renderTranscript();
   };
-  inp.addEventListener('change', apply);
-  inp.addEventListener('blur', apply);
-  chk.addEventListener('change', apply);
-}
 
-/* ---------- Copy with timecodes ---------- */
-function getRowIndexFromNode(node){
-  if (!node) return -1;
-  let el = (node.nodeType === Node.ELEMENT_NODE) ? node : node.parentElement;
-  while (el && el !== document){
-    if (el.hasAttribute && el.hasAttribute('data-index')){
-      return parseInt(el.getAttribute('data-index'), 10);
-    }
-    el = el.parentElement;
-  }
-  return -1;
+  btnSrt.addEventListener('click', () => { isTxtMode = false; apply(); });
+  btnTxt.addEventListener('click', () => { isTxtMode = true;  apply(); });
+
+  apply();
 }
-function buildCopyPayload(sel){
-  const f = getFPS();
-  if (!sel || sel.rangeCount === 0) return '';
-  const range = sel.getRangeAt(0);
-  const startIdx = getRowIndexFromNode(range.startContainer);
-  const endIdx   = getRowIndexFromNode(range.endContainer);
-  if (startIdx < 0 || endIdx < 0) return '';
-  const [from, to] = startIdx <= endIdx ? [startIdx, endIdx] : [endIdx, startIdx];
-  const blocks = [];
-  for (let i = from; i <= to; i++){
-    const e = entries[i];
-    if (!e) continue;
-    let txt = e.text || '';
-    const rowEl = transcriptEl.querySelector(`[data-index="${i}"]`);
-    const textEl = rowEl ? rowEl.querySelector('.text') : null;
-    if (textEl && (i === startIdx || i === endIdx)){
-      const full = textEl.textContent || '';
-      const computeOffset = (container, offset) => {
-        const r = document.createRange();
-        r.setStart(textEl, 0);
-        r.setEnd(container, offset);
-        return r.toString().length;
-      };
-      if (i === startIdx){
-        const startOff = computeOffset(range.startContainer, range.startOffset);
-        txt = full.slice(startOff);
-      }
-      if (i === endIdx){
-        const endOff = computeOffset(range.endContainer, range.endOffset);
-        if (i === startIdx){
-          const startOff = computeOffset(range.startContainer, range.startOffset);
-          txt = full.slice(startOff, endOff);
-        } else {
-          txt = full.slice(0, endOff);
-        }
-      }
-    }
-    const inTc  = (typeof fmtTC==='function' ? fmtTC(e.start, f) : formatTimecodeFromSeconds(e.start, f));
-    const outTc = (typeof fmtTC==='function' ? fmtTC(e.end, f)   : formatTimecodeFromSeconds(e.end,   f));
-    blocks.push(`${inTc} --> ${outTc}\n${txt}`.trimEnd());
-  }
-  return blocks.join('\\n\\n');
-}
-transcriptEl.addEventListener('copy', (ev) => {
-  const sel = window.getSelection();
-  const payload = buildCopyPayload(sel);
-  if (payload){
-    ev.preventDefault();
-    if (ev.clipboardData){
-      ev.clipboardData.setData('text/plain', payload);
-      const html = `<pre>${payload.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>`;
-      ev.clipboardData.setData('text/html', html);
-    } else if (window.clipboardData){
-      window.clipboardData.setData('Text', payload);
-    }
-  }
-});
 
 /* ---------- Init ---------- */
 function init(){
@@ -990,6 +928,5 @@ function init(){
   ensureContextMenu();
   ensureStyleControls();
   ensureFindReplaceBar();
-  ensureTcOriginBar();
 }
 init();
