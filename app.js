@@ -203,7 +203,7 @@ function renderTranscript(){
     node.draggable = true;
 
     const header = node.querySelector('.stamp');
-    header.textContent = `[${formatTimecodeFromSeconds(e.start, f)}]`;
+    header.textContent = `[${fmtTC(e.start, f)}]`;
     header.onclick = () => { player.currentTime = Math.max(0, e.start) + 0.001; player.play(); };
 
     const textEl = node.querySelector('.text');
@@ -306,9 +306,9 @@ function renderTranscript(){
     const meta = document.createElement('div');
     meta.className = 'caption-meta';
     meta.innerHTML = `
-      <span class="timepill in-pill"  id="in-pill-${i}"  title="Drag or type; ←/→ to nudge">${formatTimecodeFromSeconds(e.start, f)}</span>
+      <span class="timepill in-pill"  id="in-pill-${i}"  title="Drag or type; ←/→ to nudge">${fmtTC(e.start, f)}</span>
       <span class="arrow">→</span>
-      <span class="timepill out-pill" id="out-pill-${i}" title="Drag or type; ←/→ to nudge">${formatTimecodeFromSeconds(e.end, f)}</span>
+      <span class="timepill out-pill" id="out-pill-${i}" title="Drag or type; ←/→ to nudge">${fmtTC(e.end, f)}</span>
       <span class="len-pill" id="len-pill-${i}" title="Duration (SS:FF)">${formatDurationSF(Math.max(e.end - e.start, 0), f)}</span>
     `;
     node.appendChild(meta);
@@ -398,7 +398,7 @@ function enablePillEditing(pillEl, index, isIn, durFrames){
 
   pillEl.addEventListener('blur', () => {
     const f = getFPS();
-    const parsed = parseTimecodeToSeconds(pillEl.textContent, f);
+    const parsed = parseDisplayedTcToSeconds(pillEl.textContent, f);
     if (parsed == null){ pillEl.textContent = original; return; }
     const frames = secToFrames(parsed, f);
     commitFrames(index, isIn, frames, durFrames);
@@ -480,12 +480,12 @@ function updateRowUI(index){
   if (!row) return;
   const e = entries[index];
   const header = row.querySelector('.stamp');
-  if (header) header.textContent = `[${formatTimecodeFromSeconds(e.start, f)}]`;
+  if (header) header.textContent = `[${fmtTC(e.start, f)}]`;
   const inPill  = row.querySelector(`#in-pill-${index}`);
   const outPill = row.querySelector(`#out-pill-${index}`);
   const lenPill = row.querySelector(`#len-pill-${index}`);
-  if (inPill)  inPill.textContent  = formatTimecodeFromSeconds(e.start, f);
-  if (outPill) outPill.textContent = formatTimecodeFromSeconds(e.end,   f);
+  if (inPill)  inPill.textContent  = fmtTC(e.start, f);
+  if (outPill) outPill.textContent = fmtTC(e.end,   f);
   if (lenPill) lenPill.textContent = formatDurationSF(Math.max(e.end - e.start, 0), f);
 }
 
@@ -536,7 +536,7 @@ player.addEventListener('timeupdate', () => {
 /* ---------- Live timecode ---------- */
 function updateLiveTimecode(){
   const t = player?.currentTime || 0;
-  tcPanel.textContent = formatTimecodeFromSeconds(t, getFPS());
+  tcPanel.textContent = fmtTC(t, getFPS());
   const p = tcPanel.parentElement;
   if (p && !p.classList.contains('tc-centered')) p.classList.add('tc-centered');
   requestAnimationFrame(updateLiveTimecode);
@@ -592,8 +592,9 @@ btnExport.addEventListener('click', () => {
 });
 if (btnExportVtt){
   btnExportVtt.addEventListener('click', () => {
-    flushEditsFromDOM(); 
-    const vtt = buildVTT(entries);
+  flushEditsFromDOM(); 
+    const items = useSourceTc ? entries.map(e => ({...e, start: e.start + sourceTcSec, end: e.end + sourceTcSec})) : entries;
+  const vtt = buildVTT(items);
     download(suggestBaseName() + '.vtt', vtt, 'text/vtt');
   });
 }
@@ -871,94 +872,58 @@ function buildSearchRegex(q, isCase, whole){
   return { re: new RegExp(pattern, flags) };
 }
 
-/* ---------- Copy with timecodes ---------- */
-function getRowIndexFromNode(node){
-  if (!node) return -1;
-  let el = (node.nodeType === Node.ELEMENT_NODE) ? node : node.parentElement;
-  while (el && el !== document){
-    if (el.hasAttribute && el.hasAttribute('data-index')){
-      return parseInt(el.getAttribute('data-index'), 10);
-    }
-    el = el.parentElement;
-  }
-  return -1;
+/* ---------- Timecode Origin (Source TC) ---------- */
+let sourceTcSec = 0;         // seconds offset corresponding to HH:MM:SS:FF source timecode
+let useSourceTc = false;     // if true, display/export timecodes with source offset
+
+// Format with origin: adds source offset to a base time in seconds for display/export
+const fmtTC = (sec, f=getFPS()) => formatTimecodeFromSeconds(Math.max(0, sec + (useSourceTc ? sourceTcSec : 0)), f);
+
+// Parse from displayed TC back to base seconds
+function parseDisplayedTcToSeconds(text, f=getFPS()){
+  const s = parseTimecodeToSeconds(text, f);
+  if (s == null) return null;
+  return Math.max(0, s - (useSourceTc ? sourceTcSec : 0));
 }
 
-function buildCopyPayload(sel){
-  const f = getFPS();
-  if (!sel || sel.rangeCount === 0) return '';
+// UI: input + toggle to control source TC origin
+function ensureTcOriginBar(){
+  if (document.getElementById('tcOriginBar')) return;
 
-  const range = sel.getRangeAt(0);
+  const bar = document.createElement('div');
+  bar.id = 'tcOriginBar';
+  bar.style.cssText = 'margin-top:8px;padding:8px;display:flex;gap:12px;align-items:center;background:#0e1116;border:1px solid rgba(255,255,255,.06);border-radius:10px;color:#fff;font-size:13px';
 
-  // If selection is outside transcript, bail
-  const startIdx = getRowIndexFromNode(range.startContainer);
-  const endIdx   = getRowIndexFromNode(range.endContainer);
-  if (startIdx < 0 || endIdx < 0) return '';
+  bar.innerHTML = `
+    <label style="display:flex;align-items:center;gap:6px">
+      Source TC (HH:MM:SS:FF):
+      <input id="srcTcInput" type="text" placeholder="10:51:54:18" style="width:140px;background:#131720;color:#fff;border:1px solid #2a2f3a;border-radius:6px;padding:6px 8px;height:32px">
+    </label>
+    <label style="display:flex;align-items:center;gap:6px">
+      <input id="useSrcTcToggle" type="checkbox">
+      Use source timecode for display/export
+    </label>
+  `;
 
-  const [from, to] = startIdx <= endIdx ? [startIdx, endIdx] : [endIdx, startIdx];
+  const anchor = tcPanel?.parentElement || player?.parentElement || document.body;
+  anchor.insertAdjacentElement('afterend', bar);
 
-  const blocks = [];
-  for (let i = from; i <= to; i++){
-    const e = entries[i];
-    if (!e) continue;
+  const inp = bar.querySelector('#srcTcInput');
+  const chk = bar.querySelector('#useSrcTcToggle');
 
-    // Determine selected text portion for edge rows
-    let txt = e.text || '';
+  const apply = () => {
+    const f = getFPS();
+    const s = parseTimecodeToSeconds(inp.value, f);
+    sourceTcSec = s != null ? s : 0;
+    useSourceTc = chk.checked;
+    // Repaint UI
+    renderTranscript();
+  };
 
-    // If selection starts/ends in this row's .text, slice appropriately
-    const rowEl = transcriptEl.querySelector(`[data-index="${i}"]`);
-    const textEl = rowEl ? rowEl.querySelector('.text') : null;
-
-    if (textEl && (i === startIdx || i === endIdx)){
-      // Map selection offsets relative to this element
-      const full = textEl.textContent || '';
-
-      const computeOffset = (container, offset) => {
-        const r = document.createRange();
-        r.setStart(textEl, 0);
-        r.setEnd(container, offset);
-        return r.toString().length;
-      };
-
-      if (i === startIdx){
-        const startOff = computeOffset(range.startContainer, range.startOffset);
-        txt = full.slice(startOff);
-      }
-      if (i === endIdx){
-        const endOff = computeOffset(range.endContainer, range.endOffset);
-        if (i === startIdx){
-          // selection entirely within one row
-          const startOff = computeOffset(range.startContainer, range.startOffset);
-          txt = full.slice(startOff, endOff);
-        } else {
-          txt = full.slice(0, endOff);
-        }
-      }
-    }
-
-    const inTc  = formatTimecodeFromSeconds(e.start, f);
-    const outTc = formatTimecodeFromSeconds(e.end,   f);
-    blocks.push(`${inTc} --> ${outTc}\n${txt}`.trimEnd());
-  }
-
-  return blocks.join('\\n\\n');
+  inp.addEventListener('change', apply);
+  inp.addEventListener('blur', apply);
+  chk.addEventListener('change', apply);
 }
-
-transcriptEl.addEventListener('copy', (ev) => {
-  const sel = window.getSelection();
-  const payload = buildCopyPayload(sel);
-  if (payload){
-    ev.preventDefault();
-    if (ev.clipboardData){
-      ev.clipboardData.setData('text/plain', payload);
-      // Also set HTML with <pre> to preserve line breaks in Google Docs
-      const html = `<pre>${payload.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>`;
-      ev.clipboardData.setData('text/html', html);
-    } else if (window.clipboardData){
-      window.clipboardData.setData('Text', payload);
-    }
-  }
-});
 
 /* ---------- Init ---------- */
 function init(){
@@ -967,5 +932,6 @@ function init(){
   ensureContextMenu();
   ensureStyleControls();
   ensureFindReplaceBar();
+  ensureTcOriginBar();
 }
 init();
