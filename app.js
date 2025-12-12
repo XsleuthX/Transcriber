@@ -308,7 +308,7 @@ function renderTranscript(){
     meta.innerHTML = `
       <span class="timepill in-pill"  id="in-pill-${i}"  title="Drag or type; ←/→ to nudge">${fmtTC(e.start, f)}</span>
       <span class="arrow">→</span>
-      <span class="timepill out-pill" id="out-pill-${i}" title="Drag or type; ←/→ to nudge">${formatTimecodeFromSeconds(e.end, f)}</span>
+      <span class="timepill out-pill" id="out-pill-${i}" title="Drag or type; ←/→ to nudge">${fmtTC(e.end, f)}</span>
       <span class="len-pill" id="len-pill-${i}" title="Duration (SS:FF)">${formatDurationSF(Math.max(e.end - e.start, 0), f)}</span>
     `;
     node.appendChild(meta);
@@ -484,8 +484,8 @@ function updateRowUI(index){
   const inPill  = row.querySelector(`#in-pill-${index}`);
   const outPill = row.querySelector(`#out-pill-${index}`);
   const lenPill = row.querySelector(`#len-pill-${index}`);
-  if (inPill)  inPill.textContent  = fmtTC(e.start, f);
-  if (outPill) outPill.textContent = fmtTC(e.end,   f);
+  if (inPill)  inPill.textContent  = formatTimecodeFromSeconds(e.start, f);
+  if (outPill) outPill.textContent = formatTimecodeFromSeconds(e.end,   f);
   if (lenPill) lenPill.textContent = formatDurationSF(Math.max(e.end - e.start, 0), f);
 }
 
@@ -874,27 +874,19 @@ function buildSearchRegex(q, isCase, whole){
 }
 
 /* ---------- Timecode Origin (Source TC) ---------- */
-let sourceTcSec = 0;         // seconds offset corresponding to HH:MM:SS:FF source timecode
-let useSourceTc = false;     // if true, display/export timecodes with source offset
-
-// Format with origin: adds source offset to a base time in seconds for display/export
+let sourceTcSec = 0;
+let useSourceTc = false;
 const fmtTC = (sec, f=getFPS()) => formatTimecodeFromSeconds(Math.max(0, sec + (useSourceTc ? sourceTcSec : 0)), f);
-
-// Parse from displayed TC back to base seconds
 function parseDisplayedTcToSeconds(text, f=getFPS()){
   const s = parseTimecodeToSeconds(text, f);
   if (s == null) return null;
   return Math.max(0, s - (useSourceTc ? sourceTcSec : 0));
 }
-
-// UI: input + toggle to control source TC origin
 function ensureTcOriginBar(){
   if (document.getElementById('tcOriginBar')) return;
-
   const bar = document.createElement('div');
   bar.id = 'tcOriginBar';
   bar.style.cssText = 'margin-top:8px;padding:8px;display:flex;gap:12px;align-items:center;background:#0e1116;border:1px solid rgba(255,255,255,.06);border-radius:10px;color:#fff;font-size:13px';
-
   bar.innerHTML = `
     <label style="display:flex;align-items:center;gap:6px">
       Source TC (HH:MM:SS:FF):
@@ -905,13 +897,10 @@ function ensureTcOriginBar(){
       Use source timecode for display/export
     </label>
   `;
-
   const anchor = tcPanel?.parentElement || player?.parentElement || document.body;
   anchor.insertAdjacentElement('afterend', bar);
-
   const inp = bar.querySelector('#srcTcInput');
   const chk = bar.querySelector('#useSrcTcToggle');
-
   const apply = () => {
     const f = getFPS();
     const s = parseTimecodeToSeconds(inp.value, f);
@@ -919,13 +908,12 @@ function ensureTcOriginBar(){
     useSourceTc = chk.checked;
     renderTranscript();
   };
-
   inp.addEventListener('change', apply);
   inp.addEventListener('blur', apply);
   chk.addEventListener('change', apply);
 }
 
-/* ---------- Copy with timecodes (respects source toggle) ---------- */
+/* ---------- Copy with timecodes ---------- */
 function getRowIndexFromNode(node){
   if (!node) return -1;
   let el = (node.nodeType === Node.ELEMENT_NODE) ? node : node.parentElement;
@@ -937,28 +925,21 @@ function getRowIndexFromNode(node){
   }
   return -1;
 }
-
 function buildCopyPayload(sel){
   const f = getFPS();
   if (!sel || sel.rangeCount === 0) return '';
-
   const range = sel.getRangeAt(0);
-
   const startIdx = getRowIndexFromNode(range.startContainer);
   const endIdx   = getRowIndexFromNode(range.endContainer);
   if (startIdx < 0 || endIdx < 0) return '';
-
   const [from, to] = startIdx <= endIdx ? [startIdx, endIdx] : [endIdx, startIdx];
-
   const blocks = [];
   for (let i = from; i <= to; i++){
     const e = entries[i];
     if (!e) continue;
     let txt = e.text || '';
-
     const rowEl = transcriptEl.querySelector(`[data-index="${i}"]`);
     const textEl = rowEl ? rowEl.querySelector('.text') : null;
-
     if (textEl && (i === startIdx || i === endIdx)){
       const full = textEl.textContent || '';
       const computeOffset = (container, offset) => {
@@ -981,15 +962,12 @@ function buildCopyPayload(sel){
         }
       }
     }
-
-    const inTc  = fmtTC(e.start, f);
-    const outTc = fmtTC(e.end,   f);
+    const inTc  = (typeof fmtTC==='function' ? fmtTC(e.start, f) : formatTimecodeFromSeconds(e.start, f));
+    const outTc = (typeof fmtTC==='function' ? fmtTC(e.end, f)   : formatTimecodeFromSeconds(e.end,   f));
     blocks.push(`${inTc} --> ${outTc}\n${txt}`.trimEnd());
   }
-
   return blocks.join('\\n\\n');
 }
-
 transcriptEl.addEventListener('copy', (ev) => {
   const sel = window.getSelection();
   const payload = buildCopyPayload(sel);
