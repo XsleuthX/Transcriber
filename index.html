@@ -1,107 +1,130 @@
-<!doctype html>
+<!DOCTYPE html>
+
 <html lang="en">
 <head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Transcriber</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css"/>
-</head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<title>Transcriber</title>
+<link href="https://fonts.googleapis.com" rel="preconnect"/>
+<link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect"/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&amp;family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&amp;display=swap" rel="stylesheet"/>
+<link href="style.css" rel="stylesheet">
+</link></head>
 <body>
-  <header class="head">
-    <div class="brand">
-      <div class="laurel" aria-hidden="true">✶</div>
-      <div class="title">
-        <h1>Transcriber</h1>
-        <p class="subtitle">SRT / Caption Editor</p>
-      </div>
-    </div>
-    <nav class="toolbar">
-      <label class="btn btn-gold">
-        <input type="file" id="fileInput" accept="video/*,audio/*" hidden>
-        <span>Import Video</span>
-      </label>
-      <label class="btn btn-gold">
-        <input type="file" id="srtInput" accept=".srt,.vtt" hidden>
-        <span>Import SRT/VTT</span>
-      </label>
-      <div class="fps">
-        <label for="fpsSelect">FPS</label>
-        <select id="fpsSelect">
-          <option value="24">24</option>
-          <option value="25"selected>25</option>
-          <option value="30">30</option>
-          <option value="50">50</option>
-          <option value="60">60</option>
-        </select>
-      </div>
-      <button id="btnExport" class="btn btn-outline">Export SRT</button>
-      <button id="btnExportVtt" class="btn btn-outline">Export VTT</button>
-      <a class="btn btn-outline" href="README.html" target="_blank" rel="noopener">Guide</a>
-    </nav>
-  </header>
+<header class="head">
+<div class="brand">
+<div aria-hidden="true" class="laurel">✶</div>
+<div class="title">
+<h1>Transcriber</h1>
+<p class="subtitle">SRT / Caption Editor</p>
+</div>
+</div>
+<nav class="toolbar">
+<label class="btn btn-gold">
+<input accept="video/*,audio/*" hidden="" id="fileInput" type="file"/>
+<span>Import Video</span>
+</label>
+<label class="btn btn-gold">
+<input accept=".srt,.vtt" hidden="" id="srtInput" type="file"/>
+<span>Import SRT/VTT</span>
+</label>
+<div class="fps">
+<label for="fpsSelect">FPS</label>
+<select id="fpsSelect">
+<option value="24">24</option>
+<option selected="" value="25">25</option>
+<option value="30">30</option>
+<option value="50">50</option>
+<option value="60">60</option>
+</select>
+</div>
+<button class="btn btn-outline" id="btnExport">Export SRT</button>
+<button class="btn btn-outline" id="btnExportVtt">Export VTT</button>
+<a class="btn btn-outline" href="README.html" rel="noopener" target="_blank">Guide</a>
+</nav>
+</header>
+<main class="wrap">
+<aside class="panel video-panel">
 
-  <main class="wrap">
-    <aside class="panel video-panel">
-      </div>
-      <div class="frame">
-        <div class="frame-inner">
-          <video id="player" controls playsinline></video>
-          <div id="captionOverlay" class="caption-overlay"></div>
-        </div>
-      </div>
-
-      <div class="tcbar">
-        <div class="tc-label">Timecode</div>
-        <div id="tcPanel" class="tc">00:00:00:00</div>
-        <div class="tc-hint">@ <span id="tcFps">25</span> fps</div>
-      </div>
-
-      <div id="status" class="status">Ready</div>
-      <div class="smallprint">
-        Tip: Generate captions with your platform script (whisper‑cli) and import here.
-        <hr>
+<div class="frame">
+<div class="frame-inner">
+<video controls="" id="player" playsinline=""></video>
+<div class="caption-overlay" id="captionOverlay"></div>
+</div>
+</div>
+<div class="tcbar">
+<div class="tc-label">Timecode</div>
+<div class="tc" id="tcPanel">00:00:00:00</div>
+<div class="tc-hint">@ <span id="tcFps">25</span> fps</div>
+</div>
+<div class="status" id="status">Ready</div>
+<div class="smallprint">
+        Tip: Transcribe video or import SRT here.
+        <hr/>
         Tip: Drag caption to reorder sequence.
-        <hr>
+        <hr/>
         Tip: Click/Drag to edit caption timecode, keyboard ← arrow → enabled for frame by frame tunning.
-        <hr>
+        <hr/>
         Tip: Set video frame before SRT/VTT import.
-        <hr>
-      </div>
-    </aside>
-
-    <section class="panel transcript-panel">
-      <header class="section-head">
-        <h2>Transcript</h2>
-        <div class="legend">
-          <span class="dot active-dot"></span> playing
-          <span class="sep">•</span>
-          <span class="kbd">Click timestamp to seek</span> 
-        </div>
-      </header>
-
-      <div id="transcript" class="transcript" role="list"></div>
-    </section>
-  </main>
-
-  <footer class="foot">
-    <div class="credit">© Studio.B</div>
-    <div class="marks">
-      <span class="mark">FFmpeg</span>
-      <span class="mark">whisper.cpp</span>
-      <span class="mark">WebVTT / SRT</span>
-    </div>
-  </footer>
-
-  <template id="lineTpl">
-    <div class="line" role="listitem">
-      <button class="stamp" title="Seek to time"></button>
-      <div class="text" contenteditable="true" spellcheck="false"></div>
-    </div>
-  </template>
-
-  <script type="module" src="app.js"></script>
+        <hr/>
+</div>
+</aside>
+<div id="panelDivider" class="panel-divider" title="Drag to resize panels" aria-label="Resize panels"></div>
+<section class="panel transcript-panel">
+<header class="section-head">
+<div style="display:flex;flex-direction:column;gap:2px">
+<h2 style="margin:0">Transcript</h2>
+<div class="legend" style="padding-top:2px">
+<span class="dot active-dot"></span> playing
+            <span class="sep">•</span>
+<span class="kbd">Click timestamp to seek</span>
+</div>
+</div>
+<div class="tcontrols"><label class="subs-mode-label"><span class="subs-label">SUBS</span><select class="subs-mode" id="subsMode"><option selected="selected" value="A">Sub A</option><option value="B">Sub B</option><option value="DUAL">Dual Sub</option></select></label></div>
+</header>
+<!-- Single mode: existing transcript list -->
+<div id="transcriptSingleWrap">
+<div class="transcript" id="transcript" role="list"></div>
+</div>
+<!-- Dual mode: A (reference) + B (editable) -->
+<div class="dual-wrap" hidden="" id="dualWrap">
+<div class="dual-col">
+<div class="dual-bar">
+<div class="dual-title">SRT A (Original)</div>
+<label class="btn btn-outline btn-sm">
+<input accept=".srt,.vtt" hidden="" id="srtInputA" type="file"/>
+<span>Import SRT/VTT</span>
+</label>
+</div>
+<div class="transcript transcript-ro" id="transcriptA" role="list"></div>
+</div>
+<div class="dual-col">
+<div class="dual-bar">
+<div class="dual-title">SRT B (Translation)</div>
+<label class="btn btn-outline btn-sm">
+<input accept=".srt,.vtt" hidden="" id="srtInputB" type="file"/>
+<span>Import SRT/VTT</span>
+</label>
+</div>
+<div id="transcriptBHost"></div>
+</div>
+</div>
+</section>
+</main>
+<footer class="foot">
+<div class="credit">© Studio.B</div>
+<div class="marks">
+<span class="mark">FFmpeg</span>
+<span class="mark">whisper.cpp</span>
+<span class="mark">WebVTT / SRT</span>
+</div>
+</footer>
+<template id="lineTpl">
+<div class="line" role="listitem">
+<button class="stamp" title="Seek to time"></button>
+<div class="text" contenteditable="true" spellcheck="false"></div>
+</div>
+</template>
+<script src="app.js" type="module"></script>
 </body>
 </html>
