@@ -48,14 +48,44 @@
 
 <div class="frame">
 <div class="frame-inner">
-<video controls="" id="player" playsinline=""></video>
+<video id="player" playsinline=""></video>
+<div class="video-controls" id="videoControls">
+  <button class="vbtn" id="vidPlayPause" title="Play/Pause" type="button">▶</button>
+  <input class="vtimeline" id="vidTimeline" type="range" min="0" max="1000" value="0" step="1" aria-label="Timeline"/>
+  <div class="vtime" id="vidTime">0:00 / 0:00</div>
+  <div class="vsep"></div>
+  <label class="vlabel" for="vidSpeed">Speed</label>
+  <select class="vselect" id="vidSpeed" title="Playback speed">
+    <option value="0.5">0.5×</option>
+    <option value="1" selected>1×</option>
+    <option value="1.5">1.5×</option>
+    <option value="2">2×</option>
+  </select>
+  <div class="vsep"></div>
+  <div class="vvolume" id="vidVolumeWrap">
+    <button class="vbtn" id="vidMuteToggle" title="Volume" type="button" aria-label="Toggle volume">🔊</button>
+    <div class="vvolume-pop" id="vidVolumePop">
+      <input class="vvolume-slider" id="vidVolume" type="range" min="0" max="1" step="0.01" value="1" aria-label="Volume"/>
+    </div>
+  </div>
+  <button class="vbtn vbtn-toggle" id="vidCaptionToggle" title="Captions" type="button" aria-pressed="true">CC On</button>
+</div>
 <div class="caption-overlay" id="captionOverlay"></div>
 </div>
 </div>
 <div class="tcbar">
 <div class="tc-label">Timecode</div>
+
+
 <div class="tc" id="tcPanel">00:00:00:00</div>
 <div class="tc-hint">@ <span id="tcFps">25</span> fps</div>
+</div>
+<div class="tc-src-mini" id="tcSrcMini">
+  <label class="switch">
+    <input type="checkbox" id="toggleSourceTc">
+    <span class="slider"></span>
+  </label>
+  <span class="tc-src-mini-label">Source TC</span>
 </div>
 <div class="status" id="status">Ready</div>
 <div class="smallprint">
