@@ -1,136 +1,120 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8"/>
-<meta content="width=device-width, initial-scale=1" name="viewport"/>
-<title>Transcriber — README</title>
-<link href="https://fonts.googleapis.com" rel="preconnect"/>
-<link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect"/>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Fraunces:opsz,wght@9..144,400;9..144,600&display=swap" rel="stylesheet"/>
-<link href="./style.css" rel="stylesheet"/>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transcriber Guide</title>
 <style>
-  /* README page tweaks (keeps same design system) */
-  .readme-wrap{ max-width: 1060px; margin: 0 auto; padding: 18px; }
-  .readme-card{ background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; padding: 16px 18px; margin: 14px 0; }
-  .readme-card h2{ margin: 0 0 10px 0; font-size: 18px; }
-  .readme-card h3{ margin: 14px 0 8px 0; font-size: 15px; opacity: 0.95; }
-  .readme-card p{ margin: 8px 0; opacity: 0.92; line-height: 1.55; }
-  .readme-card ul{ margin: 8px 0 8px 18px; }
-  .pill{ display:inline-block; padding: 2px 10px; border-radius: 999px; border:1px solid rgba(255,255,255,0.14); background: rgba(255,255,255,0.06); font-size: 12px; margin-right: 8px; }
-  code{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 0.95em; }
-  a{ color: inherit; }
+  :root{--bg:#0b0d11;--card:#10141b;--card2:#151a23;--ink:#eef2f6;--muted:#9ca8b7;--line:rgba(255,255,255,.10);--gold:#d8b45a;--blue:#7fb3ff}
+  *{box-sizing:border-box} body{margin:0;background:radial-gradient(circle at top left,#171d28 0,#0b0d11 42%,#080a0d 100%);color:var(--ink);font-family:Inter,system-ui,-apple-system,Segoe UI,Arial,sans-serif;line-height:1.58}
+  .wrap{max-width:1080px;margin:0 auto;padding:36px 20px 64px}.hero{padding:34px;border:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.055),rgba(255,255,255,.025));border-radius:28px;box-shadow:0 24px 80px rgba(0,0,0,.34)}
+  h1{font-size:42px;line-height:1.05;margin:0 0 10px;letter-spacing:-.04em} h2{font-size:24px;margin:34px 0 12px} h3{font-size:16px;margin:22px 0 8px;color:#fff}.sub{color:var(--muted);font-size:17px;margin:0;max-width:820px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:22px}.pill{border:1px solid var(--line);background:rgba(255,255,255,.04);border-radius:999px;padding:8px 12px;color:#dce6ef;font-size:13px;text-align:center}.card{border:1px solid var(--line);background:rgba(16,20,27,.78);border-radius:20px;padding:18px;margin:12px 0}.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}.step{display:grid;grid-template-columns:34px 1fr;gap:12px;align-items:start;margin:12px 0}.num{width:34px;height:34px;border-radius:999px;background:rgba(216,180,90,.16);border:1px solid rgba(216,180,90,.34);display:grid;place-items:center;color:#f2d27a;font-weight:700}.kbd{display:inline-block;padding:2px 7px;border:1px solid var(--line);border-bottom-color:rgba(255,255,255,.22);border-radius:7px;background:#0b0e13;font-size:12px;color:#e7edf5}.note{border-left:3px solid var(--gold);padding:10px 14px;background:rgba(216,180,90,.08);border-radius:0 12px 12px 0;color:#e9dfbe}.warn{border-left:3px solid #ff8a6b;background:rgba(255,138,107,.08)}ul{margin:8px 0 0 20px;padding:0} li{margin:5px 0}.small{font-size:13px;color:var(--muted)}code{background:#06080b;border:1px solid var(--line);border-radius:8px;padding:2px 6px;color:#d6e6ff}a{color:var(--blue)}.toc{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-top:18px}.toc a{display:block;text-decoration:none;border:1px solid var(--line);background:rgba(255,255,255,.035);border-radius:14px;padding:10px 12px;color:#d9e5f1}.toc a:hover{border-color:rgba(127,179,255,.45);background:rgba(127,179,255,.08)}.tag{display:inline-flex;align-items:center;border:1px solid rgba(127,179,255,.26);background:rgba(127,179,255,.08);border-radius:999px;padding:3px 8px;color:#cfe3ff;font-size:12px;margin-right:6px}.footer{color:var(--muted);font-size:13px;margin-top:34px;text-align:center}@media(max-width:760px){.grid,.two,.toc{grid-template-columns:1fr}h1{font-size:32px}.hero{padding:24px}.wrap{padding:22px 14px 44px}}
 </style>
 </head>
-
 <body>
-<header class="head">
-  <div class="brand">
-    <div class="laurel" aria-hidden="true">✶</div>
-    <div class="title">
-      <h1>Transcriber</h1>
-      <div class="sub">README / User Guide</div>
+<div class="wrap">
+  <section class="hero">
+    <h1>Transcriber Guide</h1>
+    <p class="sub">A practical guide to importing media, transcribing, aligning subtitles, translating, reviewing, sharing sessions, and collaborating in the Transcriber app.</p>
+    <div class="grid">
+      <div class="pill">Local video</div><div class="pill">YouTube</div><div class="pill">Google Drive</div>
+      <div class="pill">Whisper transcription</div><div class="pill">Dual subtitles</div><div class="pill">Collaboration</div>
     </div>
+    <nav class="toc">
+      <a href="#quickstart">Quick start</a><a href="#sources">Import sources</a><a href="#transcribe">Transcribe</a><a href="#align">Align subtitles</a><a href="#translate">Translate & check</a><a href="#ai">AI Assistant</a><a href="#view">View & timecode</a><a href="#share">Share & collaborate</a>
+    </nav>
+  </section>
+
+  <h2 id="quickstart">Quick start</h2>
+  <div class="card">
+    <div class="step"><div class="num">1</div><div><b>Import a source.</b> Use <span class="kbd">Import Video</span>, <span class="kbd">YouTube</span>, or <span class="kbd">Google Drive</span>.</div></div>
+    <div class="step"><div class="num">2</div><div><b>Choose language.</b> Use the language dropdown above the workflow row. For mixed English/Chinese, use <span class="kbd">Auto Detect</span>.</div></div>
+    <div class="step"><div class="num">3</div><div><b>Open Transcribe.</b> Confirm Model / Device / Compute, then click <span class="kbd">Start Transcribe</span>.</div></div>
+    <div class="step"><div class="num">4</div><div><b>Edit and review.</b> Use SRT mode for cue-by-cue edits or TXT mode for a full text editing view.</div></div>
+    <div class="step"><div class="num">5</div><div><b>Export.</b> Use <span class="kbd">Export ▾</span> to save SRT or VTT.</div></div>
   </div>
 
-  <div class="tools">
-    <a class="btn" href="./index.html" title="Back to app">← Back to App</a>
+  <h2 id="sources">Import sources</h2>
+  <div class="two">
+    <div class="card"><h3>Local video/audio</h3><p>Use <span class="kbd">Import Video</span>. The app caches a 16 kHz mono WAV on the backend so Transcribe and Align-To-Audio can reuse it without re-uploading the same media repeatedly.</p></div>
+    <div class="card"><h3>Import SRT/VTT</h3><p>Use <span class="kbd">Import SRT/VTT</span> to load existing captions into Sub A. In Dual Sub mode, Sub A is usually the original and Sub B is usually the translation.</p></div>
   </div>
-</header>
-
-<main class="readme-wrap">
-  <div class="readme-card">
-    <h2>Quick Start</h2>
-    <p>
-      <span class="pill">1</span> Open <code>index.html</code> (or run the local server and open <code>http://127.0.0.1:8000</code>).
-      <br/>
-      <span class="pill">2</span> Load an audio/video file into the player.
-      <br/>
-      <span class="pill">3</span> Import subtitles into <b>Sub A</b> and/or <b>Sub B</b>.
-      <br/>
-      <span class="pill">4</span> Edit, align, and run AI checks.
-      <br/>
-      <span class="pill">5</span> Export SRT/VTT from the currently active Sub panel.
-    </p>
+  <div class="two">
+    <div class="card"><h3>YouTube</h3><p>Use the YouTube icon. You can preview, import closed captions, download authorized videos, or transcribe by extracting temporary audio through the backend.</p><p class="small">Use only with videos you own or have permission to process.</p></div>
+    <div class="card"><h3>Google Drive</h3><p>Use the Drive icon for shared Drive files. Preview + cache audio gives the best playback sync, because the app can use a native cached media preview instead of the Drive iframe.</p></div>
   </div>
+  <div class="note warn"><b>Large uploads:</b> If users access your app through ngrok, local videos must upload from their browser to your backend computer before transcription begins. YouTube/Drive sources avoid that large browser upload.</div>
 
-  <div class="readme-card">
-    <h2>Layout & Navigation</h2>
-    <h3>Top toolbar</h3>
+  <h2 id="transcribe">Transcribe</h2>
+  <div class="card">
+    <p>Open <span class="kbd">Transcribe</span>. Model / Device / Compute are grouped in one row. Device defaults to <span class="kbd">cuda</span> for GPU use; switch to CPU if CUDA is unavailable.</p>
     <ul>
-      <li><b>Import</b>: Load SRT/VTT/TXT into Sub A or Sub B (depending on which input you use).</li>
-      <li><b>Align-To-Audio</b>: Sends your current transcript + audio to the server for word-level alignment.</li>
-      <li><b>AI Check</b>: Runs automated checks (drift, suspicious lines, etc.) and returns annotated results.</li>
-      <li><b>Export SRT / Export VTT</b>: Exports <b>Sub A</b> if Sub A panel is selected; exports <b>Sub B</b> if Sub B is selected.
-        On Chrome/Edge, you’ll be asked for <b>filename and save location</b>. On other browsers, you’ll be prompted for filename and the file downloads to your default Downloads folder.</li>
-    </ul>
-
-    <h3>Player</h3>
-    <ul>
-      <li>Load audio/video and scrub to review timing.</li>
-      <li>Useful for verifying “first word” and “last word” boundary alignment.</li>
-    </ul>
-
-    <h3>Transcript panels</h3>
-    <ul>
-      <li><b>Sub A</b>: typically your original transcript / baseline.</li>
-      <li><b>Sub B</b>: an alternate track (e.g., translation, revised cut, or second version).</li>
-      <li>Click inside a panel to make it the <b>active</b> panel. Exports and some actions follow the active panel.</li>
+      <li><b>Language:</b> Use Auto Detect for mixed English/Chinese. Select a fixed language when the content is known.</li>
+      <li><b>Model:</b> Large models are more accurate but slower.</li>
+      <li><b>Progress:</b> The compact progress strip appears only during backend jobs. The Cancel button appears only when a job is active.</li>
     </ul>
   </div>
 
-  <div class="readme-card">
-    <h2>Core Functions</h2>
+  <h2 id="align">Align subtitles</h2>
+  <div class="two">
+    <div class="card"><h3>Align-To-Audio</h3><p>Paste SRT or subtitle lines into the Align drawer and run Align-To-Audio. The backend analyzes audio and returns timed cues. This is useful when your text exists but timing is wrong.</p></div>
+    <div class="card"><h3>Align-To-SRT</h3><p>Maps pasted lines onto the timing of Sub A, creating or updating Sub B. This is useful for translations that should follow existing timing.</p></div>
+  </div>
 
-    <h3>Editing</h3>
+  <h2 id="translate">Translate & check</h2>
+  <div class="card">
+    <p>Open <span class="kbd">Translate</span> for translation and review tools.</p>
     <ul>
-      <li>Edit subtitle text directly in the table.</li>
-      <li>Adjust timecodes using the time fields and controls provided in the UI.</li>
-      <li>Use search / filters (if enabled) to locate specific lines quickly.</li>
-    </ul>
-
-    <h3>Align-To-Audio</h3>
-    <p>
-      Align-To-Audio uses word-level timestamps from the server to snap each subtitle cue to the best-matching span of words.
-      This improves timing accuracy and reduces drift.
-    </p>
-    <ul>
-      <li><b>EN</b>: optimized for English token matching and boundary refinement.</li>
-      <li><b>ZH</b>: optimized for Chinese segmentation, bigram matching, and minimum-duration boosting.</li>
-      <li><b>Auto</b>: detects language and applies EN/ZH logic per cue. It also performs extra boundary tightening to reduce cases where the first or last spoken word is missed.</li>
-    </ul>
-
-    <h3>AI Check</h3>
-    <ul>
-      <li>Runs heuristics and/or LLM checks (depending on your server config) to highlight questionable lines.</li>
-      <li><b>Key Terms</b> (if enabled in your build): lets you enter English and Chinese terms to help the AI check anchor important names, jargon, and recurring concepts.</li>
+      <li><b>Start Translate:</b> Translate Sub A into Sub B using the configured translation backend.</li>
+      <li><b>Dictionary:</b> Store preferred term mappings such as names, organizations, and technical terms.</li>
+      <li><b>AI Check:</b> Compare Sub A and Sub B. Semantic mode checks meaning. Anchor Drift mode checks numbers, acronyms, and key terms.</li>
+      <li><b>Key Terms:</b> Appears when Anchor Drift is selected.</li>
     </ul>
   </div>
 
-  <div class="readme-card">
-    <h2>Recommended Workflow</h2>
-    <ol>
-      <li>Import your best available subtitles into <b>Sub A</b>.</li>
-      <li>(Optional) Import a second version into <b>Sub B</b>.</li>
-      <li>Run <b>Align-To-Audio</b> using <b>Auto</b> (or force EN/ZH if you know the language).</li>
-      <li>Review the first/last word boundaries on fast speech segments; fix any edge cases manually.</li>
-      <li>Run <b>AI Check</b> to catch drift, missing terms, or suspicious lines.</li>
-      <li>Export SRT/VTT from the active panel.</li>
-    </ol>
-  </div>
-
-  <div class="readme-card">
-    <h2>Troubleshooting</h2>
+  <h2 id="ai">AI Assistant</h2>
+  <div class="card">
+    <p>The AI Assistant drawer gives you a dedicated prompt and answer panel. Choose context such as Sub A, Sub B, both subtitles, or the current cue.</p>
+    <p>Useful prompts include:</p>
     <ul>
-      <li><b>Export prompt doesn’t show a folder picker:</b> Folder picker requires Chrome/Edge’s File System Access API. Other browsers will download to your default Downloads folder.</li>
-      <li><b>Align results look shifted:</b> Try running Align-To-Audio again, or force EN/ZH instead of Auto for a single-language file.</li>
-      <li><b>Server not reachable:</b> Start the Python server and ensure it’s running at <code>http://127.0.0.1:8000</code>.</li>
+      <li>Summarize this transcript in five bullet points.</li>
+      <li>Find the strongest quote in the current section.</li>
+      <li>Rewrite the selected cue in documentary tone.</li>
+      <li>Suggest chapter breaks and titles.</li>
     </ul>
+    <p class="small">DeepSeek features require your backend to have <code>DEEPSEEK_API_KEY</code> set.</p>
   </div>
 
-  <div class="readme-card">
-    <h2>Credits / Notes</h2>
-    <p>This README is bundled with the app. You can open it anytime as <code>README.html</code>.</p>
+  <h2 id="view">View, captions, and timecode</h2>
+  <div class="two">
+    <div class="card"><h3>Large timecode bar</h3><p>The large timecode bar stays visible for frame/time checking. FPS can be changed from the top toolbar.</p></div>
+    <div class="card"><h3>Settings</h3><p>The compact Settings tab contains Source TC, View Mode, Captions, and Tips. These stay collapsed until needed.</p></div>
   </div>
-</main>
+  <div class="two">
+    <div class="card"><h3>TXT mode</h3><p>TXT mode shows transcript text in an editable big box. Edits update the cue text line-by-line. Clicking a TXT line seeks to that cue's start time.</p></div>
+    <div class="card"><h3>Captions</h3><p>Caption settings include font, size, color, and maximum characters per subtitle row for overlay wrapping.</p></div>
+  </div>
+  <div class="card"><h3>Source TC</h3><p>Use Source TC to display/export captions with source timecode offset. The app can attempt to read source timecode from media metadata when available.</p></div>
+
+  <h2 id="share">Share & collaborate</h2>
+  <div class="card">
+    <p>Use <span class="kbd">Share</span> to create session links.</p>
+    <ul>
+      <li><b>View-only:</b> Others can review but not edit.</li>
+      <li><b>Editor:</b> Opens the same snapshot with editing controls enabled.</li>
+      <li><b>Collaborative:</b> Creates a live polling session that syncs changes across users every few seconds.</li>
+    </ul>
+    <p class="small">Local uploaded video files are not automatically shared to viewers. Web sources such as YouTube or Google Drive are better for remote review.</p>
+  </div>
+
+  <h2>Backend notes</h2>
+  <div class="card">
+    <p>The backend pill shows which backend the app is connected to. For ngrok testing, make sure the frontend uses same-origin API:</p>
+    <p><code>const API_BASE = window.API_BASE || window.location.origin;</code></p>
+    <p>Run the backend with CUDA auto-language support if available:</p>
+    <p><code>set "WHISPER_AUTO_LANGS=en,zh"</code><br><code>python -m uvicorn server_whisper_deepseekv1:app --host 127.0.0.1 --port 8000</code></p>
+  </div>
+  <div class="footer">Transcriber · Caption editing, alignment, translation, and review workflow</div>
+</div>
 </body>
 </html>
