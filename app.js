@@ -3264,6 +3264,29 @@ function timelinePointerTime(ev){
   const rect = content.getBoundingClientRect();
   return timelinePxToTime(ev.clientX - rect.left);
 }
+function timelineAutoScrollWhileDragging(ev){
+  const scroll = timelineModeEl?.querySelector('#tlScroll');
+  if (!scroll || !timelineDragState) return;
+  const rect = scroll.getBoundingClientRect();
+  const zone = Math.min(220, Math.max(110, rect.width * 0.18));
+  let delta = 0;
+  if (ev.clientX < rect.left + zone){
+    const strength = 1 - Math.max(0, ev.clientX - rect.left) / zone;
+    delta = -Math.max(8, Math.round(42 * strength));
+  } else if (ev.clientX > rect.right - zone){
+    const strength = 1 - Math.max(0, rect.right - ev.clientX) / zone;
+    delta = Math.max(8, Math.round(42 * strength));
+  }
+  if (!delta) return;
+  const max = Math.max(0, scroll.scrollWidth - scroll.clientWidth);
+  scroll.scrollLeft = Math.max(0, Math.min(max, scroll.scrollLeft + delta));
+  // Keep rendering smooth without flooding.
+  const now = performance.now();
+  if (now - timelineLastAutoScroll > 24){
+    timelineLastAutoScroll = now;
+    requestTimelineRender();
+  }
+}
 function onTimelineLanePointerDown(ev){
   if (ev.target?.closest?.('.tl-clip')) return;
   ev.preventDefault();
@@ -3275,7 +3298,7 @@ function onTimelineLanePointerDown(ev){
   sendTimelinePresence('selecting', start, { force:true });
   sendTimelineRangePreview(true);
   lane.setPointerCapture?.(ev.pointerId);
-  const move = (e) => { if (!timelineDragState) return; const t = snapTimeToFrameValue(timelinePointerTime(e)); timelineSelection.end = t; timelineLiveSeek(t); sendTimelinePresence('selecting', t); sendTimelineRangePreview(true); requestTimelineRender(); };
+  const move = (e) => { if (!timelineDragState) return; timelineAutoScrollWhileDragging(e); const t = snapTimeToFrameValue(timelinePointerTime(e)); timelineSelection.end = t; timelineLiveSeek(t); sendTimelinePresence('selecting', t); sendTimelineRangePreview(true); requestTimelineRender(); };
   const up = (e) => {
     lane.releasePointerCapture?.(e.pointerId);
     window.removeEventListener('pointermove', move);
@@ -3487,13 +3510,44 @@ function storyCueRange(cueRefs=[], track='A'){
 }
 function storyEffectiveTrack(card){
   const wanted = normalizeStoryTrack(storyActiveSubTrack || subsMode || card?.track || 'A');
+  const baseTrack = normalizeStoryTrack(card?.track || wanted || 'A');
+  if (!card) return wanted;
   if (card?.altCueRefs && Array.isArray(card.altCueRefs[wanted]) && card.altCueRefs[wanted].length) return wanted;
-  return normalizeStoryTrack(card?.track || wanted);
+  if (wanted === baseTrack) return baseTrack;
+
+  // For Story/Timeline SUBS toggles, do not keep cue cards pinned to their
+  // original track.  Map the card's time range to the requested Sub A/Sub B
+  // track, then render that track's cue text when matching cues exist.
+  if (card.kind === 'cue' || card.kind === 'clip'){
+    let baseRange = null;
+    const baseRefs = Array.isArray(card?.cueRefs) ? card.cueRefs : [];
+    if (baseRefs.length) baseRange = storyCueRange(baseRefs, baseTrack);
+    if (!baseRange && card.start != null && card.end != null) baseRange = { start:Number(card.start), end:Number(card.end) };
+    if (baseRange){
+      const mapped = storyCueRefsForRange(baseRange.start, baseRange.end, wanted);
+      if (mapped.length) return wanted;
+    }
+  }
+  return baseTrack;
 }
 function storyEffectiveCueRefs(card){
   const t = storyEffectiveTrack(card);
   if (card?.altCueRefs && Array.isArray(card.altCueRefs[t]) && card.altCueRefs[t].length) return card.altCueRefs[t];
-  return Array.isArray(card?.cueRefs) ? card.cueRefs : [];
+  const baseRefs = Array.isArray(card?.cueRefs) ? card.cueRefs : [];
+  const baseTrack = normalizeStoryTrack(card?.track || 'A');
+  if (!card || t === baseTrack) return baseRefs;
+
+  // Story Cards are created from a source track, usually Sub A.  When the
+  // Story/Timeline top SUBS control switches to the other track, derive the
+  // matching cue refs by the card's live time range so the same story beat can
+  // be viewed in Sub B without duplicating the card.
+  let baseRange = null;
+  if (baseRefs.length) baseRange = storyCueRange(baseRefs, baseTrack);
+  if (!baseRange && card.start != null && card.end != null) baseRange = { start:Number(card.start), end:Number(card.end) };
+  if (!baseRange) return baseRefs;
+
+  const mapped = storyCueRefsForRange(baseRange.start, baseRange.end, t);
+  return mapped.length ? mapped : baseRefs;
 }
 function syncStoryTopSubControls(){
   const v = normalizeStoryTrack(storyActiveSubTrack || subsMode || 'A');
@@ -3667,6 +3721,13 @@ function ensureStoryMode(){
   assembly?.addEventListener('focusin', onStoryFocusIn);
   assembly?.addEventListener('keyup', onStoryKeyup);
   assembly?.addEventListener('keydown', onStoryKeydown);
+  assembly?.addEventListener('pointerdown', ev => {
+    const miniText = ev.target?.closest?.('.story-mini-text');
+    if (!miniText) return;
+    // Let the browser handle caret placement/text selection naturally, but mark
+    // this as an active edit target so delayed sync work will not rebuild over it.
+    miniText.dataset.editingNow = '1';
+  }, true);
   return storyModeEl;
 }
 function getStoryTargetRowIdFromEvent(ev){ return ev.target?.closest?.('.story-row')?.dataset.rowId || storyDefaultRowId(); }
@@ -3856,6 +3917,33 @@ function storyBindTextareaResizeRemembering(){
   }, true);
 }
 storyBindTextareaResizeRemembering();
+function storyInstallCardSelectionStability(){
+  if (window.__storyCardSelectionStabilityBound) return;
+  window.__storyCardSelectionStabilityBound = true;
+  document.addEventListener('pointerdown', ev => {
+    const ta = ev.target?.closest?.('.story-card-body');
+    if (!ta) return;
+    ta.__storyPointerStart = { x: ev.clientX, y: ev.clientY };
+    ta.__storySelectingText = false;
+  }, true);
+  document.addEventListener('pointermove', ev => {
+    const ta = ev.target?.closest?.('.story-card-body') || document.activeElement?.closest?.('.story-card-body');
+    if (!ta || !ta.__storyPointerStart) return;
+    if (Math.abs(ev.clientX - ta.__storyPointerStart.x) + Math.abs(ev.clientY - ta.__storyPointerStart.y) > 6){
+      ta.__storySelectingText = true;
+    }
+  }, true);
+  document.addEventListener('pointerup', ev => {
+    const ta = ev.target?.closest?.('.story-card-body') || document.activeElement?.closest?.('.story-card-body');
+    if (!ta) return;
+    setTimeout(() => {
+      const selected = Number(ta.selectionStart ?? 0) !== Number(ta.selectionEnd ?? 0);
+      ta.__storySelectingText = selected ? true : false;
+      ta.__storyPointerStart = null;
+    }, 0);
+  }, true);
+}
+storyInstallCardSelectionStability();
 function storyNormalizeCardsBeforeRender(){
   storyRows.forEach(row => (row.cards || []).forEach(card => {
     if ((card.kind === 'cue' || card.kind === 'clip') && (!Array.isArray(card.sourceCueRefs) || !card.sourceCueRefs.length) && Array.isArray(card.cueRefs)){
@@ -3897,7 +3985,7 @@ function storyRenderMiniTranscript(row, card){
           const idx = getCueIndexById(cue.id, track);
           return `<div class="story-mini-cue" data-cue-id="${escapeStoryAttr(cue.id)}" data-cue-index="${idx}" data-track="${escapeStoryAttr(track)}">
             <button class="story-mini-time" data-story-action="edit-mini-time" title="Click to edit cue In / Out" type="button">${fmtTC(cue.start)} → ${fmtTC(cue.end)}</button>
-            <div class="story-mini-text" contenteditable="${VIEW_ONLY_SESSION ? 'false' : 'true'}" spellcheck="false">${escapeHtml(cue.text || '')}</div>
+            <div class="story-mini-text" contenteditable="${VIEW_ONLY_SESSION ? 'false' : 'true'}" tabindex="0" spellcheck="false">${escapeHtml(cue.text || '')}</div>
           </div>`;
         }).join('')}
       </div>
@@ -3908,12 +3996,26 @@ function storyFindCard(rowId, cardId){
   const card = row?.cards?.find(c => c.id === cardId);
   return { row, card };
 }
+let __storyMiniSyncTimer = null;
+function storyScheduleExternalCueSync(){
+  if (__storyMiniSyncTimer) clearTimeout(__storyMiniSyncTimer);
+  __storyMiniSyncTimer = setTimeout(() => {
+    __storyMiniSyncTimer = null;
+    // Do not rebuild other transcript surfaces while the user's caret is inside
+    // the Story mini transcript. Rebuilding can steal focus/selection in Chrome.
+    if (document.activeElement?.closest?.('.story-mini-text')) return;
+    try{ renderBySubsMode?.(); }catch(_e){}
+    try{ updateTxtBox?.(); }catch(_e){}
+  }, 500);
+}
 function storyUpdateCueFromMiniText(cueId, track, text){
   const cue = storyCueById(cueId, track);
   if (!cue) return;
   cue.text = String(text ?? '');
-  try{ renderBySubsMode?.(); }catch(_e){}
-  try{ updateTxtBox?.(); }catch(_e){}
+  try{ updateOverlay?.(getActiveIndex?.(getMediaCurrentTime?.() || 0, track), track); }catch(_e){}
+  // Keep the edit live in data immediately, but avoid immediate full transcript
+  // re-render so the mini editor caret/selection remains stable.
+  storyScheduleExternalCueSync();
   storyCommitSharedState();
 }
 function sendCollabStoryCursor(rowId, cardId, cueId='', mode='card'){
@@ -4177,15 +4279,85 @@ function onStoryChange(ev){
   } else if (field === 'label') card.label = ev.target.value;
   storyCommitSharedState();
 }
+
+let STORY_PREVIEW_STOPPER = null;
+function storyCardPlaybackRange(card){
+  if (!card) return null;
+  if (card.kind === 'cue' || card.kind === 'clip'){
+    const refs = storyEffectiveCueRefs(card);
+    const track = storyEffectiveTrack(card);
+    const range = refs.length ? storyCueRange(refs, track) : null;
+    if (range && Number.isFinite(Number(range.start)) && Number.isFinite(Number(range.end))) return range;
+  }
+  const clip = card.kind === 'clip' ? storyClipById(card.clipId) : null;
+  const start = clip ? storyClipStart(clip) : card.start;
+  const end = clip ? storyClipEnd(clip) : card.end;
+  if (start != null && end != null && Number.isFinite(Number(start)) && Number.isFinite(Number(end)) && Number(end) > Number(start)){
+    return { start:Number(start), end:Number(end) };
+  }
+  return null;
+}
+function storyPreviewCardRange(card){
+  const range = storyCardPlaybackRange(card);
+  if (!range) return;
+  try{
+    if (typeof STORY_PREVIEW_STOPPER === 'function') STORY_PREVIEW_STOPPER();
+  }catch(_e){}
+  const stopAt = Math.max(Number(range.start) + 0.02, Number(range.end));
+  const stop = () => {
+    try{ player?.removeEventListener('timeupdate', onTime); }catch(_e){}
+    try{ player?.removeEventListener('pause', stop); }catch(_e){}
+    STORY_PREVIEW_STOPPER = null;
+  };
+  const onTime = () => {
+    const t = (typeof getMediaCurrentTime === 'function') ? getMediaCurrentTime() : (player?.currentTime || 0);
+    if (Number(t) >= stopAt - 0.015){
+      try{ pauseMedia?.(); }catch(_e){ try{ player.pause(); }catch(_e2){} }
+      stop();
+    }
+  };
+  STORY_PREVIEW_STOPPER = stop;
+  try{ player?.addEventListener('timeupdate', onTime); player?.addEventListener('pause', stop, { once:true }); }catch(_e){}
+  seekMediaTo(Math.max(0, Number(range.start)) + 0.001, { play:true });
+}
+
 function onStoryClick(ev){
   const action = ev.target.dataset.storyAction;
   const rowEl = ev.target.closest?.('.story-row');
   const cardEl = ev.target.closest?.('.story-card');
   const row = rowEl ? getStoryRow(rowEl.dataset.rowId) : null;
+
+  // In normal Story Card view, clicking a cue line in the textarea should seek
+  // to that cue's exact timecode.  Use the click Y position, not the stale
+  // textarea caret, because a normal click may not update selectionStart until
+  // after this delegated handler has already run.
+  if (ev.target?.classList?.contains('story-card-body') && row && cardEl){
+    const bodyEl = ev.target;
+    const card = row.cards?.find(c => c.id === cardEl.dataset.cardId);
+    // Do not run click-to-seek while the user is selecting text. Calling seek
+    // can move focus to the video player in some browsers and immediately
+    // collapse the textarea selection/caret.
+    const hasTextSelection = Number(bodyEl.selectionStart ?? 0) !== Number(bodyEl.selectionEnd ?? 0);
+    const wasSelecting = !!bodyEl.__storySelectingText;
+    if (card && (card.kind === 'cue' || card.kind === 'clip') && !hasTextSelection && !wasSelecting){
+      window.__storyLastContextY = ev.clientY;
+      const cueId = storyCueIdFromTextareaLine(bodyEl, card);
+      const cue = cueId ? storyCueById(cueId, storyEffectiveTrack(card)) : null;
+      if (cue) seekMediaTo(Math.max(0, Number(cue.start || 0)) + 0.001, { play:false });
+    }
+    if (bodyEl.__storySelectingText) setTimeout(() => { bodyEl.__storySelectingText = false; }, 80);
+  }
+
   const miniCueClicked = ev.target.closest?.('.story-mini-cue');
   if (miniCueClicked && !ev.target.closest?.('.story-mini-time')){
-    const cue = storyCueById(miniCueClicked.dataset.cueId, miniCueClicked.dataset.track || 'A');
-    if (cue) seekMediaTo(Math.max(0, Number(cue.start || 0)) + 0.001, { play:false });
+    const inMiniText = ev.target.closest?.('.story-mini-text');
+    const sel = window.getSelection?.();
+    // If the user is actively selecting text inside the mini transcript, do not
+    // treat mouseup/click as a seek action that may collapse the selection.
+    if (!(inMiniText && sel && !sel.isCollapsed)){
+      const cue = storyCueById(miniCueClicked.dataset.cueId, miniCueClicked.dataset.track || 'A');
+      if (cue) seekMediaTo(Math.max(0, Number(cue.start || 0)) + 0.001, { play:false });
+    }
   }
   if (!action || !row) return;
   if (action === 'open-add-menu') { showStoryAddMenu(ev.target, row.id); return; }
@@ -4195,15 +4367,13 @@ function onStoryClick(ev){
   if (action === 'move-card-up' && cardEl){ const i = row.cards.findIndex(c => c.id === cardEl.dataset.cardId); if (i > 0){ [row.cards[i-1], row.cards[i]] = [row.cards[i], row.cards[i-1]]; renderStoryAssembly(); storyCommitSharedState(true); } return; }
   if (action === 'move-card-down' && cardEl){ const i = row.cards.findIndex(c => c.id === cardEl.dataset.cardId); if (i >= 0 && i < row.cards.length - 1){ [row.cards[i+1], row.cards[i]] = [row.cards[i], row.cards[i+1]]; renderStoryAssembly(); storyCommitSharedState(true); } return; }
   if (action === 'delete-card' && cardEl){ row.cards = row.cards.filter(c => c.id !== cardEl.dataset.cardId); renderStoryAssembly(); storyCommitSharedState(true); return; }
-  if (action === 'done-mini-transcript' && cardEl){ const card = row.cards.find(c => c.id === cardEl.dataset.cardId); if (card){ card.editMode = false; card.bodyManual = false; card.body = ''; renderStoryAssembly(); storyCommitSharedState(true); } return; }
+  if (action === 'done-mini-transcript' && cardEl){ const card = row.cards.find(c => c.id === cardEl.dataset.cardId); if (card){ card.editMode = false; card.bodyManual = false; card.body = ''; try{ renderBySubsMode?.(); updateTxtBox?.(); }catch(_e){} renderStoryAssembly(); storyCommitSharedState(true); } return; }
   if (action === 'seek-mini-cue' || action === 'edit-mini-time') { const cueEl = ev.target.closest('.story-mini-cue'); const cue = storyCueById(cueEl?.dataset?.cueId, cueEl?.dataset?.track || 'A'); if (action === 'edit-mini-time') { const ctx = storyMiniFindContextFromNode(cueEl); if (ctx) showStoryMiniTimePopover(ev, ctx); } else if (cue) seekMediaTo(Math.max(0, Number(cue.start || 0)) + 0.001, { play:false }); return; }
   if (action === 'toggle-card-notes' && cardEl){ const card = row.cards.find(c => c.id === cardEl.dataset.cardId); if (card){ card.notesOpen = !card.notesOpen; renderStoryAssembly(); storyCommitSharedState(); } return; }
   if (action === 'seek-card' && cardEl){
     const card = row.cards.find(c => c.id === cardEl.dataset.cardId);
-    const range = card?.kind === 'cue' ? storyCueRange(card.cueRefs, card.track) : null;
-    const clip = card?.kind === 'clip' ? storyClipById(card.clipId) : null;
-    const start = range ? range.start : (clip ? storyClipStart(clip) : card?.start);
-    if (start != null) seekMediaTo(Math.max(0, start) + 0.001, { play:false });
+    storyPreviewCardRange(card);
+    return;
   }
 }
 function showStoryAddMenu(anchor, rowId){
@@ -4689,6 +4859,7 @@ function onStoryFocusIn(ev){
   const rowEl = ev.target.closest?.('.story-row');
   if (!cardEl || !rowEl) return;
   const cueEl = ev.target.closest?.('.story-mini-cue');
+  if (ev.target?.closest?.('.story-mini-text')) ev.target.dataset.editingNow = '1';
   sendCollabStoryCursor(rowEl.dataset.rowId, cardEl.dataset.cardId, cueEl?.dataset?.cueId || '', cueEl ? 'mini' : 'card');
 }
 function onStoryKeyup(ev){ onStoryFocusIn(ev); }
@@ -4807,7 +4978,8 @@ function showStoryMiniTimePopover(ev, ctx){
     try{ renderBySubsMode?.(); updateTxtBox?.(); }catch(_e){}
     seekMediaTo(Math.max(0, liveCue.start) + 0.001, { play:false });
   };
-  positionStoryMiniTimePopover(ev.currentTarget || ev.target);
+  const anchor = ev?.target?.closest?.('.story-mini-time') || ev?.target || ev?.currentTarget;
+  positionStoryMiniTimePopover(anchor);
   pop.style.display = 'block';
   pop.classList.add('is-open');
   setTimeout(() => { try{ inInput?.focus({preventScroll:true}); inInput?.select(); }catch(_e){} }, 0);
@@ -10193,6 +10365,10 @@ let TIMELINE_COLOR_PICKER_OPEN = false;
 let TIMELINE_COLOR_PICKER_CLIP_ID = '';
 
 function getTimelineTrackChoice(){
+  // The top SUBS control decides which subtitle cue markers are visible in Timeline Mode.
+  // Export panel can still use "Current visible track", which resolves through getTimelineSubtitleSource().
+  const top = timelineModeEl?.querySelector('#timelineSubModeTop')?.value;
+  if (top === 'A' || top === 'B') return top;
   return timelineModeEl?.querySelector('#tlSubTrack')?.value || 'current';
 }
 function getTimelineTrackLists(trackChoice='current'){
@@ -10519,7 +10695,6 @@ function ensureTimelineMode(){
         <button class="btn btn-outline" id="tlSnapCue" type="button">Snap to Cue</button>
         <button class="btn btn-outline" id="tlSetIn" type="button">Set In</button>
         <button class="btn btn-outline" id="tlSetOut" type="button">Set Out</button>
-        <button class="btn btn-outline" id="tlPreview" type="button">Preview</button>
         <button class="btn btn-gold" id="tlAddClip" type="button">Add Clip</button>
         <button class="btn btn-gold" id="tlAiSelect" type="button">AI Select</button>
       </div>
@@ -10563,6 +10738,7 @@ function ensureTimelineMode(){
           </select>
         </label>
         <div class="tl-export-note">Export order follows the checked clip list. Vertical export uses a center crop, so it keeps the middle of the frame rather than doing AI subject tracking.</div>
+        <button class="btn btn-outline" id="tlPreviewExport" type="button">Preview</button>
         <button class="btn btn-gold" id="tlExport" type="button">Export Cut</button>
         <div class="tl-export-links" id="tlExportLinks"></div>
       </div>
@@ -10590,7 +10766,8 @@ function bindTimelineMode(){
   el.querySelector('#tlSnapCue')?.addEventListener('click', () => snapTimelineSelectionToCurrentCue());
   el.querySelector('#tlSetIn')?.addEventListener('click', () => setTimelineInAtPlayhead());
   el.querySelector('#tlSetOut')?.addEventListener('click', () => setTimelineOutAtPlayhead());
-  el.querySelector('#tlPreview')?.addEventListener('click', () => previewTimelineSelectionOrClip());
+  el.querySelector('#tlPreviewExport')?.addEventListener('click', () => openTimelinePreviewModal());
+  el.querySelector('#timelineSubModeTop')?.addEventListener('change', (ev) => { setStoryTimelineSubMode(ev.currentTarget.value); requestTimelineRender(); });
   el.querySelector('#tlSubTrack')?.addEventListener('change', () => requestTimelineRender());
   scroll?.addEventListener('scroll', () => requestTimelineRender(), { passive:true });
   scroll?.addEventListener('wheel', (ev) => {
@@ -10780,6 +10957,7 @@ function onTimelineClipPointerDown(ev){
   seekMediaTo(clip.start, { play:false });
   const move = (e) => {
     const c = timelineClips.find(x => x.id === clip.id); if (!c) return;
+    timelineAutoScrollWhileDragging(e);
     const dt = (e.clientX - startX) / timelinePxPerSec;
     const minDur = 1 / getFPS();
     if (timelineDragState.kind === 'move'){
@@ -10913,6 +11091,373 @@ function setTimelineOutAtPlayhead(){
   if (!timelineSelection) createDefaultTimelineSelection();
   setTimelineSelection(Math.min(timelineSelection.start, t - 1/getFPS()), t, { seek:false });
 }
+
+let timelinePreviewModalEl = null;
+let tlModalPreview = { clips: [], index: 0, playing: false, ratio:'16:9', scale:1, x:0, y:0, raf:0 };
+function ensureTimelinePreviewModal(){
+  if (timelinePreviewModalEl && document.body.contains(timelinePreviewModalEl)) return timelinePreviewModalEl;
+  const wrap = document.createElement('div');
+  wrap.id = 'timelinePreviewModal';
+  wrap.className = 'modal-overlay hidden tl-preview-overlay';
+  wrap.innerHTML = `
+    <div class="modal-card tl-preview-card" role="dialog" aria-modal="true" aria-labelledby="tlPreviewTitle">
+      <div class="modal-head">
+        <div>
+          <div id="tlPreviewTitle" class="modal-title">Timeline Preview</div>
+          <div class="modal-sub">Preview checked clips in sequence with subtitle overlay before Export Cut.</div>
+        </div>
+        <button class="btn btn-outline btn-mini" id="tlPreviewClose" type="button">✕</button>
+      </div>
+      <div class="modal-body tl-preview-body">
+        <div class="tl-preview-stage-wrap">
+          <div id="tlPreviewStage" class="tl-preview-stage ratio-16x9">
+            <video id="tlPreviewVideo" playsinline></video>
+            <div id="tlPreviewSafe" class="tl-preview-safe"></div>
+            <div id="tlPreviewSubtitle" class="tl-preview-subtitle"></div>
+          </div>
+        </div>
+        <div class="tl-preview-side">
+          <div class="tl-preview-controls">
+            <div class="tl-preview-transport">
+              <button class="btn btn-gold" id="tlPreviewPlay" type="button">Play</button>
+              <button class="btn btn-outline" id="tlPreviewPrev" type="button">Prev Clip</button>
+              <button class="btn btn-outline" id="tlPreviewNext" type="button">Next Clip</button>
+              <input id="tlPreviewScrub" class="tl-preview-scrub" type="range" min="0" max="1000" step="1" value="0" aria-label="Preview timeline">
+              <div id="tlPreviewTime" class="tl-preview-time">00:00 / 00:00</div>
+            </div>
+            <label>Aspect <select id="tlPreviewRatio" class="ui-dark-select"><option value="16:9">16:9</option><option value="9:16">9:16</option></select></label>
+            <label>Scale <input id="tlPreviewScale" type="range" min="0.6" max="2.6" step="0.01" value="1"></label>
+            <label>X <input id="tlPreviewX" type="range" min="-60" max="60" step="1" value="0"></label>
+            <label>Y <input id="tlPreviewY" type="range" min="-60" max="60" step="1" value="0"></label>
+            <div id="tlPreviewStatus" class="tl-preview-status">Ready</div>
+          </div>
+          <div class="tl-preview-subpanel">
+            <div class="tl-preview-subhead"><strong>Subtitles</strong><span>stitched timeline</span></div>
+            <div id="tlPreviewSubtitleRows" class="tl-preview-subrows"></div>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  document.body.appendChild(wrap);
+  timelinePreviewModalEl = wrap;
+  const close = () => { stopTimelineModalPreview(); wrap.classList.add('hidden'); };
+  wrap.querySelector('#tlPreviewClose').onclick = close;
+  wrap.addEventListener('click', ev => { if (ev.target === wrap) close(); });
+  wrap.querySelector('#tlPreviewPlay').onclick = () => toggleTimelineModalPreview();
+  wrap.querySelector('#tlPreviewPrev').onclick = () => jumpTimelineModalPreview(-1);
+  wrap.querySelector('#tlPreviewNext').onclick = () => jumpTimelineModalPreview(1);
+  const scrub = wrap.querySelector('#tlPreviewScrub');
+  scrub?.addEventListener('input', () => seekTimelinePreviewToAssembledTime(Number(scrub.value || 0), false));
+  scrub?.addEventListener('change', () => seekTimelinePreviewToAssembledTime(Number(scrub.value || 0), tlModalPreview.playing));
+  const subRows = wrap.querySelector('#tlPreviewSubtitleRows');
+  subRows?.addEventListener('input', onTimelinePreviewSubtitleInput);
+  subRows?.addEventListener('keydown', onTimelinePreviewSubtitleKeydown);
+  subRows?.addEventListener('contextmenu', onTimelinePreviewSubtitleContextMenu);
+  subRows?.addEventListener('click', onTimelinePreviewSubtitleClick);
+  ['tlPreviewRatio','tlPreviewScale','tlPreviewX','tlPreviewY'].forEach(id => {
+    wrap.querySelector('#'+id)?.addEventListener('input', applyTimelinePreviewStageSettings);
+    wrap.querySelector('#'+id)?.addEventListener('change', applyTimelinePreviewStageSettings);
+  });
+  const v = wrap.querySelector('#tlPreviewVideo');
+  v?.addEventListener('timeupdate', updateTimelinePreviewSubtitle);
+  v?.addEventListener('ended', () => advanceTimelineModalPreview());
+  return wrap;
+}
+function getTimelinePreviewClips(){
+  const clips = getTimelineExportClips().map(c => ({ ...c, start:Number(c.start)||0, end:Number(c.end)||0 })).filter(c => c.end > c.start);
+  if (clips.length) return clips;
+  if (timelineSelection){
+    const a = Math.min(timelineSelection.start, timelineSelection.end);
+    const b = Math.max(timelineSelection.start, timelineSelection.end);
+    if (b > a) return [{ id:'selection_preview', label:'Selection', start:a, end:b, color:'#d7b46a', enabled:true }];
+  }
+  return [];
+}
+function openTimelinePreviewModal(){
+  const modal = ensureTimelinePreviewModal();
+  tlModalPreview.clips = getTimelinePreviewClips();
+  tlModalPreview.index = 0;
+  tlModalPreview.playing = false;
+  tlPreviewCues = buildTimelinePreviewCues(tlModalPreview.clips);
+  modal.classList.remove('hidden');
+  const src = player?.currentSrc || player?.src || '';
+  const v = modal.querySelector('#tlPreviewVideo');
+  if (v && src && v.src !== src) v.src = src;
+  applyTimelinePreviewStageSettings();
+  renderTimelinePreviewSubtitlePanel();
+  loadTimelineModalPreviewClip(0, false);
+}
+function applyTimelinePreviewStageSettings(){
+  const modal = ensureTimelinePreviewModal();
+  const stage = modal.querySelector('#tlPreviewStage');
+  const video = modal.querySelector('#tlPreviewVideo');
+  const ratio = modal.querySelector('#tlPreviewRatio')?.value || '16:9';
+  const scale = Number(modal.querySelector('#tlPreviewScale')?.value || 1);
+  const x = Number(modal.querySelector('#tlPreviewX')?.value || 0);
+  const y = Number(modal.querySelector('#tlPreviewY')?.value || 0);
+  tlModalPreview.ratio = ratio; tlModalPreview.scale = scale; tlModalPreview.x = x; tlModalPreview.y = y;
+  if (stage){ stage.classList.toggle('ratio-9x16', ratio === '9:16'); stage.classList.toggle('ratio-16x9', ratio !== '9:16'); }
+  if (video){ video.style.transform = `translate(${x}%, ${y}%) scale(${scale})`; }
+}
+function loadTimelineModalPreviewClip(index, play=true){
+  const modal = ensureTimelinePreviewModal();
+  const clips = tlModalPreview.clips || [];
+  if (!clips.length){ const st=modal.querySelector('#tlPreviewStatus'); if(st) st.textContent='No clips to preview.'; return; }
+  tlModalPreview.index = Math.max(0, Math.min(clips.length - 1, index));
+  const clip = clips[tlModalPreview.index];
+  const v = modal.querySelector('#tlPreviewVideo');
+  if (!v) return;
+  try{ v.currentTime = Math.max(0, clip.start || 0); }catch(_e){}
+  const st = modal.querySelector('#tlPreviewStatus');
+  if (st) st.textContent = `${tlModalPreview.index + 1}/${clips.length} · ${clip.label || 'Clip'} · ${fmtTimelineTime(clip.start)} → ${fmtTimelineTime(clip.end)}`;
+  updateTimelinePreviewSubtitle();
+  if (play){ tlModalPreview.playing = true; v.play().catch(()=>{}); modal.querySelector('#tlPreviewPlay').textContent = 'Pause'; startTimelineModalPreviewLoop(); }
+  else { tlModalPreview.playing = false; v.pause(); modal.querySelector('#tlPreviewPlay').textContent = 'Play'; }
+}
+function toggleTimelineModalPreview(){
+  const modal = ensureTimelinePreviewModal();
+  const v = modal.querySelector('#tlPreviewVideo');
+  if (!v) return;
+  if (tlModalPreview.playing){ tlModalPreview.playing=false; v.pause(); modal.querySelector('#tlPreviewPlay').textContent='Play'; return; }
+  if (!tlModalPreview.clips?.length) tlModalPreview.clips = getTimelinePreviewClips();
+  if (!tlModalPreview.clips.length) return;
+  tlModalPreview.playing=true; modal.querySelector('#tlPreviewPlay').textContent='Pause';
+  v.play().catch(()=>{}); startTimelineModalPreviewLoop();
+}
+function stopTimelineModalPreview(){
+  tlModalPreview.playing = false;
+  if (tlModalPreview.raf) cancelAnimationFrame(tlModalPreview.raf);
+  tlModalPreview.raf = 0;
+  const v = timelinePreviewModalEl?.querySelector('#tlPreviewVideo');
+  try{ v?.pause(); }catch(_e){}
+}
+function jumpTimelineModalPreview(dir){ loadTimelineModalPreviewClip((tlModalPreview.index || 0) + dir, tlModalPreview.playing); }
+function advanceTimelineModalPreview(){
+  if (!tlModalPreview.clips?.length) return;
+  const next = (tlModalPreview.index || 0) + 1;
+  if (next >= tlModalPreview.clips.length){ stopTimelineModalPreview(); ensureTimelinePreviewModal().querySelector('#tlPreviewPlay').textContent='Play'; return; }
+  loadTimelineModalPreviewClip(next, true);
+}
+function startTimelineModalPreviewLoop(){
+  if (tlModalPreview.raf) cancelAnimationFrame(tlModalPreview.raf);
+  const tick = () => {
+    const modal = timelinePreviewModalEl;
+    const v = modal?.querySelector('#tlPreviewVideo');
+    const clip = tlModalPreview.clips?.[tlModalPreview.index || 0];
+    if (!modal || modal.classList.contains('hidden') || !v || !clip || !tlModalPreview.playing){ tlModalPreview.raf = 0; return; }
+    updateTimelinePreviewSubtitle();
+    if (Number(v.currentTime || 0) >= Number(clip.end || 0) - 0.015){ advanceTimelineModalPreview(); return; }
+    tlModalPreview.raf = requestAnimationFrame(tick);
+  };
+  tlModalPreview.raf = requestAnimationFrame(tick);
+}
+
+let tlPreviewCues = [];
+let tlPreviewSubCtxMenu = null;
+let tlPreviewSubCtxIndex = -1;
+function timelinePreviewClipOffsets(clips=tlModalPreview.clips || []){
+  const offsets = [];
+  let cursor = 0;
+  clips.forEach((clip, i) => {
+    const start = Number(clip.start) || 0;
+    const end = Math.max(start, Number(clip.end) || start);
+    offsets.push({ index:i, start:cursor, end:cursor + Math.max(0, end - start), clip });
+    cursor += Math.max(0, end - start);
+  });
+  return offsets;
+}
+function getTimelinePreviewTotalDuration(){
+  const offsets = timelinePreviewClipOffsets();
+  return offsets.length ? offsets[offsets.length - 1].end : 0;
+}
+function getTimelinePreviewTrackForPanel(){
+  const choice = getTimelineTrackChoice();
+  if (choice === 'B') return 'B';
+  if (choice === 'dual') return 'A';
+  const src = getTimelineSubtitleSource?.();
+  return normalizeTxtTrack(src?.track || 'A');
+}
+function buildTimelinePreviewCues(clips){
+  const track = getTimelinePreviewTrackForPanel();
+  const list = track === 'B' ? (entriesB || []) : (entries || []);
+  ensureCueIds(list);
+  const out = [];
+  let cursor = 0;
+  (clips || []).forEach((clip, clipIndex) => {
+    const c0 = Number(clip.start) || 0;
+    const c1 = Math.max(c0, Number(clip.end) || c0);
+    (list || []).forEach((cue, srcIndex) => {
+      const s0 = Number(cue.start) || 0;
+      const s1 = Math.max(s0, Number(cue.end) || s0);
+      const ov0 = Math.max(c0, s0);
+      const ov1 = Math.min(c1, s1);
+      if (ov1 <= ov0) return;
+      const text = String(cue.text || '').trim();
+      if (!text) return;
+      out.push({
+        id:'tlprev_' + track + '_' + clipIndex + '_' + srcIndex + '_' + (cue.id || ''),
+        track, sourceCueId:cue.id || '', sourceIndex:srcIndex,
+        clipIndex, sourceStart:ov0, sourceEnd:ov1,
+        start:cursor + (ov0 - c0), end:cursor + (ov1 - c0), text
+      });
+    });
+    cursor += Math.max(0, c1 - c0);
+  });
+  out.sort((a,b) => (a.start - b.start) || (a.end - b.end));
+  return out;
+}
+function getTimelinePreviewAssembledTime(){
+  const v = timelinePreviewModalEl?.querySelector('#tlPreviewVideo');
+  const clip = tlModalPreview.clips?.[tlModalPreview.index || 0];
+  if (!v || !clip) return 0;
+  const offsets = timelinePreviewClipOffsets();
+  const off = offsets[tlModalPreview.index || 0]?.start || 0;
+  return off + Math.max(0, Number(v.currentTime || 0) - (Number(clip.start) || 0));
+}
+function seekTimelinePreviewToAssembledTime(t, play=false){
+  const clips = tlModalPreview.clips || [];
+  if (!clips.length) return;
+  const offsets = timelinePreviewClipOffsets(clips);
+  const total = offsets.length ? offsets[offsets.length - 1].end : 0;
+  const target = Math.max(0, Math.min(total, Number(t) || 0));
+  let found = offsets.find(o => target >= o.start && target <= o.end) || offsets[offsets.length - 1];
+  const local = Math.max(0, target - found.start);
+  tlModalPreview.index = found.index;
+  const v = timelinePreviewModalEl?.querySelector('#tlPreviewVideo');
+  if (!v) return;
+  try{ v.currentTime = (Number(found.clip.start) || 0) + local; }catch(_e){}
+  const st = timelinePreviewModalEl?.querySelector('#tlPreviewStatus');
+  if (st) st.textContent = `${found.index + 1}/${clips.length} · ${found.clip.label || 'Clip'} · ${fmtTimelineTime(found.clip.start)} → ${fmtTimelineTime(found.clip.end)}`;
+  if (play){ tlModalPreview.playing = true; v.play().catch(()=>{}); timelinePreviewModalEl.querySelector('#tlPreviewPlay').textContent='Pause'; startTimelineModalPreviewLoop(); }
+  updateTimelinePreviewSubtitle();
+}
+function renderTimelinePreviewSubtitlePanel(){
+  const modal = ensureTimelinePreviewModal();
+  const host = modal.querySelector('#tlPreviewSubtitleRows');
+  if (!host) return;
+  if (!tlPreviewCues.length){ host.innerHTML = '<div class="tl-preview-subempty">No subtitle cues overlap the checked clips.</div>'; return; }
+  host.innerHTML = tlPreviewCues.map((cue, i) => `
+    <div class="tl-preview-subrow" data-preview-index="${i}">
+      <button class="tl-preview-subtime" type="button" data-preview-seek="${i}">${fmtTimelineTime(cue.start)} → ${fmtTimelineTime(cue.end)}</button>
+      <div class="tl-preview-subtext" contenteditable="${VIEW_ONLY_SESSION ? 'false' : 'true'}" tabindex="0" spellcheck="false">${escapeHtml(cue.text || '')}</div>
+    </div>`).join('');
+}
+function updateTimelinePreviewSourceCueText(pcue){
+  if (!pcue?.sourceCueId) return;
+  const list = pcue.track === 'B' ? entriesB : entries;
+  const idx = getCueIndexById(pcue.sourceCueId, pcue.track);
+  if (idx >= 0 && list[idx]){
+    list[idx].text = String(pcue.text || '');
+    try{ renderBySubsMode?.(); }catch(_e){}
+  }
+}
+function onTimelinePreviewSubtitleInput(ev){
+  const textEl = ev.target?.closest?.('.tl-preview-subtext');
+  if (!textEl) return;
+  const row = textEl.closest('.tl-preview-subrow');
+  const idx = Number(row?.dataset?.previewIndex || -1);
+  const cue = tlPreviewCues[idx];
+  if (!cue) return;
+  cue.text = textEl.textContent || '';
+  updateTimelinePreviewSourceCueText(cue);
+  updateTimelinePreviewSubtitle();
+}
+function onTimelinePreviewSubtitleClick(ev){
+  const row = ev.target?.closest?.('.tl-preview-subrow');
+  if (!row) return;
+  const idx = Number(row.dataset.previewIndex || -1);
+  const cue = tlPreviewCues[idx];
+  if (!cue) return;
+  seekTimelinePreviewToAssembledTime(cue.start + 0.001, false);
+}
+function onTimelinePreviewSubtitleKeydown(ev){
+  const textEl = ev.target?.closest?.('.tl-preview-subtext');
+  if (!textEl) return;
+  if (ev.key === 'Enter' && !ev.shiftKey){
+    ev.preventDefault();
+    const row = textEl.closest('.tl-preview-subrow');
+    timelinePreviewSplitCue(Number(row?.dataset?.previewIndex || -1), getCaretOffset(textEl));
+  }
+}
+function onTimelinePreviewSubtitleContextMenu(ev){
+  const row = ev.target?.closest?.('.tl-preview-subrow');
+  if (!row) return;
+  ev.preventDefault();
+  tlPreviewSubCtxIndex = Number(row.dataset.previewIndex || -1);
+  ensureTimelinePreviewSubtitleContextMenu();
+  tlPreviewSubCtxMenu.style.left = (ev.pageX || ev.clientX + window.scrollX) + 'px';
+  tlPreviewSubCtxMenu.style.top = (ev.pageY || ev.clientY + window.scrollY) + 'px';
+  tlPreviewSubCtxMenu.style.display = 'block';
+}
+function ensureTimelinePreviewSubtitleContextMenu(){
+  if (tlPreviewSubCtxMenu) return tlPreviewSubCtxMenu;
+  tlPreviewSubCtxMenu = document.createElement('div');
+  tlPreviewSubCtxMenu.className = 'ctx-menu tl-preview-subctx';
+  tlPreviewSubCtxMenu.style.display = 'none';
+  tlPreviewSubCtxMenu.innerHTML = `<button data-act="split">Split Cue at Caret</button><button data-act="merge-prev">Merge with Previous</button><button data-act="merge-next">Merge with Next</button><button data-act="push-up">Push Text Up</button><button data-act="push-down">Push Text Down</button><button data-act="add-blank">Add Blank Cue Below</button><button data-act="delete">Delete Cue</button>`;
+  document.body.appendChild(tlPreviewSubCtxMenu);
+  tlPreviewSubCtxMenu.addEventListener('click', ev => {
+    const act = ev.target?.dataset?.act;
+    if (!act) return;
+    const idx = tlPreviewSubCtxIndex;
+    tlPreviewSubCtxMenu.style.display = 'none';
+    timelinePreviewRunCueAction(idx, act);
+  });
+  document.addEventListener('click', ev => { if (tlPreviewSubCtxMenu && !tlPreviewSubCtxMenu.contains(ev.target)) tlPreviewSubCtxMenu.style.display='none'; }, true);
+  return tlPreviewSubCtxMenu;
+}
+function timelinePreviewSplitCue(idx, caret=null){
+  const cue = tlPreviewCues[idx]; if (!cue) return;
+  const textEl = timelinePreviewModalEl?.querySelector(`.tl-preview-subrow[data-preview-index="${idx}"] .tl-preview-subtext`);
+  const full = String(textEl?.textContent ?? cue.text ?? '');
+  const at = Math.max(0, Math.min(caret == null && textEl ? getCaretOffset(textEl) : Number(caret || 0), full.length));
+  const left = full.slice(0, at).trimEnd();
+  const right = full.slice(at).trimStart();
+  const ratio = full.length ? Math.max(0.12, Math.min(0.88, at / full.length)) : 0.5;
+  const mid = cue.start + (cue.end - cue.start) * ratio;
+  cue.text = left; cue.end = mid;
+  const next = { ...cue, id:cue.id + '_split_' + Date.now().toString(36), sourceCueId:'', sourceIndex:-1, start:mid, end:Math.max(mid + 1/getFPS(), (Number(tlPreviewCues[idx+1]?.start) || cue.end || mid + 1)) , text:right };
+  tlPreviewCues.splice(idx + 1, 0, next);
+  renderTimelinePreviewSubtitlePanel(); updateTimelinePreviewSubtitle();
+}
+function timelinePreviewRunCueAction(idx, act){
+  if (idx < 0 || idx >= tlPreviewCues.length) return;
+  const cue = tlPreviewCues[idx];
+  if (act === 'split') return timelinePreviewSplitCue(idx);
+  if (act === 'merge-prev' && idx > 0){ const p=tlPreviewCues[idx-1]; p.text = [p.text, cue.text].filter(Boolean).join(' '); p.end = Math.max(p.end, cue.end); tlPreviewCues.splice(idx,1); }
+  else if (act === 'merge-next' && idx < tlPreviewCues.length-1){ const n=tlPreviewCues[idx+1]; cue.text = [cue.text, n.text].filter(Boolean).join(' '); cue.end = Math.max(cue.end, n.end); tlPreviewCues.splice(idx+1,1); }
+  else if (act === 'push-up' && idx > 0){ const tmp=tlPreviewCues[idx-1].text; tlPreviewCues[idx-1].text=cue.text; cue.text=tmp; updateTimelinePreviewSourceCueText(tlPreviewCues[idx-1]); updateTimelinePreviewSourceCueText(cue); }
+  else if (act === 'push-down' && idx < tlPreviewCues.length-1){ const tmp=tlPreviewCues[idx+1].text; tlPreviewCues[idx+1].text=cue.text; cue.text=tmp; updateTimelinePreviewSourceCueText(tlPreviewCues[idx+1]); updateTimelinePreviewSourceCueText(cue); }
+  else if (act === 'add-blank'){ const start=cue.end; const end=Math.max(start + 1/getFPS(), Number(tlPreviewCues[idx+1]?.start) || start + 1); tlPreviewCues.splice(idx+1,0,{id:'blank_'+Date.now().toString(36), track:cue.track, sourceCueId:'', sourceIndex:-1, clipIndex:cue.clipIndex, sourceStart:start, sourceEnd:end, start, end, text:''}); }
+  else if (act === 'delete'){ tlPreviewCues.splice(idx,1); }
+  renderTimelinePreviewSubtitlePanel(); updateTimelinePreviewSubtitle();
+}
+function updateTimelinePreviewSubtitle(){
+  const modal = timelinePreviewModalEl;
+  if (!modal || modal.classList.contains('hidden')) return;
+  const v = modal.querySelector('#tlPreviewVideo');
+  const sub = modal.querySelector('#tlPreviewSubtitle');
+  if (!v || !sub) return;
+  const assembled = getTimelinePreviewAssembledTime();
+  const cue = (tlPreviewCues || []).find(c => assembled >= Number(c.start||0) && assembled <= Number(c.end||0));
+  sub.textContent = cue ? wrapSubtitleTextByChars(String(cue.text || '').trim(), getCaptionMaxChars()) : '';
+  sub.style.opacity = cue ? '1' : '0';
+  const scrub = modal.querySelector('#tlPreviewScrub');
+  const time = modal.querySelector('#tlPreviewTime');
+  const total = getTimelinePreviewTotalDuration();
+  if (scrub){ scrub.max = String(Math.max(0.01, total)); scrub.step = String(1 / getFPS()); scrub.value = String(Math.max(0, Math.min(total, assembled))); }
+  if (time) time.textContent = `${fmtTimelineTime(assembled)} / ${fmtTimelineTime(total)}`;
+  const host = modal.querySelector('#tlPreviewSubtitleRows');
+  if (host){
+    host.querySelectorAll('.tl-preview-subrow.active').forEach(x => x.classList.remove('active'));
+    if (cue){
+      const idx = tlPreviewCues.indexOf(cue);
+      const row = host.querySelector(`.tl-preview-subrow[data-preview-index="${idx}"]`);
+      if (row){ row.classList.add('active'); if (!row.matches(':focus-within')) row.scrollIntoView({ block:'nearest' }); }
+    }
+  }
+}
+
 function previewTimelineSelectionOrClip(){
   const clips = getTimelineExportClips();
   if (clips.length){
