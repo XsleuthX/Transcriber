@@ -19,6 +19,13 @@ let COLLAB_REMOTE_CUES = {};
 let COLLAB_REMOTE_CARETS = {};
 let COLLAB_REMOTE_TXT = {};
 let COLLAB_REMOTE_STORY = {};
+let COLLAB_STORY_LOCKS = {};
+let COLLAB_STORY_LAST_CURSOR_MS = 0;
+let COLLAB_STORY_LOCKED_CARD_ID = '';
+let COLLAB_STORY_LOCK_LAST_SEND_MS = 0;
+let COLLAB_STORY_AWARENESS_TIMER = null;
+let COLLAB_STORY_DEFERRED_ROWS = null;
+let COLLAB_STORY_DEFERRED_TIMER = null;
 let COLLAB_REMOTE_LOCKS = {};
 let COLLAB_COMMENTS = {};
 let COLLAB_COMMENT_POPOVER = null;
@@ -1232,7 +1239,7 @@ function handleMediaTimeUpdate(t){
   updateOverlay(overlayIdx, activeOverlayTrack);
 
   if (isTimelineMode){ try{ updateTimelinePlayhead(t); }catch(_e){} return; }
-  if (isStoryMode){ try{ renderStoryAssembly(); }catch(_e){} return; }
+  if (isStoryMode){ try{ updateStoryPlaybackActiveState(t); }catch(_e){} return; }
   if (isTxtMode) return;
 
   // If user manually selected a row recently, don't auto-scroll over them
@@ -3170,6 +3177,8 @@ let COLLAB_TIMELINE_STATE_TIMER = null;
 let COLLAB_TIMELINE_PRESENCE_TIMER = null;
 let timelineAiModalEl = null;
 let timelineAiSuggestions = [];
+let timelineUndoStack = [];
+let timelineConfirmModalEl = null;
 
 function makeTimelineClipId(){ return 'clip_' + Date.now().toString(36) + '_' + (__timelineIdSeq++); }
 function getTimelineDuration(){
@@ -3479,6 +3488,10 @@ let COLLAB_STORY_STATE_TIMER = null;
 let storyContextMenuEl = null;
 let storyContextCueTarget = null;
 let storyActiveSubTrack = 'A';
+let storyActiveCardCtx = null;
+let storyDraggingRowId = '';
+let storySavedRichSelection = null;
+let storySelectionToolbarBound = false;
 const STORY_LABELS = {
   audio: ['Upsot Dialogue','Natural Sound','Upsot PTC','Mute Audio','Sound FX'],
   shot: ['Main Shot','B-roll','Montage','Interview','PTC','Studio'],
@@ -3569,10 +3582,30 @@ function storyCueRefsForRange(start, end, track='A'){
   const list = storyEnsureCueIds(track) || [];
   const s = Number(start ?? 0), e = Number(end ?? 0);
   if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s) return [];
+  const fps = (typeof getFPS === 'function') ? getFPS() : 25;
+  const tol = Math.max(0.001, 0.5 / Math.max(1, fps));
   return list
-    .filter(cue => storyCueOverlapScore(cue, s, e) > 0)
+    .filter(cue => {
+      const cs = Number(cue?.start ?? 0), ce = Number(cue?.end ?? 0);
+      if (!Number.isFinite(cs) || !Number.isFinite(ce) || ce <= cs) return false;
+      // Include cues that truly overlap the clip range, with a tiny frame
+      // tolerance so frame-rounded clip In/Out values do not drop boundary cues.
+      return Math.min(ce, e + tol) - Math.max(cs, s - tol) > 0.001;
+    })
     .map(cue => cue.id)
     .filter(Boolean);
+}
+function storyCueRefBundleForRange(start, end, preferredTrack=null){
+  const preferred = normalizeStoryTrack(preferredTrack || storyActiveSubTrack || subsMode || 'A');
+  const refsA = storyCueRefsForRange(start, end, 'A');
+  const refsB = storyCueRefsForRange(start, end, 'B');
+  let track = preferred;
+  let cueRefs = track === 'B' ? refsB : refsA;
+  if (!cueRefs.length){
+    track = refsB.length > refsA.length ? 'B' : 'A';
+    cueRefs = track === 'B' ? refsB : refsA;
+  }
+  return { track, cueRefs:[...cueRefs], altCueRefs:{ A:[...refsA], B:[...refsB] } };
 }
 function storyBestTrackForClip(clip){
   const start = storyClipStart(clip);
@@ -3591,21 +3624,131 @@ function storyClipEnd(clip){
   return Number(clip?.end ?? clip?.out ?? clip?.outTime ?? clip?.endTime ?? clip?.rangeEnd ?? 0);
 }
 function storyClipCueRefs(clip, preferredTrack=null){
-  if (!clip) return { track: preferredTrack || 'A', cueRefs: [] };
-  const explicit = clip.cueRefs || clip.cue_ids || clip.cues || clip.cueIds;
-  if (Array.isArray(explicit) && explicit.length){
-    return { track: normalizeStoryTrack(clip.track || clip.subtitleTrack || preferredTrack || 'A'), cueRefs: explicit.map(x => String(typeof x === 'object' ? (x.id || x.cueId || '') : x)).filter(Boolean) };
-  }
+  if (!clip) return { track: preferredTrack || 'A', cueRefs: [], altCueRefs:{ A:[], B:[] } };
   const start = storyClipStart(clip);
   const end = storyClipEnd(clip);
-  const tryTrack = preferredTrack ? normalizeStoryTrack(preferredTrack) : storyBestTrackForClip({ start, end });
-  let refs = storyCueRefsForRange(start, end, tryTrack);
-  if (!refs.length && tryTrack !== 'A') refs = storyCueRefsForRange(start, end, 'A');
-  if (!refs.length && tryTrack !== 'B') refs = storyCueRefsForRange(start, end, 'B');
-  const track = refs.length ? (storyCueRefsForRange(start, end, tryTrack).length ? tryTrack : (storyCueRefsForRange(start, end, 'A').length ? 'A' : 'B')) : tryTrack;
-  return { track, cueRefs: refs };
+
+  // Clip Story Cards should behave like cue Story Cards: the card owns the cue
+  // refs that fall inside the clip In/Out window.  Derive by time range first,
+  // because Timeline clips usually do not carry explicit cue ids.
+  if (Number.isFinite(start) && Number.isFinite(end) && end > start){
+    const rangeBundle = storyCueRefBundleForRange(start, end, preferredTrack || clip.track || clip.subtitleTrack || storyActiveSubTrack || subsMode || 'A');
+    if (rangeBundle.cueRefs.length || rangeBundle.altCueRefs.A.length || rangeBundle.altCueRefs.B.length) return rangeBundle;
+  }
+
+  // Backward compatibility for older Timeline clips that did store cue ids.
+  const explicit = clip.cueRefs || clip.cue_ids || clip.cues || clip.cueIds;
+  if (Array.isArray(explicit) && explicit.length){
+    const track = normalizeStoryTrack(clip.track || clip.subtitleTrack || preferredTrack || 'A');
+    const cueRefs = explicit.map(x => String(typeof x === 'object' ? (x.id || x.cueId || '') : x)).filter(Boolean);
+    return { track, cueRefs, altCueRefs:{ A:track === 'A' ? [...cueRefs] : [], B:track === 'B' ? [...cueRefs] : [] } };
+  }
+  const track = normalizeStoryTrack(preferredTrack || clip.track || clip.subtitleTrack || 'A');
+  return { track, cueRefs:[], altCueRefs:{ A:[], B:[] } };
 }
 function escapeStoryAttr(v){ return escapeHtml(String(v ?? '')).replace(/"/g, '&quot;'); }
+function storyNormalizeTextStyle(style={}){
+  const src = (style && typeof style === 'object') ? style : {};
+  const size = Math.max(10, Math.min(36, Number(src.fontSize || 14) || 14));
+  const align = ['left','center','right','justify'].includes(String(src.align || 'left')) ? String(src.align || 'left') : 'left';
+  return { bold:!!src.bold, italic:!!src.italic, underline:!!src.underline, fontSize:size, align };
+}
+function storyCardBodyInlineStyle(card){
+  const st = storyNormalizeTextStyle(card?.textStyle || {});
+  return `--story-card-font-size:${st.fontSize}px;--story-card-font-weight:${st.bold ? 700 : 400};--story-card-font-style:${st.italic ? 'italic' : 'normal'};--story-card-text-decoration:${st.underline ? 'underline' : 'none'};--story-card-text-align:${st.align};`;
+}
+function storyPlainTextToRichHtml(text){
+  const safe = escapeHtml(String(text ?? ''));
+  return safe ? safe.replace(/\r?\n/g, '<br>') : '<br>';
+}
+function storyPlainTextFromRichHtml(html){
+  if (!html) return '';
+  try{
+    const box = document.createElement('div');
+    box.innerHTML = String(html || '');
+    return String(box.innerText || box.textContent || '').replace(/\u00a0/g, '');
+  }catch(_e){ return String(html || '').replace(/<[^>]+>/g, ''); }
+}
+function storySanitizeStyle(styleText){
+  const allowed = new Set(['font-size','font-family','font-weight','font-style','text-decoration','text-decoration-line','color','background-color','text-align']);
+  return String(styleText || '').split(';').map(part => part.trim()).filter(Boolean).map(part => {
+    const i = part.indexOf(':');
+    if (i <= 0) return '';
+    const prop = part.slice(0, i).trim().toLowerCase();
+    let val = part.slice(i + 1).trim();
+    if (!allowed.has(prop)) return '';
+    if (/url\s*\(/i.test(val) || /javascript:/i.test(val)) return '';
+    if (prop === 'font-size'){
+      const n = Math.max(8, Math.min(72, parseFloat(val) || 11));
+      val = n + 'px';
+    }
+    return `${prop}:${val}`;
+  }).filter(Boolean).join(';');
+}
+function storySanitizeRichHtml(html){
+  if (!html) return '';
+  try{
+    const box = document.createElement('div');
+    box.innerHTML = String(html || '');
+    const allowed = new Set(['B','STRONG','I','EM','U','S','STRIKE','DEL','SPAN','BR','DIV','P','A','FONT']);
+    const walk = (node) => {
+      Array.from(node.childNodes || []).forEach(child => {
+        if (child.nodeType === 1){
+          if (!allowed.has(child.tagName)){
+            const frag = document.createDocumentFragment();
+            while (child.firstChild) frag.appendChild(child.firstChild);
+            child.replaceWith(frag);
+            walk(node);
+            return;
+          }
+          const rawHref = child.getAttribute('href') || '';
+          const rawFace = child.getAttribute('face') || '';
+          const rawColor = child.getAttribute('color') || '';
+          const rawStyleBase = child.getAttribute('style') || child.style?.cssText || '';
+          const rawStyle = [rawStyleBase, rawFace ? `font-family:${rawFace}` : '', rawColor ? `color:${rawColor}` : ''].filter(Boolean).join(';');
+          Array.from(child.attributes || []).forEach(attr => child.removeAttribute(attr.name));
+          if (child.tagName === 'A' && /^(https?:|mailto:)/i.test(rawHref)){
+            child.setAttribute('href', rawHref);
+            child.setAttribute('target', '_blank');
+            child.setAttribute('rel', 'noopener noreferrer');
+          }
+          const style = storySanitizeStyle(rawStyle);
+          if (style) child.setAttribute('style', style);
+          walk(child);
+        } else if (child.nodeType !== 3){
+          child.remove();
+        }
+      });
+    };
+    walk(box);
+    return box.innerHTML;
+  }catch(_e){ return escapeHtml(storyPlainTextFromRichHtml(html)); }
+}
+function storyRichBodyHtmlForCard(card, text){
+  if (card?.bodyManual && card?.bodyHtml) return storySanitizeRichHtml(card.bodyHtml);
+  return storyPlainTextToRichHtml(text);
+}
+function storyGetRichBodyText(editable){
+  return String(editable?.innerText || editable?.textContent || '').replace(/\n+$/g, '');
+}
+function exportStoryJsonPayload(){
+  try{ storySyncAllRichBodiesToCards({ commit:false, reconcile:false }); }catch(_e){}
+  return {
+    type:'transcriber_story_assembly',
+    version:2,
+    exportedAt:new Date().toISOString(),
+    media:getCurrentStoryMediaLabel(),
+    activeSubTrack:normalizeStoryTrack(storyActiveSubTrack || subsMode || 'A'),
+    storyRows:storyRows.map(cleanStoryRowForShare)
+  };
+}
+function storyApplyTextStyleToCardEl(cardEl, card){
+  if (!cardEl || !card) return;
+  const css = storyCardBodyInlineStyle(card);
+  cardEl.querySelectorAll('.story-card-body,.story-mini-text').forEach(el => {
+    css.split(';').filter(Boolean).forEach(pair => { const i = pair.indexOf(':'); if (i > 0) el.style.setProperty(pair.slice(0, i), pair.slice(i + 1)); });
+  });
+}
 function getCurrentStoryMediaLabel(){
   const src = currentMediaSource || {};
   const fileName = src.file?.name || src.filename || src.metadata?.filename || src.metadata?.name || src.metadata?.title || src.url || window.currentBaseName || lastLoadedVideoFile?.name || 'Current media';
@@ -3629,31 +3772,238 @@ function storyCommitSharedState(force=false){
   if (COLLAB_STORY_STATE_TIMER) clearTimeout(COLLAB_STORY_STATE_TIMER);
   COLLAB_STORY_STATE_TIMER = setTimeout(() => {
     try{ maybeSendCollabStateOverWebSocket?.({ force: !!force }); }catch(_e){}
-  }, force ? 30 : 240);
+  }, force ? 30 : 900);
+}
+function storyExportRangeForCard(card){
+  if (!card) return null;
+  try{
+    const r = (typeof storyCardRange === 'function' ? storyCardRange(card) : null) || (typeof storyTimelineRangeForCard === 'function' ? storyTimelineRangeForCard(card) : null);
+    if (r && Number.isFinite(Number(r.start)) && Number.isFinite(Number(r.end)) && Number(r.end) > Number(r.start)) return { start:Number(r.start), end:Number(r.end) };
+  }catch(_e){}
+  if (card?.start != null && card?.end != null && Number.isFinite(Number(card.start)) && Number.isFinite(Number(card.end)) && Number(card.end) > Number(card.start)){
+    return { start:Number(card.start), end:Number(card.end) };
+  }
+  return null;
+}
+function storySnapshotCardBodyHtml(card){
+  if (!card) return '';
+  try{
+    const cardEl = storyFindCardEl?.(storyRows.find(r => (r.cards || []).some(c => c.id === card.id))?.id, card.id);
+    const editable = cardEl?.querySelector?.('.story-card-body[data-card-field="body"]');
+    if (editable) return storySanitizeRichHtml(editable.innerHTML || '');
+  }catch(_e){}
+  const bodyHtml = String(card.bodyHtml || '');
+  if (bodyHtml.trim()) return storySanitizeRichHtml(bodyHtml);
+  const plain = storyTextForCard(card) || card.body || '';
+  return storySanitizeRichHtml(storyPlainTextToRichHtml(plain));
+}
+function storySnapshotCardPlainText(card){
+  if (!card) return '';
+  try{
+    const cardEl = storyFindCardEl?.(storyRows.find(r => (r.cards || []).some(c => c.id === card.id))?.id, card.id);
+    const editable = cardEl?.querySelector?.('.story-card-body[data-card-field="body"]');
+    if (editable) return storyGetRichBodyText(editable);
+  }catch(_e){}
+  return String(card.body || storyTextForCard(card) || storyPlainTextFromRichHtml(card.bodyHtml || '') || '');
+}
+function storySyncAllRichBodiesToCards({ commit=false, reconcile=false } = {}){
+  if (!storyModeEl) return;
+  storyModeEl.querySelectorAll?.('.story-card-body[data-card-field="body"]').forEach(editable => {
+    try{ storySyncRichBodyToCard(editable, { commit, reconcile }); }catch(_e){}
+  });
 }
 function cleanStoryCardForShare(card){
+  const range = storyExportRangeForCard(card);
+  const bodyHtml = storySnapshotCardBodyHtml(card);
+  const bodyText = storySnapshotCardPlainText(card) || storyPlainTextFromRichHtml(bodyHtml || '');
   return {
     id:String(card?.id || makeStoryCardId()), kind:String(card?.kind || 'generic'), title:String(card?.title || ''),
     labelGroup:String(card?.labelGroup || 'shot'), label:String(card?.label || ''), source:String(card?.source || ''),
-    start:card?.start == null ? null : Number(card.start), end:card?.end == null ? null : Number(card.end),
+    start:range ? range.start : (card?.start == null ? null : Number(card.start)),
+    end:range ? range.end : (card?.end == null ? null : Number(card.end)),
+    inTc:range ? fmtTC(range.start) : '', outTc:range ? fmtTC(range.end) : '',
     cueRefs:Array.isArray(card?.cueRefs) ? card.cueRefs.map(x=>String(x)).filter(Boolean) : [],
     sourceCueRefs:Array.isArray(card?.sourceCueRefs) ? card.sourceCueRefs.map(x=>String(x)).filter(Boolean) : [],
     altCueRefs:(card?.altCueRefs && typeof card.altCueRefs === 'object') ? { A:Array.isArray(card.altCueRefs.A)?card.altCueRefs.A.map(x=>String(x)).filter(Boolean):[], B:Array.isArray(card.altCueRefs.B)?card.altCueRefs.B.map(x=>String(x)).filter(Boolean):[] } : null,
     track:normalizeStoryTrack(card?.track || 'A'), clipId:String(card?.clipId || ''),
-    body:String(card?.body || ''), bodyManual:!!card?.bodyManual, notes:String(card?.notes || ''), notesOpen:!!card?.notesOpen, editMode:!!card?.editMode,
-    bodyWidth:String(card?.bodyWidth || ''), bodyHeight:String(card?.bodyHeight || '')
+    body:String(bodyText || ''), bodyHtml:bodyHtml || storyPlainTextToRichHtml(bodyText || ''), bodyManual:!!card?.bodyManual,
+    notes:String(card?.notes || ''), notesOpen:!!card?.notesOpen, editMode:!!card?.editMode,
+    bodyWidth:String(card?.bodyWidth || ''), bodyHeight:String(card?.bodyHeight || ''),
+    textStyle:storyNormalizeTextStyle(card?.textStyle || {})
   };
 }
 function cleanStoryRowForShare(row){
   return { id:String(row?.id || makeStoryRowId()), cards:(row?.cards || []).map(cleanStoryCardForShare), notes:String(row?.notes || ''), status:String(row?.status || 'draft') };
 }
-function applySharedStoryRows(rows){
+function storyIsNodeInsideStoryEditor(node=document.activeElement){
+  try{ return !!(node && node.closest && node.closest('#storyMode .story-card')); }catch(_e){ return false; }
+}
+function storySnapshotEditingFocus(){
+  const active = document.activeElement;
+  if (!storyIsNodeInsideStoryEditor(active)) return null;
+  const rowEl = active.closest('.story-row');
+  const cardEl = active.closest('.story-card');
+  if (!rowEl || !cardEl) return null;
+  const snap = { rowId:rowEl.dataset.rowId || '', cardId:cardEl.dataset.cardId || '', field:'', selector:'', start:0, end:0, textOffset:0 };
+  if (active.matches?.('.story-card-title')) { snap.field='title'; snap.selector='.story-card-title'; }
+  else if (active.matches?.('.story-card-notes')) { snap.field='notes'; snap.selector='.story-card-notes'; }
+  else if (active.matches?.('.story-card-body')) { snap.field='body'; snap.selector='.story-card-body[data-card-field="body"]'; }
+  else if (active.matches?.('.story-mini-text')) { snap.field='mini'; snap.selector=`.story-mini-cue[data-cue-id="${CSS.escape(active.closest('.story-mini-cue')?.dataset?.cueId || '')}"] .story-mini-text`; snap.cueId = active.closest('.story-mini-cue')?.dataset?.cueId || ''; }
+  else return null;
+  try{
+    if (active.isContentEditable){ snap.textOffset = getCaretOffset(active); }
+    else { snap.start = Number(active.selectionStart || 0); snap.end = Number(active.selectionEnd ?? snap.start); }
+  }catch(_e){}
+  return snap;
+}
+function storyRestoreEditingFocus(snap){
+  if (!snap || !snap.rowId || !snap.cardId) return;
+  setTimeout(() => {
+    try{
+      const cardEl = storyFindCardEl(snap.rowId, snap.cardId);
+      const target = cardEl?.querySelector?.(snap.selector || '');
+      if (!target || target.getAttribute('contenteditable') === 'false' || target.disabled) return;
+      target.focus({ preventScroll:true });
+      if (target.isContentEditable){ setCaretOffset(target, Math.max(0, Number(snap.textOffset || 0))); }
+      else if (typeof target.setSelectionRange === 'function'){ target.setSelectionRange(Math.max(0, snap.start || 0), Math.max(0, snap.end ?? snap.start ?? 0)); }
+    }catch(_e){}
+  }, 0);
+}
+function storyLocalActiveCardCleanSnapshot(){
+  const snap = storySnapshotEditingFocus();
+  if (!snap?.rowId || !snap?.cardId) return null;
+  const { row, card } = storyFindCard(snap.rowId, snap.cardId);
+  if (!row || !card) return null;
+  try{
+    const cardEl = storyFindCardEl(row.id, card.id);
+    const body = cardEl?.querySelector?.('.story-card-body[data-card-field="body"]');
+    if (body) storySyncRichBodyToCard(body, { commit:false, reconcile:false });
+    const notes = cardEl?.querySelector?.('.story-card-notes');
+    if (notes) card.notes = notes.value || '';
+    const title = cardEl?.querySelector?.('.story-card-title');
+    if (title) card.title = title.value || '';
+  }catch(_e){}
+  return { rowId:row.id, cardId:card.id, card:cleanStoryCardForShare(card), focus:snap };
+}
+function applySharedStoryRows(rows, opts={}){
   if (!Array.isArray(rows)) return;
+  const local = opts.remoteUpdate ? storyLocalActiveCardCleanSnapshot() : null;
   storyRows = rows.map(r => ({
     id:String(r?.id || makeStoryRowId()), notes:String(r?.notes || ''), status:String(r?.status || 'draft'),
-    cards:Array.isArray(r?.cards) ? r.cards.map(c => cleanStoryCardForShare(c)) : []
+    cards:Array.isArray(r?.cards) ? r.cards.map(c => {
+      if (local && String(c?.id || '') === local.cardId) return normalizeImportedStoryCard(local.card);
+      return normalizeImportedStoryCard(c);
+    }) : []
   }));
-  if (isStoryMode){ ensureStoryMode(); renderStoryAssembly(); }
+  if (local && !storyRows.some(r => (r.cards || []).some(c => c.id === local.cardId))){
+    const target = storyRows.find(r => r.id === local.rowId) || storyRows[0] || (storyRows.push(createStoryRow()), storyRows[0]);
+    target.cards.push(normalizeImportedStoryCard(local.card));
+  }
+  if (isStoryMode){ ensureStoryMode(); renderStoryAssembly(); if (local?.focus) storyRestoreEditingFocus(local.focus); }
+}
+function storyParseImportedTime(v){
+  if (v == null || v === '') return null;
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  const n = Number(v);
+  if (Number.isFinite(n)) return n;
+  try{ const parsed = parseDisplayedTcToSeconds(String(v), getFPS()); return parsed == null ? null : parsed; }catch(_e){ return null; }
+}
+function normalizeImportedStoryCard(c={}, opts={}){
+  const track = normalizeStoryTrack(c?.track || c?.subtitleTrack || 'A');
+  let start = storyParseImportedTime(c?.start ?? c?.in ?? c?.inTime ?? c?.rangeStart ?? c?.timecodeIn ?? c?.inTc);
+  let end = storyParseImportedTime(c?.end ?? c?.out ?? c?.outTime ?? c?.rangeEnd ?? c?.timecodeOut ?? c?.outTc);
+  if ((start == null || end == null) && typeof c?.timecode === 'string'){
+    const parts = c.timecode.split(/-->|→|-/).map(x => x.trim()).filter(Boolean);
+    if (parts.length >= 2){ start = storyParseImportedTime(parts[0]); end = storyParseImportedTime(parts[1]); }
+  }
+  const cueRefs = Array.isArray(c?.cueRefs) ? c.cueRefs.map(x=>String(x)).filter(Boolean)
+    : (Array.isArray(c?.cueIds) ? c.cueIds.map(x=>String(x)).filter(Boolean) : []);
+  const sourceCueRefs = Array.isArray(c?.sourceCueRefs) && c.sourceCueRefs.length ? c.sourceCueRefs.map(x=>String(x)).filter(Boolean) : [...cueRefs];
+  const altCueRefs = (c?.altCueRefs && typeof c.altCueRefs === 'object')
+    ? { A:Array.isArray(c.altCueRefs.A)?c.altCueRefs.A.map(x=>String(x)).filter(Boolean):[], B:Array.isArray(c.altCueRefs.B)?c.altCueRefs.B.map(x=>String(x)).filter(Boolean):[] }
+    : { A:track === 'A' ? [...cueRefs] : [], B:track === 'B' ? [...cueRefs] : [] };
+  let rawBodyHtml = String(c?.bodyHtml || c?.html || c?.richText || '');
+  let body = String(c?.body ?? c?.text ?? c?.bodyText ?? storyPlainTextFromRichHtml(rawBodyHtml || '') ?? '');
+  if (!rawBodyHtml && body) rawBodyHtml = storyPlainTextToRichHtml(body);
+  rawBodyHtml = storySanitizeRichHtml(rawBodyHtml || '');
+  if (!body && rawBodyHtml) body = storyPlainTextFromRichHtml(rawBodyHtml);
+  const hasSnapshotBody = !!String(rawBodyHtml || body || '').trim();
+  return {
+    id:String(c?.id || makeStoryCardId()), kind:String(c?.kind || 'generic'), title:String(c?.title || ''),
+    labelGroup:String(c?.labelGroup || 'shot'), label:String(c?.label || ''), source:String(c?.source || ''),
+    start:start == null ? null : Number(start), end:end == null ? null : Number(end),
+    cueRefs, sourceCueRefs, altCueRefs, track, clipId:String(c?.clipId || ''),
+    body:String(body || ''), bodyHtml:rawBodyHtml || storyPlainTextToRichHtml(body || ''),
+    // Imported JSON should be self-contained: even if the source subtitles have
+    // not been loaded yet, Story Cards still display their exported cue text.
+    bodyManual: (opts?.forceSnapshotBody && hasSnapshotBody) ? true : !!c?.bodyManual,
+    notes:String(c?.notes || ''), notesOpen:!!c?.notesOpen, editMode:!!c?.editMode,
+    bodyWidth:String(c?.bodyWidth || ''), bodyHeight:String(c?.bodyHeight || ''),
+    textStyle:storyNormalizeTextStyle(c?.textStyle || {})
+  };
+}
+function normalizeImportedStoryRows(raw, opts={}){
+  const rows = Array.isArray(raw) ? raw : (Array.isArray(raw?.storyRows) ? raw.storyRows : (Array.isArray(raw?.story_rows) ? raw.story_rows : (Array.isArray(raw?.rows) ? raw.rows : [])));
+  if (!Array.isArray(rows) || !rows.length) return [];
+  return rows.map(r => ({
+    id:String(r?.id || makeStoryRowId()),
+    notes:String(r?.notes || ''),
+    status:String(r?.status || 'draft'),
+    cards:Array.isArray(r?.cards) ? r.cards.map(c => normalizeImportedStoryCard(c, opts)) : []
+  })).filter(r => Array.isArray(r.cards));
+}
+function readStoryJsonViaInput(){
+  return new Promise((resolve, reject) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'application/json,.json';
+    input.style.position = 'fixed';
+    input.style.left = '-9999px';
+    input.addEventListener('change', async () => {
+      const file = input.files?.[0];
+      input.remove();
+      if (!file) return resolve(null);
+      try{
+        const text = await file.text();
+        resolve({ text, name:file.name });
+      }catch(err){ reject(err); }
+    }, { once:true });
+    document.body.appendChild(input);
+    input.click();
+  });
+}
+async function importStoryJsonFile(){
+  let picked = null;
+  if (window.showOpenFilePicker){
+    try{
+      const [handle] = await window.showOpenFilePicker({
+        multiple:false,
+        types:[{ description:'Story JSON', accept:{ 'application/json':['.json'] } }]
+      });
+      const file = await handle.getFile();
+      picked = { text: await file.text(), name:file.name };
+    }catch(err){
+      if (err?.name === 'AbortError') return;
+      console.warn('showOpenFilePicker failed; falling back to input picker.', err);
+    }
+  }
+  if (!picked) picked = await readStoryJsonViaInput();
+  if (!picked) return;
+  let parsed;
+  try{ parsed = JSON.parse(picked.text); }catch(_e){ throw new Error('Invalid JSON file.'); }
+  const rows = normalizeImportedStoryRows(parsed, { forceSnapshotBody:true });
+  const cardCount = rows.reduce((n,r)=>n+(r.cards?.length||0),0);
+  if (!rows.length || !cardCount) throw new Error('No Story Mode rows/cards found in this JSON file.');
+  const replace = !storyRows.length || confirm(`Import ${cardCount} Story Card(s) from ${picked.name || 'JSON'}?
+
+OK = Replace current Story Mode
+Cancel = Append to current Story Mode`);
+  if (replace) storyRows = rows;
+  else storyRows.push(...rows);
+  ensureStorySeed();
+  renderStoryAssembly();
+  storyCommitSharedState(true);
+  setStatusSafe?.(`Imported ${cardCount} Story Card(s) from JSON.`);
 }
 function hideStoryMode(){
   if (storyModeEl) storyModeEl.style.display = 'none';
@@ -3697,28 +4047,74 @@ function ensureStoryMode(){
         <button class="btn btn-outline" id="storyAddFromSelection" type="button">Add Selection</button>
         <button class="btn btn-outline" id="storyAddRow" type="button">Add Row</button>
         <button class="btn btn-gold" id="storyExportTimeline" type="button">Export to Timeline</button>
+        <button class="btn btn-outline" id="storyExportGoogleDoc" type="button">Export to Google Doc</button>
+        <button class="btn btn-outline" id="storyImportGoogleDoc" type="button">Fetch from Google Doc</button>
+        <button class="btn btn-outline" id="storyImportJson" type="button">Import JSON</button>
         <button class="btn btn-outline" id="storyExportJson" type="button">Export JSON</button>
       </div>
     </div>
     <div class="story-help">Tip: select transcript cues, Ctrl+C, then paste here. Cue cards stay live-linked to In / Out timecodes and editable text.</div>
+    <div class="story-float-toolbar is-hidden" id="storyFloatToolbar" aria-label="Story text formatting toolbar">
+      <select class="story-toolbar-font" data-story-toolbar="fontName" title="Font">
+        <option value="Arial">Arial</option><option value="Helvetica">Helvetica</option><option value="Times New Roman">Times New Roman</option><option value="Georgia">Georgia</option><option value="Courier New">Courier New</option>
+      </select>
+      <span class="story-toolbar-sep"></span>
+      <button type="button" data-story-toolbar="font-smaller" title="Decrease font size">−</button>
+      <input class="story-toolbar-size" data-story-toolbar="fontSize" type="number" min="8" max="72" step="1" value="11" title="Font size">
+      <button type="button" data-story-toolbar="font-larger" title="Increase font size">+</button>
+      <span class="story-toolbar-sep"></span>
+      <button type="button" data-story-toolbar="bold" title="Bold"><b>B</b></button>
+      <button type="button" data-story-toolbar="italic" title="Italic"><i>I</i></button>
+      <button type="button" data-story-toolbar="underline" title="Underline"><u>U</u></button>
+      <button type="button" data-story-toolbar="strikeThrough" title="Strikethrough"><s>S</s></button>
+      <button type="button" data-story-toolbar="removeFormat" title="Clear formatting">Tx</button>
+      <label class="story-toolbar-color" title="Text color"><span>A</span><input type="color" data-story-toolbar="foreColor" value="#202124"></label>
+      <label class="story-toolbar-color story-toolbar-highlight" title="Highlight color"><span>▰</span><input type="color" data-story-toolbar="hiliteColor" value="#fff475"></label>
+      <button type="button" data-story-toolbar="link" title="Insert link">🔗</button>
+      <span class="story-toolbar-sep"></span>
+      <button type="button" data-story-toolbar="insert-row-above" title="Insert row above current card">Row ↑</button>
+      <button type="button" data-story-toolbar="insert-row-below" title="Insert row below current card">Row ↓</button>
+    </div>
     <div class="story-assembly" id="storyAssembly" tabindex="0"></div>
   `;
   parent.appendChild(storyModeEl);
-  storyModeEl.querySelector('#storyAddRow')?.addEventListener('click', () => { storyRows.push(createStoryRow()); renderStoryAssembly(); });
+  storyModeEl.querySelector('#storyAddRow')?.addEventListener('click', () => { if (VIEW_ONLY_SESSION) return; storyRows.push(createStoryRow()); renderStoryAssembly(); storyCommitSharedState(true); });
   storyModeEl.querySelector('#storyAddFromSelection')?.addEventListener('click', () => { addCurrentSelectionToStory(); });
   storyModeEl.querySelector('#storyExportTimeline')?.addEventListener('click', () => { exportStoryToTimeline(); });
+  storyModeEl.querySelector('#storyExportGoogleDoc')?.addEventListener('click', () => { exportStoryToGoogleDocBackup().catch(err => alert('Google Doc export failed: ' + (err?.message || err))); });
+  storyModeEl.querySelector('#storyImportGoogleDoc')?.addEventListener('click', () => { fetchStoryFromGoogleDocBackup().catch(err => alert('Google Doc fetch failed: ' + (err?.message || err))); });
   storyModeEl.querySelector('#storySubModeTop')?.addEventListener('change', (ev) => setStoryTimelineSubMode(ev.target.value));
-  storyModeEl.querySelector('#storyExportJson')?.addEventListener('click', async () => { await saveTextFile((suggestBaseName?.() || 'story') + '_story_assembly.json', JSON.stringify(storyRows, null, 2), 'application/json;charset=utf-8'); });
+  storyModeEl.querySelector('#storyImportJson')?.addEventListener('click', () => importStoryJsonFile().catch(err => alert('Story JSON import failed: ' + (err?.message || err))));
+  storyModeEl.querySelector('#storyExportJson')?.addEventListener('click', async () => {
+    const payload = exportStoryJsonPayload();
+    await saveTextFile((suggestBaseName?.() || 'story') + '_story_assembly.json', JSON.stringify(payload, null, 2), 'application/json;charset=utf-8');
+  });
+  const toolbar = storyModeEl.querySelector('#storyFloatToolbar');
+  toolbar?.addEventListener('mousedown', ev => {
+    if (ev.target?.matches?.('select,input')) return;
+    ev.preventDefault();
+  });
+  toolbar?.addEventListener('click', onStoryToolbarClick);
+  toolbar?.addEventListener('input', onStoryToolbarChange);
+  toolbar?.addEventListener('change', onStoryToolbarChange);
+  storyInstallSelectionToolbarHandlers();
   const assembly = storyModeEl.querySelector('#storyAssembly');
   assembly?.addEventListener('paste', onStoryPaste);
-  assembly?.addEventListener('dragover', ev => { ev.preventDefault(); assembly.classList.add('is-drop'); });
-  assembly?.addEventListener('dragleave', () => assembly.classList.remove('is-drop'));
-  assembly?.addEventListener('drop', ev => { assembly.classList.remove('is-drop'); onStoryDrop(ev); });
+  assembly?.addEventListener('dragstart', onStoryDragStart);
+  assembly?.addEventListener('dragover', ev => {
+    const isRowDrag = storyIsRowDragEvent(ev);
+    if (isRowDrag){ ev.preventDefault(); storyMarkRowDropTarget(ev); return; }
+    ev.preventDefault(); assembly.classList.add('is-drop');
+  });
+  assembly?.addEventListener('dragleave', ev => { if (!ev.relatedTarget || !assembly.contains(ev.relatedTarget)){ assembly.classList.remove('is-drop'); storyClearRowDropTargets(); } });
+  assembly?.addEventListener('drop', ev => { assembly.classList.remove('is-drop'); storyClearRowDropTargets(); onStoryDrop(ev); });
+  assembly?.addEventListener('dragend', () => { storyDraggingRowId = ''; storyClearRowDropTargets(); });
   assembly?.addEventListener('input', onStoryInput);
   assembly?.addEventListener('change', onStoryChange);
   assembly?.addEventListener('click', onStoryClick);
   assembly?.addEventListener('contextmenu', onStoryContextMenu);
   assembly?.addEventListener('focusin', onStoryFocusIn);
+  assembly?.addEventListener('focusout', () => setTimeout(storyApplyDeferredRemoteRows, 250));
   assembly?.addEventListener('keyup', onStoryKeyup);
   assembly?.addEventListener('keydown', onStoryKeydown);
   assembly?.addEventListener('pointerdown', ev => {
@@ -3734,30 +4130,40 @@ function getStoryTargetRowIdFromEvent(ev){ return ev.target?.closest?.('.story-r
 function getStoryRow(rowId){ return storyRows.find(r => r.id === rowId) || null; }
 function storyDefaultRowId(){ ensureStorySeed(); return storyRows[storyRows.length - 1].id; }
 function createGenericStoryCard(overrides={}){
-  return { id:makeStoryCardId(), kind:'generic', title:'Generic Clip / Assignment', labelGroup:'shot', label:'B-roll', source:'', start:null, end:null, cueRefs:[], track:'A', body:'', notes:'', notesOpen:false, ...overrides };
+  return { id:makeStoryCardId(), kind:'generic', title:'Generic Clip / Assignment', labelGroup:'shot', label:'B-roll', source:'', start:null, end:null, cueRefs:[], track:'A', body:'', notes:'', notesOpen:false, textStyle:storyNormalizeTextStyle(overrides.textStyle || {}), ...overrides };
 }
 function createCueStoryCard(payload={}){
   const track = normalizeStoryTrack(payload.track || 'A');
   const cueRefs = (payload.cueIds || payload.cueRefs || []).filter(Boolean);
   const source = payload.source || getCurrentStoryMediaLabel();
-  return { id:makeStoryCardId(), kind:'cue', title:`${source}`, labelGroup:'shot', label:'Main Shot', track, cueRefs, sourceCueRefs:[...cueRefs], body:'', start:payload.start ?? null, end:payload.end ?? null, notes:'', notesOpen:false };
+  return { id:makeStoryCardId(), kind:'cue', title:`${source}`, labelGroup:'shot', label:'Main Shot', track, cueRefs, sourceCueRefs:[...cueRefs], body:'', start:payload.start ?? null, end:payload.end ?? null, notes:'', notesOpen:false, textStyle:storyNormalizeTextStyle(payload.textStyle || {}) };
 }
 function createClipStoryCard(clip){
   const source = getCurrentStoryMediaLabel();
-  const resolved = storyClipCueRefs(clip);
+  const preferredTrack = normalizeStoryTrack(storyActiveSubTrack || subsMode || clip?.track || clip?.subtitleTrack || 'A');
+  const resolved = storyClipCueRefs(clip, preferredTrack);
   const track = resolved.track;
-  const cueRefs = resolved.cueRefs;
+  const cueRefs = storyUniqueRefs(resolved.cueRefs || []);
+  const altCueRefs = resolved.altCueRefs || { A:track === 'A' ? [...cueRefs] : [], B:track === 'B' ? [...cueRefs] : [] };
   const label = (typeof getTimelineClipDisplayName === 'function') ? getTimelineClipDisplayName(clip, 0) : (clip?.label || 'Timeline Clip');
   const start = storyClipStart(clip);
   const end = storyClipEnd(clip);
-  return { id:makeStoryCardId(), kind:'clip', title:`${source}`, labelGroup:'shot', label:'Main Shot', source, clipId:String(clip?.id || ''), track, cueRefs, sourceCueRefs:[...cueRefs], start:Number.isFinite(start) ? start : null, end:Number.isFinite(end) ? end : null, body:cueRefs.length ? '' : (label || ''), notes:'', notesOpen:false };
+  return { id:makeStoryCardId(), kind:'clip', title:(label || source), labelGroup:'shot', label:'Main Shot', source, clipId:String(clip?.id || ''), track, cueRefs, sourceCueRefs:[...cueRefs], altCueRefs:{ A:storyUniqueRefs(altCueRefs.A || []), B:storyUniqueRefs(altCueRefs.B || []) }, start:Number.isFinite(start) ? start : null, end:Number.isFinite(end) ? end : null, body:cueRefs.length ? '' : (label || ''), bodyManual:false, notes:'', notesOpen:false, textStyle:storyNormalizeTextStyle({}) };
 }
 function createCaptionStoryCard(type='Lower Third', text=''){
-  return { id:makeStoryCardId(), kind:'caption', title:type, labelGroup:'caption', label:type, source:'', start:null, end:null, cueRefs:[], track:'A', body:text || '', notes:'', notesOpen:false };
+  return { id:makeStoryCardId(), kind:'caption', title:type, labelGroup:'caption', label:type, source:'', start:null, end:null, cueRefs:[], track:'A', body:text || '', notes:'', notesOpen:false, textStyle:storyNormalizeTextStyle({}) };
 }
 function addStoryCardToRow(rowId, card){
   const row = getStoryRow(rowId) || storyRows.at(-1) || (storyRows.push(createStoryRow()), storyRows.at(-1));
   row.cards.push(card);
+  renderStoryAssembly();
+  storyCommitSharedState(true);
+}
+function addStoryCardsToRow(rowId, cards){
+  const row = getStoryRow(rowId) || storyRows.at(-1) || (storyRows.push(createStoryRow()), storyRows.at(-1));
+  const clean = (Array.isArray(cards) ? cards : [cards]).filter(Boolean);
+  if (!clean.length) return;
+  row.cards.push(...clean);
   renderStoryAssembly();
   storyCommitSharedState(true);
 }
@@ -3780,6 +4186,326 @@ function addCurrentSelectionToStory(){
   const t = (typeof getMediaCurrentTime === 'function') ? getMediaCurrentTime() : 0;
   addStoryCardToRow(storyDefaultRowId(), createGenericStoryCard({ title:getCurrentStoryMediaLabel(), start:t, end:t + 5 }));
 }
+function storyFindCardEl(rowId, cardId){
+  const safeRow = (window.CSS && CSS.escape) ? CSS.escape(String(rowId || '')) : String(rowId || '').replace(/"/g, '\"');
+  const safeCard = (window.CSS && CSS.escape) ? CSS.escape(String(cardId || '')) : String(cardId || '').replace(/"/g, '\"');
+  return storyModeEl?.querySelector?.(`.story-row[data-row-id="${safeRow}"] .story-card[data-card-id="${safeCard}"]`) || null;
+}
+function storySetActiveCard(rowId, cardId){
+  if (!rowId || !cardId) return;
+  storyActiveCardCtx = { rowId:String(rowId), cardId:String(cardId) };
+  storyRefreshActiveCardDom();
+}
+function storyGetActiveCard(){
+  if (!storyActiveCardCtx){
+    const cardEl = document.activeElement?.closest?.('.story-card');
+    const rowEl = cardEl?.closest?.('.story-row');
+    if (rowEl && cardEl) storyActiveCardCtx = { rowId:rowEl.dataset.rowId, cardId:cardEl.dataset.cardId };
+  }
+  const row = getStoryRow(storyActiveCardCtx?.rowId);
+  const card = row?.cards?.find(c => c.id === storyActiveCardCtx?.cardId) || null;
+  return { row, card, rowId:row?.id || storyActiveCardCtx?.rowId || '', cardId:card?.id || storyActiveCardCtx?.cardId || '' };
+}
+function storyRefreshActiveCardDom(){
+  storyModeEl?.querySelectorAll?.('.story-card.is-active').forEach(el => el.classList.remove('is-active'));
+  const { row, card } = storyGetActiveCard();
+  if (!row || !card) return;
+  const cardEl = storyFindCardEl(row.id, card.id);
+  cardEl?.classList.add('is-active');
+  storyApplyTextStyleToCardEl(cardEl, card);
+}
+function storyMutateActiveCardStyle(mutator){
+  // Kept for backward compatibility with older JSON/collab states.  The visible
+  // toolbar now styles only the selected range in the rich Story Card body.
+  const { row, card } = storyGetActiveCard();
+  if (!row || !card || VIEW_ONLY_SESSION) return false;
+  const st = storyNormalizeTextStyle(card.textStyle || {});
+  mutator(st);
+  card.textStyle = storyNormalizeTextStyle(st);
+  storyApplyTextStyleToCardEl(storyFindCardEl(row.id, card.id), card);
+  storyCommitSharedState();
+  return true;
+}
+function storyInsertRowNearActive(where='below'){
+  if (VIEW_ONLY_SESSION) return;
+  const { row } = storyGetActiveCard();
+  const idx = Math.max(0, storyRows.findIndex(r => r.id === row?.id));
+  const at = where === 'above' ? idx : idx + 1;
+  storyRows.splice(Math.min(Math.max(0, at), storyRows.length), 0, createStoryRow());
+  storyHideSelectionToolbar();
+  renderStoryAssembly();
+  storyCommitSharedState(true);
+}
+function storySelectionEditableFromNode(node){
+  const el = node?.nodeType === 1 ? node : node?.parentElement;
+  return el?.closest?.('.story-card-body[contenteditable="true"]') || null;
+}
+function storySelectionContextFromEditable(editable){
+  const cardEl = editable?.closest?.('.story-card');
+  const rowEl = editable?.closest?.('.story-row');
+  const row = rowEl ? getStoryRow(rowEl.dataset.rowId) : null;
+  const card = row && cardEl ? row.cards?.find(c => c.id === cardEl.dataset.cardId) : null;
+  return { editable, cardEl, rowEl, row, card, rowId:row?.id || rowEl?.dataset?.rowId || '', cardId:card?.id || cardEl?.dataset?.cardId || '' };
+}
+function storyGetCurrentRichSelectionContext(){
+  const sel = window.getSelection?.();
+  if (!sel || !sel.rangeCount || sel.isCollapsed) return null;
+  const range = sel.getRangeAt(0);
+  const editable = storySelectionEditableFromNode(range.commonAncestorContainer) || storySelectionEditableFromNode(sel.anchorNode) || storySelectionEditableFromNode(sel.focusNode);
+  if (!editable || !storyModeEl?.contains(editable)) return null;
+  if (!editable.contains(sel.anchorNode) || !editable.contains(sel.focusNode)) return null;
+  const ctx = storySelectionContextFromEditable(editable);
+  if (!ctx.row || !ctx.card) return null;
+  return { ...ctx, range };
+}
+function storyHasSelectionInsideEditable(editable){
+  const sel = window.getSelection?.();
+  if (!sel || !sel.rangeCount || sel.isCollapsed || !editable) return false;
+  return editable.contains(sel.anchorNode) && editable.contains(sel.focusNode);
+}
+function storySaveCurrentRichSelection(){
+  const ctx = storyGetCurrentRichSelectionContext();
+  if (!ctx) return null;
+  storySavedRichSelection = { rowId:ctx.rowId, cardId:ctx.cardId, range:ctx.range.cloneRange() };
+  storySetActiveCard(ctx.rowId, ctx.cardId);
+  return storySavedRichSelection;
+}
+function storyRestoreSavedRichSelection(){
+  if (!storySavedRichSelection?.range) return null;
+  const cardEl = storyFindCardEl(storySavedRichSelection.rowId, storySavedRichSelection.cardId);
+  const editable = cardEl?.querySelector?.('.story-card-body[contenteditable="true"]');
+  if (!editable) return null;
+  const sel = window.getSelection?.();
+  if (!sel) return null;
+  try{
+    sel.removeAllRanges();
+    sel.addRange(storySavedRichSelection.range);
+    editable.focus({ preventScroll:true });
+    return storySelectionContextFromEditable(editable);
+  }catch(_e){ return null; }
+}
+function storyToolbarPositionNearSelection(){
+  const toolbar = storyModeEl?.querySelector?.('#storyFloatToolbar');
+  if (!toolbar || !storySavedRichSelection?.range) return;
+  let rect = null;
+  try{ rect = storySavedRichSelection.range.getBoundingClientRect(); }catch(_e){}
+  if (!rect || (!rect.width && !rect.height)){
+    const ctx = storyRestoreSavedRichSelection();
+    rect = ctx?.editable?.getBoundingClientRect?.() || null;
+  }
+  if (!rect) return;
+  toolbar.classList.remove('is-hidden');
+  toolbar.classList.add('is-open');
+  const pad = 8;
+  const tbRect = toolbar.getBoundingClientRect();
+  const width = tbRect.width || 520;
+  const height = tbRect.height || 34;
+  let left = rect.left + Math.min(Math.max(rect.width / 2, 0), 220) - width / 2;
+  let top = rect.top - height - 10;
+  if (top < pad) top = rect.bottom + 10;
+  left = Math.max(pad, Math.min(left, window.innerWidth - width - pad));
+  top = Math.max(pad, Math.min(top, window.innerHeight - height - pad));
+  toolbar.style.left = `${Math.round(left)}px`;
+  toolbar.style.top = `${Math.round(top)}px`;
+}
+function storyShowSelectionToolbar(){
+  if (!storySaveCurrentRichSelection()) return storyHideSelectionToolbar();
+  storyToolbarPositionNearSelection();
+}
+function storyHideSelectionToolbar(){
+  const toolbar = storyModeEl?.querySelector?.('#storyFloatToolbar');
+  if (!toolbar) return;
+  toolbar.classList.add('is-hidden');
+  toolbar.classList.remove('is-open');
+}
+function storyInstallSelectionToolbarHandlers(){
+  if (storySelectionToolbarBound) return;
+  storySelectionToolbarBound = true;
+  document.addEventListener('selectionchange', () => {
+    if (!isStoryMode || !storyModeEl) return;
+    const toolbar = storyModeEl.querySelector('#storyFloatToolbar');
+    const active = document.activeElement;
+    if (toolbar?.contains(active)) return;
+    const ctx = storyGetCurrentRichSelectionContext();
+    if (ctx) storyShowSelectionToolbar();
+    else if (!toolbar?.matches(':hover')) storyHideSelectionToolbar();
+  });
+  window.addEventListener('resize', () => { if (isStoryMode) storyToolbarPositionNearSelection(); });
+  document.addEventListener('scroll', () => { if (isStoryMode) storyToolbarPositionNearSelection(); }, true);
+  document.addEventListener('pointerdown', ev => {
+    if (!isStoryMode || !storyModeEl) return;
+    const toolbar = storyModeEl.querySelector('#storyFloatToolbar');
+    if (toolbar?.contains(ev.target)) return;
+    if (ev.target?.closest?.('.story-card-body[contenteditable="true"]')) return;
+    setTimeout(storyHideSelectionToolbar, 0);
+    if (!ev.target?.closest?.('#storyMode .story-card')) setTimeout(storyApplyDeferredRemoteRows, 350);
+  }, true);
+}
+function storySyncRichBodyToCard(editable, { commit=true, reconcile=true } = {}){
+  const ctx = storySelectionContextFromEditable(editable);
+  const { row, card, cardEl } = ctx;
+  if (!row || !card || !editable) return false;
+  storySetActiveCard(row.id, card.id);
+  const plain = storyGetRichBodyText(editable);
+  card.body = plain;
+  card.bodyHtml = storySanitizeRichHtml(editable.innerHTML || '');
+  card.bodyManual = true;
+  if (reconcile && (card.kind === 'cue' || (card.kind === 'clip' && (card.cueRefs || []).length))){
+    const result = storyReconcileCueCardFromBody(row, card, plain);
+    if (result.split){
+      renderStoryAssembly();
+      storyCommitSharedState(true);
+      return true;
+    }
+    storyUpdateCardTimecodeDom(cardEl, card);
+  }
+  storyRememberTextareaSize(editable);
+  if (commit) storyCommitSharedState();
+  return true;
+}
+function storySelectedRangeIsInsideEditable(editable){
+  const sel = window.getSelection?.();
+  if (!sel || !sel.rangeCount || sel.isCollapsed || !editable) return false;
+  return editable.contains(sel.anchorNode) && editable.contains(sel.focusNode);
+}
+function storyApplyInlineStyleToSelectedText(styleObj={}){
+  if (VIEW_ONLY_SESSION) return;
+  const ctx = storyRestoreSavedRichSelection();
+  if (!ctx?.editable || !storySelectedRangeIsInsideEditable(ctx.editable) || isStoryCardRemoteLocked(ctx.cardId)) return;
+  storyHandleFocusForCollab(ctx.editable);
+  const sel = window.getSelection?.();
+  if (!sel || !sel.rangeCount || sel.isCollapsed) return;
+  const range = sel.getRangeAt(0);
+  const span = document.createElement('span');
+  Object.entries(styleObj || {}).forEach(([k, v]) => { if (v != null && v !== '') span.style[k] = String(v); });
+  try{
+    span.appendChild(range.extractContents());
+    range.insertNode(span);
+    const newRange = document.createRange();
+    newRange.selectNodeContents(span);
+    sel.removeAllRanges();
+    sel.addRange(newRange);
+  }catch(err){ console.warn('Story inline style failed:', err); return; }
+  storySyncRichBodyToCard(ctx.editable, { commit:true, reconcile:true });
+  storySaveCurrentRichSelection();
+  storyToolbarPositionNearSelection();
+}
+function storyClearSelectedTextFormat(){
+  if (VIEW_ONLY_SESSION) return;
+  const ctx = storyRestoreSavedRichSelection();
+  if (!ctx?.editable || isStoryCardRemoteLocked(ctx.cardId)) return;
+  storyHandleFocusForCollab(ctx.editable);
+  try{ document.execCommand('removeFormat', false, null); }catch(err){ console.warn('Story clear formatting failed:', err); }
+  try{ document.execCommand('unlink', false, null); }catch(_e){}
+  storySyncRichBodyToCard(ctx.editable, { commit:true, reconcile:true });
+  storySaveCurrentRichSelection();
+  storyToolbarPositionNearSelection();
+}
+function storyExecOnSelectedText(cmd, value=null){
+  if (VIEW_ONLY_SESSION) return;
+  if (cmd === 'fontSize') return storyApplyInlineStyleToSelectedText({ fontSize: Math.max(8, Math.min(72, Number(value) || 11)) + 'px' });
+  if (cmd === 'fontName') return storyApplyInlineStyleToSelectedText({ fontFamily: value || 'Arial' });
+  if (cmd === 'foreColor') return storyApplyInlineStyleToSelectedText({ color: value || '#202124' });
+  if (cmd === 'hiliteColor' || cmd === 'backColor') return storyApplyInlineStyleToSelectedText({ backgroundColor: value || '#fff475' });
+  if (cmd === 'removeFormat') return storyClearSelectedTextFormat();
+  const ctx = storyRestoreSavedRichSelection();
+  if (!ctx?.editable || isStoryCardRemoteLocked(ctx.cardId)) return;
+  storyHandleFocusForCollab(ctx.editable);
+  try{ document.execCommand('styleWithCSS', false, true); }catch(_e){}
+  try{ document.execCommand(cmd, false, value); }catch(err){ console.warn('Story toolbar command failed:', cmd, err); }
+  storySyncRichBodyToCard(ctx.editable, { commit:true, reconcile:true });
+  storySaveCurrentRichSelection();
+  storyToolbarPositionNearSelection();
+}
+function storyConvertExecFontSizeToPx(editable, px){
+  const size = Math.max(8, Math.min(72, Number(px) || 11));
+  editable.querySelectorAll('font[size="7"]').forEach(font => {
+    const span = document.createElement('span');
+    span.style.fontSize = size + 'px';
+    span.innerHTML = font.innerHTML;
+    font.replaceWith(span);
+  });
+}
+function storyToolbarFontSizeValue(){
+  const input = storyModeEl?.querySelector?.('[data-story-toolbar="fontSize"]');
+  return Math.max(8, Math.min(72, Number(input?.value || 11) || 11));
+}
+function onStoryToolbarClick(ev){
+  const btn = ev.target?.closest?.('button[data-story-toolbar]');
+  if (!btn) return;
+  ev.preventDefault();
+  const cmd = btn.dataset.storyToolbar;
+  if (cmd === 'insert-row-above') return storyInsertRowNearActive('above');
+  if (cmd === 'insert-row-below') return storyInsertRowNearActive('below');
+  if (cmd === 'bold') return storyExecOnSelectedText('bold');
+  if (cmd === 'italic') return storyExecOnSelectedText('italic');
+  if (cmd === 'underline') return storyExecOnSelectedText('underline');
+  if (cmd === 'strikeThrough') return storyExecOnSelectedText('strikeThrough');
+  if (cmd === 'removeFormat') return storyExecOnSelectedText('removeFormat');
+  if (cmd === 'link'){
+    const url = prompt('Paste link URL');
+    if (!url) return;
+    return storyExecOnSelectedText('createLink', url);
+  }
+  if (cmd === 'font-smaller' || cmd === 'font-larger'){
+    const input = storyModeEl?.querySelector?.('[data-story-toolbar="fontSize"]');
+    const next = Math.max(8, Math.min(72, storyToolbarFontSizeValue() + (cmd === 'font-larger' ? 1 : -1)));
+    if (input) input.value = String(next);
+    return storyExecOnSelectedText('fontSize', String(next));
+  }
+}
+function onStoryToolbarChange(ev){
+  const target = ev.target?.closest?.('[data-story-toolbar]');
+  if (!target) return;
+  const cmd = target.dataset.storyToolbar;
+  if (cmd === 'fontName') return storyExecOnSelectedText('fontName', target.value || 'Arial');
+  if (cmd === 'fontSize') return storyExecOnSelectedText('fontSize', String(storyToolbarFontSizeValue()));
+  if (cmd === 'foreColor') return storyExecOnSelectedText('foreColor', target.value || '#202124');
+  if (cmd === 'hiliteColor'){
+    try{ return storyExecOnSelectedText('hiliteColor', target.value || '#fff475'); }
+    catch(_e){ return storyExecOnSelectedText('backColor', target.value || '#fff475'); }
+  }
+}
+function storyIsRowDragEvent(ev){
+  try{ return !!storyDraggingRowId || Array.from(ev.dataTransfer?.types || []).includes('application/x-transcriber-story-row'); }catch(_e){ return !!storyDraggingRowId; }
+}
+function storyClearRowDropTargets(){
+  storyModeEl?.querySelectorAll?.('.story-row.is-row-drop-target,.story-row.is-row-dragging').forEach(el => el.classList.remove('is-row-drop-target','is-row-dragging'));
+}
+function storyMarkRowDropTarget(ev){
+  storyModeEl?.querySelectorAll?.('.story-row.is-row-drop-target').forEach(el => el.classList.remove('is-row-drop-target'));
+  const rowEl = ev.target?.closest?.('.story-row');
+  if (rowEl && rowEl.dataset.rowId !== storyDraggingRowId) rowEl.classList.add('is-row-drop-target');
+}
+function onStoryDragStart(ev){
+  const handle = ev.target?.closest?.('.story-row-num[data-story-row-drag]');
+  if (!handle || VIEW_ONLY_SESSION) return;
+  const rowEl = handle.closest('.story-row');
+  if (!rowEl) return;
+  storyDraggingRowId = rowEl.dataset.rowId || '';
+  rowEl.classList.add('is-row-dragging');
+  ev.dataTransfer?.setData?.('application/x-transcriber-story-row', storyDraggingRowId);
+  ev.dataTransfer?.setData?.('text/plain', storyDraggingRowId);
+  if (ev.dataTransfer) ev.dataTransfer.effectAllowed = 'move';
+}
+function storyMoveRowBeforeOrAfter(sourceId, targetId, ev){
+  if (!sourceId || !targetId || sourceId === targetId) return false;
+  const from = storyRows.findIndex(r => r.id === sourceId);
+  const to0 = storyRows.findIndex(r => r.id === targetId);
+  if (from < 0 || to0 < 0) return false;
+  const [row] = storyRows.splice(from, 1);
+  let to = storyRows.findIndex(r => r.id === targetId);
+  const targetEl = storyModeEl?.querySelector?.(`.story-row[data-row-id="${CSS.escape(targetId)}"]`);
+  if (targetEl && ev){
+    const rect = targetEl.getBoundingClientRect();
+    if (ev.clientY > rect.top + rect.height / 2) to += 1;
+  }
+  storyRows.splice(Math.max(0, Math.min(to, storyRows.length)), 0, row);
+  storyActiveCardCtx = null;
+  renderStoryAssembly();
+  storyCommitSharedState(true);
+  return true;
+}
 function onStoryPaste(ev){
   const clip = ev.clipboardData || window.clipboardData;
   const custom = clip?.getData?.('application/x-transcriber-cues');
@@ -3792,6 +4518,12 @@ function onStoryPaste(ev){
 }
 function onStoryDrop(ev){
   ev.preventDefault();
+  const rowDrag = ev.dataTransfer?.getData?.('application/x-transcriber-story-row') || storyDraggingRowId;
+  if (rowDrag){
+    const targetRow = ev.target?.closest?.('.story-row')?.dataset?.rowId || '';
+    storyDraggingRowId = '';
+    if (storyMoveRowBeforeOrAfter(rowDrag, targetRow, ev)) return;
+  }
   const custom = ev.dataTransfer?.getData?.('application/x-transcriber-cues');
   if (custom){ try{ addCuePayloadToStory(JSON.parse(custom), getStoryTargetRowIdFromEvent(ev)); return; }catch(_e){} }
 }
@@ -3863,21 +4595,22 @@ installStoryClipboardBridge();
 function storyTextForCard(card){
   if (!card) return '';
   if (card.kind === 'cue'){
-    if (card.bodyManual) return card.body || '';
+    if (card.bodyManual) return card.body || storyPlainTextFromRichHtml(card.bodyHtml || '') || '';
     const track = storyEffectiveTrack(card);
     const range = storyCueRange(storyEffectiveCueRefs(card), track);
     return (range?.cues || []).map(c => c.text || '').join('\n');
   }
   if (card.kind === 'clip'){
+    storyRefreshClipCardCueLinks(card);
     const clip = storyClipById(card.clipId);
     let refs = storyEffectiveCueRefs(card).filter(Boolean);
-    if (!refs.length && clip){
+    if (!refs.length && clip && !card.bodyManual){
       const resolved = storyClipCueRefs(clip, card.track);
       refs = resolved.cueRefs;
-      if (refs.length){ card.track = resolved.track; card.cueRefs = refs; card.body = ''; card.bodyManual = false; }
+      if (refs.length){ card.track = resolved.track; card.cueRefs = refs; card.sourceCueRefs = [...refs]; card.altCueRefs = resolved.altCueRefs || card.altCueRefs; card.body = ''; card.bodyManual = false; }
     }
     if (refs.length){
-      if (card.bodyManual) return card.body || '';
+      if (card.bodyManual) return card.body || storyPlainTextFromRichHtml(card.bodyHtml || '') || '';
       const range = storyCueRange(refs, storyEffectiveTrack(card));
       return (range?.cues || []).map(c => c.text || '').join('\n');
     }
@@ -3895,7 +4628,8 @@ function storyApplyTextareaSizing(root=storyModeEl){
     if (card?.bodyHeight) el.style.height = card.bodyHeight;
     else {
       el.style.height = 'auto';
-      el.style.height = Math.max(118, el.scrollHeight + 4) + 'px';
+      const minH = el.classList?.contains('story-card-richbody') ? 48 : 118;
+      el.style.height = Math.max(minH, el.scrollHeight + 4) + 'px';
     }
   });
 }
@@ -3937,20 +4671,125 @@ function storyInstallCardSelectionStability(){
     const ta = ev.target?.closest?.('.story-card-body') || document.activeElement?.closest?.('.story-card-body');
     if (!ta) return;
     setTimeout(() => {
-      const selected = Number(ta.selectionStart ?? 0) !== Number(ta.selectionEnd ?? 0);
+      const selected = storyHasSelectionInsideEditable(ta);
       ta.__storySelectingText = selected ? true : false;
       ta.__storyPointerStart = null;
     }, 0);
   }, true);
 }
 storyInstallCardSelectionStability();
+window.addEventListener('beforeunload', () => { try{ sendStoryCardUnlock(COLLAB_STORY_LOCKED_CARD_ID); }catch(_e){} });
+function storyRefreshClipCardCueLinks(card){
+  if (!card || card.kind !== 'clip' || card.bodyManual) return;
+  const hasAnyRefs = (Array.isArray(card.cueRefs) && card.cueRefs.length)
+    || (Array.isArray(card.sourceCueRefs) && card.sourceCueRefs.length)
+    || (card.altCueRefs && ((Array.isArray(card.altCueRefs.A) && card.altCueRefs.A.length) || (Array.isArray(card.altCueRefs.B) && card.altCueRefs.B.length)));
+  if (hasAnyRefs) return;
+  const clip = storyClipById(card.clipId);
+  const start = clip ? storyClipStart(clip) : Number(card.start);
+  const end = clip ? storyClipEnd(clip) : Number(card.end);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return;
+  const resolved = storyCueRefBundleForRange(start, end, card.track || storyActiveSubTrack || subsMode || 'A');
+  if (!resolved.cueRefs.length && !resolved.altCueRefs.A.length && !resolved.altCueRefs.B.length) return;
+  card.track = resolved.track;
+  card.cueRefs = storyUniqueRefs(resolved.cueRefs || []);
+  card.sourceCueRefs = [...card.cueRefs];
+  card.altCueRefs = { A:storyUniqueRefs(resolved.altCueRefs.A || []), B:storyUniqueRefs(resolved.altCueRefs.B || []) };
+  card.body = '';
+}
 function storyNormalizeCardsBeforeRender(){
   storyRows.forEach(row => (row.cards || []).forEach(card => {
+    card.textStyle = storyNormalizeTextStyle(card.textStyle || {});
+    if (card.kind === 'clip') storyRefreshClipCardCueLinks(card);
     if ((card.kind === 'cue' || card.kind === 'clip') && (!Array.isArray(card.sourceCueRefs) || !card.sourceCueRefs.length) && Array.isArray(card.cueRefs)){
       card.sourceCueRefs = [...card.cueRefs];
     }
   }));
 }
+
+function updateStoryPlaybackActiveState(t){
+  if (!storyModeEl || !isStoryMode) return;
+  const time = Math.max(0, Number(t) || 0);
+  // Story Mode used to call renderStoryAssembly() on every media timeupdate.
+  // That rebuilt the whole table several times per second, collapsing rich-text
+  // selections and making collab markers/buttons flash. Mirror SRT/TXT modes:
+  // only toggle lightweight active classes on existing DOM nodes.
+  storyModeEl.querySelectorAll('.story-card.story-playhead-active,.story-mini-cue.story-playhead-active').forEach(el => el.classList.remove('story-playhead-active'));
+  storyRows.forEach(row => (row.cards || []).forEach(card => {
+    if (!card || !(card.kind === 'cue' || card.kind === 'clip')) return;
+    const refs = storyEffectiveCueRefs(card);
+    const track = storyEffectiveTrack(card);
+    let hitCue = null;
+    for (const id of refs){
+      const cue = storyCueById(id, track);
+      if (cue && time >= Number(cue.start || 0) && time <= Number(cue.end || 0)){ hitCue = cue; break; }
+    }
+    const range = refs.length ? storyCueRange(refs, track) : storyCardPlaybackRange(card);
+    const inCard = hitCue || (range && time >= Number(range.start || 0) && time <= Number(range.end || 0));
+    if (!inCard) return;
+    const cardEl = storyFindCardEl(row.id, card.id);
+    if (cardEl) cardEl.classList.add('story-playhead-active');
+    if (hitCue && cardEl){
+      const cueEl = cardEl.querySelector(`.story-mini-cue[data-cue-id="${CSS.escape(String(hitCue.id || ''))}"]`);
+      if (cueEl) cueEl.classList.add('story-playhead-active');
+    }
+  }));
+}
+
+function storySelectionIsInsideMode(){
+  try{
+    const sel = window.getSelection?.();
+    if (!sel || !sel.rangeCount || sel.isCollapsed || !storyModeEl) return false;
+    for (let i = 0; i < sel.rangeCount; i++){
+      const r = sel.getRangeAt(i);
+      if (storyModeEl.contains(r.startContainer) || storyModeEl.contains(r.endContainer)) return true;
+    }
+  }catch(_e){}
+  return false;
+}
+function storyIsEditingOrSelecting(){
+  if (!isStoryMode || !storyModeEl) return false;
+  const active = document.activeElement;
+  if (active && active.closest && active.closest('#storyMode .story-card')) return true;
+  if (storySelectionIsInsideMode()) return true;
+  const toolbar = storyModeEl.querySelector('#storyFloatToolbar');
+  if (toolbar && !toolbar.classList.contains('is-hidden') && (toolbar.matches(':hover') || toolbar.contains(active))) return true;
+  return false;
+}
+function storyQueueRemoteRows(rows){
+  if (!Array.isArray(rows)) return false;
+  COLLAB_STORY_DEFERRED_ROWS = rows;
+  storyScheduleDeferredRowsApply();
+  return true;
+}
+function storyScheduleDeferredRowsApply(delay=900){
+  if (COLLAB_STORY_DEFERRED_TIMER) clearTimeout(COLLAB_STORY_DEFERRED_TIMER);
+  COLLAB_STORY_DEFERRED_TIMER = setTimeout(() => {
+    COLLAB_STORY_DEFERRED_TIMER = null;
+    storyApplyDeferredRemoteRows();
+  }, delay);
+}
+function storyApplyDeferredRemoteRows(){
+  if (!COLLAB_STORY_DEFERRED_ROWS) return false;
+  if (storyIsEditingOrSelecting()){
+    storyScheduleDeferredRowsApply(1200);
+    return false;
+  }
+  const rows = COLLAB_STORY_DEFERRED_ROWS;
+  COLLAB_STORY_DEFERRED_ROWS = null;
+  applySharedStoryRows(rows, { remoteUpdate:true });
+  try{ COLLAB_LAST_HASH = hashSessionState(buildShareSessionState()); }catch(_e){}
+  return true;
+}
+function scheduleApplyStoryCollabAwareness(){
+  if (!isStoryMode) return;
+  if (COLLAB_STORY_AWARENESS_TIMER) return;
+  COLLAB_STORY_AWARENESS_TIMER = requestAnimationFrame(() => {
+    COLLAB_STORY_AWARENESS_TIMER = null;
+    applyStoryCollabAwareness();
+  });
+}
+
 function renderStoryAssembly(){
   storyNormalizeCardsBeforeRender();
   const host = storyModeEl?.querySelector('#storyAssembly');
@@ -3958,17 +4797,18 @@ function renderStoryAssembly(){
   ensureStorySeed();
   host.innerHTML = storyRows.map((row, idx) => `
     <section class="story-row" data-row-id="${escapeStoryAttr(row.id)}">
-      <div class="story-row-num">${idx + 1}</div>
+      <div class="story-row-num" draggable="${VIEW_ONLY_SESSION ? 'false' : 'true'}" data-story-row-drag="1" title="Drag to reorder this story row">${idx + 1}</div>
       <div class="story-row-main">
         <div class="story-card-stack">
           ${(row.cards || []).map(card => renderStoryCard(row, card)).join('')}
-          <button class="story-add-card" data-story-action="open-add-menu" type="button">+ Cues / Clips / Captions / Cards</button>
+          <button class="story-add-card" data-story-action="open-add-menu" type="button"${VIEW_ONLY_SESSION ? ' disabled' : ''}>+ Cues / Clips / Captions / Cards</button>
         </div>
-        <div class="story-row-tools"><button class="btn btn-mini" data-story-action="move-row-up" type="button">↑ Row</button><button class="btn btn-mini" data-story-action="move-row-down" type="button">↓ Row</button><button class="btn btn-mini" data-story-action="delete-row" type="button">Delete Row</button></div>
+        <div class="story-row-tools"><button class="btn btn-mini" data-story-action="move-row-up" type="button"${VIEW_ONLY_SESSION ? ' disabled' : ''}>↑ Row</button><button class="btn btn-mini" data-story-action="move-row-down" type="button"${VIEW_ONLY_SESSION ? ' disabled' : ''}>↓ Row</button><button class="btn btn-mini" data-story-action="delete-row" type="button"${VIEW_ONLY_SESSION ? ' disabled' : ''}>Delete Row</button></div>
       </div>
     </section>
   `).join('');
   storyApplyTextareaSizing(host);
+  storyRefreshActiveCardDom();
   applyStoryCollabAwareness();
 }
 
@@ -3985,7 +4825,7 @@ function storyRenderMiniTranscript(row, card){
           const idx = getCueIndexById(cue.id, track);
           return `<div class="story-mini-cue" data-cue-id="${escapeStoryAttr(cue.id)}" data-cue-index="${idx}" data-track="${escapeStoryAttr(track)}">
             <button class="story-mini-time" data-story-action="edit-mini-time" title="Click to edit cue In / Out" type="button">${fmtTC(cue.start)} → ${fmtTC(cue.end)}</button>
-            <div class="story-mini-text" contenteditable="${VIEW_ONLY_SESSION ? 'false' : 'true'}" tabindex="0" spellcheck="false">${escapeHtml(cue.text || '')}</div>
+            <div class="story-mini-text" style="${escapeStoryAttr(storyCardBodyInlineStyle(card))}" contenteditable="${VIEW_ONLY_SESSION ? 'false' : 'true'}" tabindex="0" spellcheck="false">${escapeHtml(cue.text || '')}</div>
           </div>`;
         }).join('')}
       </div>
@@ -4018,18 +4858,103 @@ function storyUpdateCueFromMiniText(cueId, track, text){
   storyScheduleExternalCueSync();
   storyCommitSharedState();
 }
-function sendCollabStoryCursor(rowId, cardId, cueId='', mode='card'){
-  if (!COLLAB_SESSION_ID || VIEW_ONLY_SESSION) return;
+function sendCollabStoryCursor(rowId, cardId, cueId='', mode='card', opts={}){
+  if (!COLLAB_SESSION_ID || VIEW_ONLY_SESSION || !rowId || !cardId) return;
+  const now = Date.now();
+  if (!opts.force && now - COLLAB_STORY_LAST_CURSOR_MS < 350) return;
+  COLLAB_STORY_LAST_CURSOR_MS = now;
   sendCollabEvent({ type:'story_cursor_update', row_id:rowId, card_id:cardId, cue_id:cueId || '', mode });
+}
+function sendStoryCardLock(rowId, cardId, action='edit'){
+  if (!rowId || !cardId || !COLLAB_SESSION_ID || !COLLAB_USER_ID || VIEW_ONLY_SESSION) return false;
+  const now = Date.now();
+  if (COLLAB_STORY_LOCKED_CARD_ID === String(cardId) && now - COLLAB_STORY_LOCK_LAST_SEND_MS < 2500) return true;
+  COLLAB_STORY_LOCKED_CARD_ID = String(cardId);
+  COLLAB_STORY_LOCK_LAST_SEND_MS = now;
+  sendCollabEvent({ type:'lock_story_card', row_id:String(rowId), card_id:String(cardId), action:String(action || 'edit') });
+  return true;
+}
+function sendStoryCardUnlock(cardId=COLLAB_STORY_LOCKED_CARD_ID){
+  if (!cardId || !COLLAB_SESSION_ID || !COLLAB_USER_ID || VIEW_ONLY_SESSION) return false;
+  if (String(cardId) === String(COLLAB_STORY_LOCKED_CARD_ID)) COLLAB_STORY_LOCKED_CARD_ID = '';
+  sendCollabEvent({ type:'unlock_story_card', card_id:String(cardId) });
+  return true;
+}
+function getStoryRemoteLock(cardId){
+  const lock = COLLAB_STORY_LOCKS ? COLLAB_STORY_LOCKS[String(cardId || '')] : null;
+  if (!lock || lock.user_id === COLLAB_USER_ID) return null;
+  return lock;
+}
+function isStoryCardRemoteLocked(cardId){ return !!getStoryRemoteLock(cardId); }
+function storyRowHasRemoteLock(row){
+  return !!(row && Array.isArray(row.cards) && row.cards.some(c => isStoryCardRemoteLocked(c.id)));
+}
+function applyStoryLocksFromList(locks){
+  COLLAB_STORY_LOCKS = {};
+  (locks || []).forEach(l => {
+    if (!l || l.user_id === COLLAB_USER_ID) return;
+    if (l.kind === 'story_card' || l.card_id){
+      COLLAB_STORY_LOCKS[String(l.card_id || '')] = l;
+    }
+  });
+  if (isStoryMode) applyStoryCollabAwareness();
+}
+function storyHandleFocusForCollab(target, opts={}){
+  if (!target || VIEW_ONLY_SESSION) return;
+  const cardEl = target.closest?.('.story-card');
+  const rowEl = target.closest?.('.story-row');
+  if (!cardEl || !rowEl) return;
+  const cardId = cardEl.dataset.cardId || '';
+  const rowId = rowEl.dataset.rowId || '';
+  if (isStoryCardRemoteLocked(cardId)) return;
+  storySetActiveCard(rowId, cardId);
+  if (COLLAB_STORY_LOCKED_CARD_ID && COLLAB_STORY_LOCKED_CARD_ID !== cardId) sendStoryCardUnlock(COLLAB_STORY_LOCKED_CARD_ID);
+  sendStoryCardLock(rowId, cardId, 'edit');
+  const mini = target.closest?.('.story-mini-cue');
+  sendCollabStoryCursor(rowId, cardId, mini?.dataset?.cueId || '', mini ? 'mini' : 'card', { force: !!opts.force });
+}
+function storyScheduleUnlockIfBlurred(cardId){
+  if (!cardId) return;
+  setTimeout(() => {
+    const activeCard = document.activeElement?.closest?.('.story-card');
+    if (!activeCard || activeCard.dataset.cardId !== String(cardId)){
+      sendStoryCardUnlock(cardId);
+    }
+  }, 450);
 }
 function applyStoryCollabAwareness(){
   if (!storyModeEl || !isStoryMode) return;
   ensureCollabAwarenessStyle();
   storyModeEl.querySelectorAll('.story-user-marker').forEach(el => el.remove());
-  storyModeEl.querySelectorAll('.story-card.story-remote-active,.story-mini-cue.story-remote-active').forEach(el => {
-    el.classList.remove('story-remote-active');
+  storyModeEl.querySelectorAll('.story-card.story-remote-active,.story-mini-cue.story-remote-active,.story-card.story-remote-locked').forEach(el => {
+    el.classList.remove('story-remote-active','story-remote-locked');
     el.style.removeProperty('--collab-color');
   });
+  if (!VIEW_ONLY_SESSION){
+    storyModeEl.querySelectorAll('.story-card input,.story-card textarea,.story-card select,.story-card button').forEach(el => { try{ el.disabled = false; }catch(_e){} });
+    storyModeEl.querySelectorAll('.story-card-body,.story-mini-text').forEach(el => { try{ el.contentEditable = 'true'; }catch(_e){} });
+  }
+  const now = Date.now();
+  for (const [uid, v] of Object.entries(COLLAB_REMOTE_STORY || {})){
+    if (!v || now - Number(v.ts || 0) > 15000) delete COLLAB_REMOTE_STORY[uid];
+  }
+  for (const [cardId, lock] of Object.entries(COLLAB_STORY_LOCKS || {})){
+    if (!lock || now - Number(lock.updated_at ? lock.updated_at * 1000 : lock.ts || 0) > 60000) { delete COLLAB_STORY_LOCKS[cardId]; continue; }
+    const card = storyModeEl.querySelector(`.story-card[data-card-id="${CSS.escape(String(cardId || ''))}"]`);
+    if (!card) continue;
+    card.classList.add('story-remote-locked');
+    if (!VIEW_ONLY_SESSION){
+      card.querySelectorAll('input,textarea,select,button').forEach(el => { try{ if (!el.classList?.contains('story-timecode')) el.disabled = true; }catch(_e){} });
+      card.querySelectorAll('.story-card-body,.story-mini-text').forEach(el => { try{ el.contentEditable = 'false'; }catch(_e){} });
+    }
+    const color = lock.user_color || collabUserColor(lock.user_id);
+    card.style.setProperty('--collab-color', color);
+    const mark = document.createElement('span');
+    mark.className = 'story-user-marker story-lock-marker';
+    mark.style.setProperty('--collab-color', color);
+    mark.textContent = `${lock.user_label || collabUserName(lock.user_id)} editing`;
+    card.appendChild(mark);
+  }
   for (const [uid, v] of Object.entries(COLLAB_REMOTE_STORY || {})){
     if (uid === COLLAB_USER_ID || !v) continue;
     const color = collabUserColor(uid);
@@ -4063,6 +4988,11 @@ function renderStoryCard(row, card){
   const labelColor = STORY_LABEL_COLORS[labelGroup] || STORY_LABEL_COLORS.generic;
   const groupOptions = Object.keys(STORY_LABELS).map(g => `<option value="${g}" ${g === labelGroup ? 'selected' : ''}>${g === 'audio' ? 'Audio' : 'Shot'}</option>`).join('');
   const labelOptions = (STORY_LABELS[labelGroup] || STORY_LABELS.shot).map(l => `<option value="${escapeStoryAttr(l)}" ${l === card.label ? 'selected' : ''}>${escapeHtml(l)}</option>`).join('');
+  const remoteLock = getStoryRemoteLock(card.id);
+  const storyLocked = !!VIEW_ONLY_SESSION || !!remoteLock;
+  const disabledAttr = storyLocked ? ' disabled' : '';
+  const editableAttr = storyLocked ? 'false' : 'true';
+  const lockedTitle = remoteLock ? `${escapeStoryAttr(remoteLock.user_label || collabUserName(remoteLock.user_id))} is editing this Story Card` : '';
   const foot = isCue
     ? `${escapeHtml(card.source || getCurrentStoryMediaLabel())} · Live CueRefs: ${effectiveRefs.length} · Track ${escapeHtml(effectiveTrack)}`
     : isClip
@@ -4070,23 +5000,26 @@ function renderStoryCard(row, card){
       : card.kind === 'caption'
         ? 'Caption / lower third card'
         : 'Generic editorial card';
+  const timeTitle = (card.kind === 'generic' || card.kind === 'caption') ? 'Click to edit In / Out' : 'Click to preview this range';
   return `
-    <article class="story-card ${isLive ? 'is-live' : 'is-generic'} ${card.notesOpen ? 'notes-open' : ''}" data-card-id="${escapeStoryAttr(card.id)}">
+    <article class="story-card ${isLive ? 'is-live' : 'is-generic'} ${card.notesOpen ? 'notes-open' : ''} ${remoteLock ? 'story-remote-locked' : ''}" data-card-id="${escapeStoryAttr(card.id)}" ${lockedTitle ? `title="${lockedTitle}"` : ''}>
       <div class="story-card-top">
         <span class="story-live-dot" title="${isLive ? 'Live linked' : 'Manual / placeholder card'}"></span>
-        <input class="story-card-title" data-card-field="title" value="${escapeStoryAttr(card.title || '')}" placeholder="Card title">
-        <div class="story-card-move"><button data-story-action="move-card-up" title="Move card up" type="button">↑</button><button data-story-action="move-card-down" title="Move card down" type="button">↓</button></div><button class="story-card-delete" data-story-action="delete-card" title="Delete card" type="button">×</button>
+        <div class="story-card-labels">${card.kind === 'caption' ? `<span class="story-caption-pill">${escapeHtml(card.label || card.title || 'Lower Third')}</span>` : `<select class="story-label-group" data-card-field="labelGroup"${disabledAttr}>${groupOptions}</select><select class="story-label" data-card-field="label" style="--label-color:${escapeHtml(labelColor)}"${disabledAttr}>${labelOptions}</select>`}</div>
+        <div class="story-card-move"><button data-story-action="move-card-up" title="Move card up" type="button"${disabledAttr}>↑</button><button data-story-action="move-card-down" title="Move card down" type="button"${disabledAttr}>↓</button></div><button class="story-card-delete" data-story-action="delete-card" title="Delete card" type="button"${disabledAttr}>×</button>
+      </div>
+      <div class="story-card-name-row">
+        <input class="story-card-title" data-card-field="title" value="${escapeStoryAttr(card.title || '')}" placeholder="Clip / card name"${disabledAttr}>
       </div>
       <div class="story-card-meta">
-        <button class="story-timecode" data-story-action="seek-card" type="button">${escapeHtml(tc)}</button>
-        ${card.kind === 'caption' ? `<span class="story-caption-pill">${escapeHtml(card.label || card.title || 'Lower Third')}</span>` : `<select class="story-label-group" data-card-field="labelGroup">${groupOptions}</select><select class="story-label" data-card-field="label" style="--label-color:${escapeHtml(labelColor)}">${labelOptions}</select>`}
+        <button class="story-timecode" data-story-action="seek-card" title="${escapeStoryAttr(timeTitle)}" type="button">${escapeHtml(tc)}</button>
       </div>
       <div class="story-card-body-shell ${card.editMode ? 'is-mini-editing' : ''}">
-        ${card.editMode ? storyRenderMiniTranscript(row, card) : `<textarea class="story-card-body" data-card-field="body" style="${card.bodyWidth ? `width:${escapeStoryAttr(card.bodyWidth)};` : ''}${card.bodyHeight ? `height:${escapeStoryAttr(card.bodyHeight)};` : ''}" placeholder="Transcript, assignment, VO, graphics, or B-roll instruction">${escapeHtml(text)}</textarea>`}
+        ${card.editMode ? storyRenderMiniTranscript(row, card) : `<div class="story-card-body story-card-richbody" data-card-field="body" contenteditable="${editableAttr}" tabindex="0" spellcheck="true" data-placeholder="Transcript, assignment, VO, graphics, or B-roll instruction" style="${escapeStoryAttr(storyCardBodyInlineStyle(card))}${card.bodyWidth ? `width:${escapeStoryAttr(card.bodyWidth)};` : ''}${card.bodyHeight ? `height:${escapeStoryAttr(card.bodyHeight)};` : ''}">${storyRichBodyHtmlForCard(card, text)}</div>`}
         <button class="story-notes-tab" data-story-action="toggle-card-notes" type="button">Notes</button>
       </div>
       <div class="story-card-notes-wrap" ${card.notesOpen ? '' : 'hidden'}>
-        <textarea class="story-card-notes" data-card-field="notes" placeholder="Producer notes / graphics / edit instructions">${escapeHtml(card.notes || '')}</textarea>
+        <textarea class="story-card-notes" data-card-field="notes" placeholder="Producer notes / graphics / edit instructions"${disabledAttr}>${escapeHtml(card.notes || '')}</textarea>
       </div>
       <div class="story-card-foot">${foot}</div>
     </article>`;
@@ -4117,21 +5050,25 @@ function storyCueTextAppearsInBody(cue, raw, normalizedBody, lines){
     return hits / Math.max(1, words.length) >= 0.65;
   });
 }
-function storyBaseCueRefsForCard(card){
+function storyBaseCueRefsForCard(card, trackOverride=null){
   if (!card || !(card.kind === 'cue' || card.kind === 'clip')) return [];
+  const track = normalizeStoryTrack(trackOverride || storyEffectiveTrack(card) || card.track || 'A');
+  const baseTrack = normalizeStoryTrack(card.track || 'A');
+  if (card.altCueRefs && Array.isArray(card.altCueRefs[track]) && card.altCueRefs[track].length) return [...card.altCueRefs[track]];
   // sourceCueRefs is the durable original selection.  It lets Ctrl+Z restore
   // cue membership when the user brings deleted cue text back into the card.
-  if (Array.isArray(card.sourceCueRefs) && card.sourceCueRefs.length) return [...card.sourceCueRefs];
+  if (track === baseTrack && Array.isArray(card.sourceCueRefs) && card.sourceCueRefs.length) return [...card.sourceCueRefs];
   const refs = Array.isArray(card.cueRefs) ? [...card.cueRefs] : [];
-  card.sourceCueRefs = [...refs];
+  if (track === baseTrack) card.sourceCueRefs = [...refs];
   return refs;
 }
-function storyCueGroupsFromBody(card, value){
+function storyCueGroupsFromBody(card, value, trackOverride=null){
   const raw = String(value ?? '');
   const normalizedBody = storyNormalizeTextForMatch(raw);
   const lines = raw.split(/\r?\n/).map(storyNormalizeTextForMatch).filter(Boolean);
-  const baseRefs = storyBaseCueRefsForCard(card);
-  const kept = baseRefs.filter(id => storyCueTextAppearsInBody(storyCueById(id, card.track || 'A'), raw, normalizedBody, lines));
+  const track = normalizeStoryTrack(trackOverride || storyEffectiveTrack(card) || card?.track || 'A');
+  const baseRefs = storyBaseCueRefsForCard(card, track);
+  const kept = baseRefs.filter(id => storyCueTextAppearsInBody(storyCueById(id, track), raw, normalizedBody, lines));
   const groups = [];
   let current = [];
   baseRefs.forEach(id => {
@@ -4139,7 +5076,7 @@ function storyCueGroupsFromBody(card, value){
     else if (current.length){ groups.push(current); current = []; }
   });
   if (current.length) groups.push(current);
-  return { baseRefs, kept, groups };
+  return { baseRefs, kept, groups, track };
 }
 function storyMakeSplitCardFromCueGroup(card, cueRefs){
   const copy = { ...card, id:makeStoryCardId(), cueRefs:[...cueRefs], sourceCueRefs:[...cueRefs], body:'', bodyManual:false, notes:'', notesOpen:false };
@@ -4148,12 +5085,73 @@ function storyMakeSplitCardFromCueGroup(card, cueRefs){
   copy.end = range ? range.end : null;
   return copy;
 }
+function storyApplyCueGroupsToCard(row, card, groups, trackOverride=null){
+  if (!row || !card) return false;
+  const idx = row.cards.findIndex(c => c.id === card.id);
+  if (idx < 0) return false;
+  const cleanGroups = (groups || []).map(g => (g || []).filter(Boolean)).filter(g => g.length);
+  const track = normalizeStoryTrack(trackOverride || storyEffectiveTrack(card) || card.track || 'A');
+  if (!cleanGroups.length){
+    row.cards.splice(idx, 1);
+    return true;
+  }
+  card.track = track;
+  card.cueRefs = [...cleanGroups[0]];
+  card.sourceCueRefs = [...cleanGroups[0]];
+  if (card.altCueRefs && typeof card.altCueRefs === 'object') card.altCueRefs[track] = [...cleanGroups[0]];
+  card.body = '';
+  card.bodyManual = false;
+  const firstRange = storyCardRange(card);
+  card.start = firstRange ? firstRange.start : null;
+  card.end = firstRange ? firstRange.end : null;
+  if (cleanGroups.length > 1){
+    const splitCards = cleanGroups.slice(1).map(g => {
+      const split = storyMakeSplitCardFromCueGroup(card, g);
+      split.track = track;
+      if (split.altCueRefs && typeof split.altCueRefs === 'object'){
+        split.altCueRefs = { A:[], B:[] };
+        split.altCueRefs[track] = [...g];
+      }
+      return split;
+    });
+    row.cards.splice(idx + 1, 0, ...splitCards);
+  }
+  return true;
+}
+function storyCueRefGroupsAfterRemoving(card, removeCueId, trackOverride=null){
+  const track = normalizeStoryTrack(trackOverride || storyEffectiveTrack(card) || card?.track || 'A');
+  const effective = storyEffectiveCueRefs(card);
+  const refs = effective.length ? [...effective] : storyBaseCueRefsForCard(card, track);
+  const groups = [];
+  let cur = [];
+  refs.forEach(id => {
+    if (String(id) === String(removeCueId)){
+      if (cur.length){ groups.push(cur); cur = []; }
+    } else {
+      cur.push(id);
+    }
+  });
+  if (cur.length) groups.push(cur);
+  return groups;
+}
+function storyRemoveCueFromCard(rowId, cardId, cueId, trackOverride=null){
+  const { row, card } = storyFindCard(rowId, cardId);
+  if (!row || !card || !(card.kind === 'cue' || card.kind === 'clip') || !cueId) return false;
+  const track = normalizeStoryTrack(trackOverride || storyEffectiveTrack(card) || card.track || 'A');
+  const ok = storyApplyCueGroupsToCard(row, card, storyCueRefGroupsAfterRemoving(card, cueId, track), track);
+  if (ok){
+    renderStoryAssembly();
+    storyCommitSharedState(true);
+  }
+  return ok;
+}
 function storyReconcileCueCardFromBody(row, card, value){
   if (!row || !card || !(card.kind === 'cue' || card.kind === 'clip')) return { changed:false, split:false };
-  const { baseRefs, kept, groups } = storyCueGroupsFromBody(card, value);
+  const activeTrack = normalizeStoryTrack(storyEffectiveTrack(card) || card.track || 'A');
+  const { baseRefs, kept, groups } = storyCueGroupsFromBody(card, value, activeTrack);
   if (!baseRefs.length) return { changed:false, split:false };
 
-  const oldRefs = [...(card.cueRefs || [])];
+  const oldRefs = storyEffectiveCueRefs(card).length ? [...storyEffectiveCueRefs(card)] : [...(card.cueRefs || [])];
   const changed = JSON.stringify(oldRefs) !== JSON.stringify(kept);
 
   // If the user deletes cue text from the middle of a live selection, the
@@ -4161,26 +5159,18 @@ function storyReconcileCueCardFromBody(row, card, value){
   // represent those as separate cards, while leaving the real transcript/SRT
   // untouched.
   if (groups.length > 1){
-    const idx = row.cards.findIndex(c => c.id === card.id);
-    if (idx >= 0){
-      card.cueRefs = [...groups[0]];
-      card.sourceCueRefs = [...groups[0]];
-      card.body = '';
-      card.bodyManual = false;
-      const firstRange = storyCardRange(card);
-      card.start = firstRange ? firstRange.start : null;
-      card.end = firstRange ? firstRange.end : null;
-      const splitCards = groups.slice(1).map(g => storyMakeSplitCardFromCueGroup(card, g));
-      row.cards.splice(idx + 1, 0, ...splitCards);
+    if (storyApplyCueGroupsToCard(row, card, groups, activeTrack)){
       return { changed:true, split:true };
     }
   }
 
   if (changed){
+    card.track = activeTrack;
     card.cueRefs = kept;
     // Keep the full sourceCueRefs so browser Ctrl+Z can restore membership if
     // the restored body text contains those cues again.
     card.sourceCueRefs = [...baseRefs];
+    if (card.altCueRefs && typeof card.altCueRefs === 'object') card.altCueRefs[activeTrack] = [...kept];
     const range = storyCardRange(card);
     card.start = range ? range.start : null;
     card.end = range ? range.end : null;
@@ -4215,39 +5205,31 @@ function onStoryInput(ev){
     const rowEl0 = miniText.closest('.story-row');
     const cueId = cueEl?.dataset?.cueId || '';
     const track = cueEl?.dataset?.track || 'A';
-    storyUpdateCueFromMiniText(cueId, track, miniText.textContent || '');
     const { card } = storyFindCard(rowEl0?.dataset?.rowId, cardEl0?.dataset?.cardId);
+    if (card && isStoryCardRemoteLocked(card.id)) return;
+    storyHandleFocusForCollab(miniText);
+    storyUpdateCueFromMiniText(cueId, track, miniText.textContent || '');
     if (card){ card.bodyManual = false; card.body = ''; storyUpdateCardTimecodeDom(cardEl0, card); }
     sendCollabStoryCursor(rowEl0?.dataset?.rowId, cardEl0?.dataset?.cardId, cueId, 'mini');
     return;
   }
+  const richBody = ev.target.closest?.('.story-card-body[data-card-field="body"]');
   const rowEl = ev.target.closest?.('.story-row');
   const cardEl = ev.target.closest?.('.story-card');
   const row = rowEl ? getStoryRow(rowEl.dataset.rowId) : null;
   if (!row || !cardEl) return;
   const card = (row.cards || []).find(c => c.id === cardEl.dataset.cardId);
-  if (!card) return;
-  const field = ev.target.dataset.cardField;
-  if (field === 'title') card.title = ev.target.value;
-  if (field === 'body'){
-    if (!card.bodyHeight) { ev.target.style.height = 'auto'; ev.target.style.height = Math.max(118, ev.target.scrollHeight + 4) + 'px'; }
+  if (!card || isStoryCardRemoteLocked(card.id)) return;
+  storySetActiveCard(row.id, card.id);
+  storyHandleFocusForCollab(ev.target);
+  if (richBody){
+    if (!card.bodyHeight) { richBody.style.height = 'auto'; richBody.style.height = Math.max(48, richBody.scrollHeight + 4) + 'px'; }
     // Story Mode body edits are assembly edits. They must not mutate the real transcript/subtitle cues.
-    // If a user removes cue text from this field, we treat that as removing that cue from this card selection only.
-    card.body = ev.target.value;
-    if (card.kind === 'cue' || (card.kind === 'clip' && (card.cueRefs || []).length)){
-      card.bodyManual = true;
-      const reconcile = storyReconcileCueCardFromBody(row, card, ev.target.value);
-      if (reconcile.split){
-        renderStoryAssembly();
-        return;
-      }
-      // Ctrl+Z/Undo can restore previously removed cue text.  Reconcile checks
-      // the durable sourceCueRefs and updates the displayed timecode both ways.
-      storyUpdateCardTimecodeDom(cardEl, card);
-    }
-    storyRememberTextareaSize(ev.target);
-    storyCommitSharedState();
+    storySyncRichBodyToCard(richBody, { commit:true, reconcile:true });
+    return;
   }
+  const field = ev.target.dataset.cardField;
+  if (field === 'title') { card.title = ev.target.value; storyCommitSharedState(); }
   if (field === 'notes') { card.notes = ev.target.value; storyCommitSharedState(); }
 }
 function updateLiveStoryCueText(card, value){
@@ -4269,7 +5251,9 @@ function onStoryChange(ev){
   const row = rowEl ? getStoryRow(rowEl.dataset.rowId) : null;
   if (!row || !cardEl) return;
   const card = (row.cards || []).find(c => c.id === cardEl.dataset.cardId);
-  if (!card) return;
+  if (!card || isStoryCardRemoteLocked(card.id)) return;
+  storySetActiveCard(row.id, card.id);
+  storyHandleFocusForCollab(ev.target);
   const field = ev.target.dataset.cardField;
   if (field === 'labelGroup'){
     card.labelGroup = ev.target.value;
@@ -4278,6 +5262,47 @@ function onStoryChange(ev){
     renderStoryAssembly();
   } else if (field === 'label') card.label = ev.target.value;
   storyCommitSharedState();
+}
+
+let MEDIA_RANGE_PREVIEW_STOPPER = null;
+function stopMediaRangePreview(){
+  try{ if (typeof MEDIA_RANGE_PREVIEW_STOPPER === 'function') MEDIA_RANGE_PREVIEW_STOPPER(); }catch(_e){}
+  MEDIA_RANGE_PREVIEW_STOPPER = null;
+}
+function previewMediaRange(start, end, { label='Preview', onStop=null } = {}){
+  const f = (typeof getFPS === 'function') ? getFPS() : 25;
+  const s = Math.max(0, Number(start) || 0);
+  const e = Math.max(s + (1 / f), Number(end) || 0);
+  if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s){ alert('No valid In / Out range to preview.'); return null; }
+  stopMediaRangePreview();
+  let done = false;
+  let timer = null;
+  const stopAt = Math.max(s + 0.02, e);
+  const finish = ({ pause=true } = {}) => {
+    if (done) return;
+    done = true;
+    if (timer) clearInterval(timer);
+    timer = null;
+    try{ player?.removeEventListener('timeupdate', check); }catch(_e){}
+    try{ player?.removeEventListener('pause', cancelOnly); }catch(_e){}
+    try{ player?.removeEventListener('ended', finish); }catch(_e){}
+    MEDIA_RANGE_PREVIEW_STOPPER = null;
+    if (pause) { try{ pauseMedia?.(); }catch(_e){ try{ player?.pause?.(); }catch(_e2){} } }
+    try{ onStop?.(); }catch(_e){}
+  };
+  const cancelOnly = () => finish({ pause:false });
+  function check(){
+    const t = (typeof getMediaCurrentTime === 'function') ? getMediaCurrentTime() : (player?.currentTime || 0);
+    if (Number(t) >= stopAt - 0.015){
+      finish({ pause:true });
+    }
+  }
+  MEDIA_RANGE_PREVIEW_STOPPER = finish;
+  try{ player?.addEventListener('timeupdate', check); player?.addEventListener('pause', cancelOnly, { once:true }); player?.addEventListener('ended', finish, { once:true }); }catch(_e){}
+  timer = setInterval(check, 90);
+  try{ timelineSetStatus?.(`${label}: ${fmtTimelineTime ? fmtTimelineTime(s) : fmtTC(s)} → ${fmtTimelineTime ? fmtTimelineTime(e) : fmtTC(e)}`); }catch(_e){}
+  seekMediaTo(Math.max(0, s) + 0.001, { play:true });
+  return finish;
 }
 
 let STORY_PREVIEW_STOPPER = null;
@@ -4300,25 +5325,102 @@ function storyCardPlaybackRange(card){
 function storyPreviewCardRange(card){
   const range = storyCardPlaybackRange(card);
   if (!range) return;
-  try{
-    if (typeof STORY_PREVIEW_STOPPER === 'function') STORY_PREVIEW_STOPPER();
-  }catch(_e){}
-  const stopAt = Math.max(Number(range.start) + 0.02, Number(range.end));
-  const stop = () => {
-    try{ player?.removeEventListener('timeupdate', onTime); }catch(_e){}
-    try{ player?.removeEventListener('pause', stop); }catch(_e){}
-    STORY_PREVIEW_STOPPER = null;
+  try{ if (typeof STORY_PREVIEW_STOPPER === 'function') STORY_PREVIEW_STOPPER(); }catch(_e){}
+  STORY_PREVIEW_STOPPER = previewMediaRange(range.start, range.end, {
+    label:'Story preview',
+    onStop: () => { STORY_PREVIEW_STOPPER = null; }
+  });
+}
+
+let storyCardTimePopover = null;
+function storyCanEditCardTimecode(card){
+  return !!card && (card.kind === 'generic' || card.kind === 'caption');
+}
+function ensureStoryCardTimePopover(){
+  if (storyCardTimePopover) return storyCardTimePopover;
+  ensureTxtTimePopover?.();
+  storyCardTimePopover = document.createElement('div');
+  storyCardTimePopover.id = 'storyCardTimePopover';
+  storyCardTimePopover.className = 'txt-time-popover story-card-time-popover';
+  storyCardTimePopover.style.display = 'none';
+  storyCardTimePopover.innerHTML = `
+    <div class="tc-pop-title">Edit Story Card timecode</div>
+    <label><span>In</span><input id="storyCardTcIn" type="text" placeholder="00:00:00:00"></label>
+    <label><span>Out</span><input id="storyCardTcOut" type="text" placeholder="00:00:00:00"></label>
+    <div class="txt-time-note">Updates this manual Story Card only. Transcript and alignment cues are not changed.</div>
+    <div class="txt-time-actions">
+      <button type="button" id="storyCardTcSeek">Seek</button>
+      <button type="button" id="storyCardTcCancel">Cancel</button>
+      <button type="button" class="primary" id="storyCardTcApply">Apply</button>
+    </div>`;
+  document.body.appendChild(storyCardTimePopover);
+  document.addEventListener('click', ev => {
+    if (!storyCardTimePopover.classList.contains('is-open')) return;
+    if (storyCardTimePopover.contains(ev.target) || ev.target?.closest?.('.story-timecode')) return;
+    hideStoryCardTimePopover();
+  });
+  window.addEventListener('resize', hideStoryCardTimePopover);
+  window.addEventListener('scroll', hideStoryCardTimePopover, true);
+  return storyCardTimePopover;
+}
+function hideStoryCardTimePopover(){
+  if (!storyCardTimePopover) return;
+  try{ if (storyCardTimePopover.__ctx?.cardId) sendStoryCardUnlock(storyCardTimePopover.__ctx.cardId); }catch(_e){}
+  storyCardTimePopover.classList.remove('is-open');
+  storyCardTimePopover.style.display = 'none';
+  storyCardTimePopover.__ctx = null;
+}
+function positionStoryCardTimePopover(anchor){
+  if (!storyCardTimePopover || !anchor) return;
+  const r = anchor.getBoundingClientRect();
+  const w = 270, h = 190;
+  storyCardTimePopover.style.position = 'fixed';
+  storyCardTimePopover.style.left = Math.min(window.innerWidth - w - 10, Math.max(10, r.left)) + 'px';
+  let top = r.bottom + 8;
+  if (top + h > window.innerHeight - 10) top = Math.max(10, r.top - h - 8);
+  storyCardTimePopover.style.top = top + 'px';
+}
+function showStoryCardTimePopover(ev, rowId, cardId){
+  const { row, card } = storyFindCard(rowId, cardId);
+  if (!row || !card || !storyCanEditCardTimecode(card)) return;
+  if (isStoryCardRemoteLocked(card.id)){ storyPreviewCardRange(card); return; }
+  const pop = ensureStoryCardTimePopover();
+  pop.__ctx = { rowId, cardId };
+  sendStoryCardLock(rowId, cardId, 'timecode');
+  sendCollabStoryCursor(rowId, cardId, '', 'timecode', { force:true });
+  const f = getFPS();
+  const now = (typeof getMediaCurrentTime === 'function') ? getMediaCurrentTime() : 0;
+  const s = Number.isFinite(Number(card.start)) ? Number(card.start) : now;
+  const e = Number.isFinite(Number(card.end)) && Number(card.end) > s ? Number(card.end) : s + 5;
+  const inInput = pop.querySelector('#storyCardTcIn');
+  const outInput = pop.querySelector('#storyCardTcOut');
+  if (inInput) inInput.value = fmtTC(s, f);
+  if (outInput) outInput.value = fmtTC(e, f);
+  const locked = !!VIEW_ONLY_SESSION || isStoryCardRemoteLocked(card.id);
+  [inInput, outInput, pop.querySelector('#storyCardTcApply')].forEach(el => { if (el) el.disabled = locked; });
+  pop.querySelector('#storyCardTcSeek').onclick = () => seekMediaTo(Math.max(0, s) + 0.001, { play:false });
+  pop.querySelector('#storyCardTcCancel').onclick = hideStoryCardTimePopover;
+  pop.querySelector('#storyCardTcApply').onclick = () => {
+    const live = pop.__ctx || { rowId, cardId };
+    const found = storyFindCard(live.rowId, live.cardId);
+    const liveCard = found.card;
+    if (!liveCard || !storyCanEditCardTimecode(liveCard) || VIEW_ONLY_SESSION || isStoryCardRemoteLocked(liveCard.id)) return;
+    const s2 = parseDisplayedTcToSeconds(inInput.value, f);
+    const e2 = parseDisplayedTcToSeconds(outInput.value, f);
+    if (s2 == null || e2 == null){ alert('Invalid timecode. Use HH:MM:SS:FF.'); return; }
+    if (e2 <= s2){ alert('Out timecode must be after In timecode.'); return; }
+    liveCard.start = Math.max(0, s2);
+    liveCard.end = Math.max(liveCard.start + (1 / f), e2);
+    hideStoryCardTimePopover();
+    renderStoryAssembly();
+    storyCommitSharedState(true);
+    seekMediaTo(Math.max(0, liveCard.start) + 0.001, { play:false });
   };
-  const onTime = () => {
-    const t = (typeof getMediaCurrentTime === 'function') ? getMediaCurrentTime() : (player?.currentTime || 0);
-    if (Number(t) >= stopAt - 0.015){
-      try{ pauseMedia?.(); }catch(_e){ try{ player.pause(); }catch(_e2){} }
-      stop();
-    }
-  };
-  STORY_PREVIEW_STOPPER = stop;
-  try{ player?.addEventListener('timeupdate', onTime); player?.addEventListener('pause', stop, { once:true }); }catch(_e){}
-  seekMediaTo(Math.max(0, Number(range.start)) + 0.001, { play:true });
+  const anchor = ev?.target?.closest?.('.story-timecode') || ev?.target || ev?.currentTarget;
+  positionStoryCardTimePopover(anchor);
+  pop.style.display = 'block';
+  pop.classList.add('is-open');
+  setTimeout(() => { try{ inInput?.focus({preventScroll:true}); inInput?.select(); }catch(_e){} }, 0);
 }
 
 function onStoryClick(ev){
@@ -4326,18 +5428,20 @@ function onStoryClick(ev){
   const rowEl = ev.target.closest?.('.story-row');
   const cardEl = ev.target.closest?.('.story-card');
   const row = rowEl ? getStoryRow(rowEl.dataset.rowId) : null;
+  if (row && cardEl) storySetActiveCard(row.id, cardEl.dataset.cardId);
 
   // In normal Story Card view, clicking a cue line in the textarea should seek
   // to that cue's exact timecode.  Use the click Y position, not the stale
   // textarea caret, because a normal click may not update selectionStart until
   // after this delegated handler has already run.
-  if (ev.target?.classList?.contains('story-card-body') && row && cardEl){
-    const bodyEl = ev.target;
+  const clickedBody = ev.target?.closest?.('.story-card-body');
+  if (clickedBody && row && cardEl){
+    const bodyEl = clickedBody;
     const card = row.cards?.find(c => c.id === cardEl.dataset.cardId);
     // Do not run click-to-seek while the user is selecting text. Calling seek
     // can move focus to the video player in some browsers and immediately
-    // collapse the textarea selection/caret.
-    const hasTextSelection = Number(bodyEl.selectionStart ?? 0) !== Number(bodyEl.selectionEnd ?? 0);
+    // collapse the rich-text selection/caret.
+    const hasTextSelection = storyHasSelectionInsideEditable(bodyEl);
     const wasSelecting = !!bodyEl.__storySelectingText;
     if (card && (card.kind === 'cue' || card.kind === 'clip') && !hasTextSelection && !wasSelecting){
       window.__storyLastContextY = ev.clientY;
@@ -4360,6 +5464,10 @@ function onStoryClick(ev){
     }
   }
   if (!action || !row) return;
+  const actionMutates = /^(open-add-menu|move-row-|delete-row|move-card-|delete-card|done-mini-transcript|toggle-card-notes)$/.test(action);
+  if (VIEW_ONLY_SESSION && actionMutates) return;
+  if (cardEl && isStoryCardRemoteLocked(cardEl.dataset.cardId) && !/^seek/.test(action)) return;
+  if (!cardEl && /^(move-row-|delete-row)/.test(action) && storyRowHasRemoteLock(row)) return;
   if (action === 'open-add-menu') { showStoryAddMenu(ev.target, row.id); return; }
   if (action === 'move-row-up') { const i = storyRows.findIndex(r => r.id === row.id); if (i > 0){ [storyRows[i-1], storyRows[i]] = [storyRows[i], storyRows[i-1]]; renderStoryAssembly(); storyCommitSharedState(true); } return; }
   if (action === 'move-row-down') { const i = storyRows.findIndex(r => r.id === row.id); if (i >= 0 && i < storyRows.length - 1){ [storyRows[i+1], storyRows[i]] = [storyRows[i], storyRows[i+1]]; renderStoryAssembly(); storyCommitSharedState(true); } return; }
@@ -4372,7 +5480,8 @@ function onStoryClick(ev){
   if (action === 'toggle-card-notes' && cardEl){ const card = row.cards.find(c => c.id === cardEl.dataset.cardId); if (card){ card.notesOpen = !card.notesOpen; renderStoryAssembly(); storyCommitSharedState(); } return; }
   if (action === 'seek-card' && cardEl){
     const card = row.cards.find(c => c.id === cardEl.dataset.cardId);
-    storyPreviewCardRange(card);
+    if (storyCanEditCardTimecode(card)) showStoryCardTimePopover(ev, row.id, card.id);
+    else storyPreviewCardRange(card);
     return;
   }
 }
@@ -4504,7 +5613,11 @@ function showStoryClipModal(rowId){
   modal.querySelector('.story-modal-close').onclick = hideStoryModal;
   modal.querySelector('.story-modal-cancel').onclick = hideStoryModal;
   modal.querySelector('.story-modal-add').onclick = () => {
-    [...modal.querySelectorAll('input[type="checkbox"]:checked')].forEach(x => { const clip = storyClipById(x.value); if (clip) addStoryCardToRow(rowId, createClipStoryCard(clip)); });
+    const cards = [...modal.querySelectorAll('input[type="checkbox"]:checked')]
+      .map(x => storyClipById(x.value))
+      .filter(Boolean)
+      .map(clip => createClipStoryCard(clip));
+    addStoryCardsToRow(rowId, cards);
     hideStoryModal();
   };
 }
@@ -4647,13 +5760,17 @@ function ensureStoryContextMenu(){
   storyContextMenuEl = document.createElement('div');
   storyContextMenuEl.className = 'story-context-menu';
   storyContextMenuEl.style.display = 'none';
-  storyContextMenuEl.innerHTML = `<button type="button" data-story-context-action="edit-transcript">Edit Transcript</button><button type="button" data-story-context-action="align-audio">Send For Align-To-Audio</button><button type="button" data-story-context-action="translate">Send For Translation</button><button type="button" data-story-context-action="ai">Send For AI Assistant</button>`;
+  storyContextMenuEl.innerHTML = `<button type="button" data-story-context-action="remove-cue">Remove Cue From Card</button><button type="button" data-story-context-action="edit-transcript">Edit Transcript</button><button type="button" data-story-context-action="align-audio">Send For Align-To-Audio</button><button type="button" data-story-context-action="translate">Send For Translation</button><button type="button" data-story-context-action="ai">Send For AI Assistant</button>`;
   document.body.appendChild(storyContextMenuEl);
   storyContextMenuEl.addEventListener('click', ev => {
     const act = ev.target?.dataset?.storyContextAction;
     if (!act || !storyContextCueTarget) return;
     const target = storyContextCueTarget;
     hideStoryContextMenu();
+    if (act === 'remove-cue'){
+      storyRemoveCueFromCard(target.rowId, target.cardId, target.cueId, target.track);
+      return;
+    }
     if (act === 'edit-transcript'){
       const { rowId, cardId, cueId } = target;
       const { card } = storyFindCard(rowId, cardId);
@@ -4738,6 +5855,124 @@ function storyReplaceCardCuesWithAligned(row, card, parsed, offset=0){
   renderStoryAssembly();
   storyCommitSharedState(true);
 }
+
+function storyFormatBackupTime(sec){
+  try{ return formatTimecodeFromSeconds(Number(sec || 0), getFPS()); }catch(_e){ return String(Number(sec || 0).toFixed(3)); }
+}
+function storyPlainTextForBackup(){
+  ensureStorySeed();
+  const lines = [];
+  lines.push('TRANSCRIBER STORY BACKUP');
+  lines.push('VERSION: 1');
+  lines.push('PROJECT: ' + (suggestBaseName?.() || window.currentBaseName || getCurrentStoryMediaLabel() || 'story'));
+  lines.push('EXPORTED_AT: ' + new Date().toISOString());
+  lines.push('FPS: ' + getFPS());
+  lines.push('');
+  storyRows.forEach((row, rowIndex) => {
+    lines.push('--- STORY ROW ' + (rowIndex + 1) + ' ---');
+    if (row.notes) { lines.push('ROW_NOTES:'); lines.push(String(row.notes || '')); }
+    (row.cards || []).forEach((card, cardIndex) => {
+      const track = normalizeStoryTrack(card.track || storyActiveSubTrack || 'A');
+      const range = storyCardRange(card) || storyTimelineRangeForCard?.(card) || { start:card.start, end:card.end };
+      lines.push('CARD:');
+      lines.push('CARD_INDEX: ' + (cardIndex + 1));
+      lines.push('KIND: ' + (card.kind || 'generic'));
+      lines.push('TITLE: ' + (card.title || ''));
+      lines.push('SOURCE: ' + (card.source || getCurrentStoryMediaLabel() || ''));
+      lines.push('TRACK: ' + track);
+      if (range && range.start != null) lines.push('IN: ' + storyFormatBackupTime(range.start));
+      if (range && range.end != null) lines.push('OUT: ' + storyFormatBackupTime(range.end));
+      lines.push('LABEL_GROUP: ' + (card.labelGroup || ''));
+      lines.push('LABEL: ' + (card.label || ''));
+      lines.push('CUE_IDS: ' + ((storyEffectiveCueRefs(card) || card.cueRefs || []).join(',')));
+      if (card.notes) { lines.push('NOTES:'); lines.push(String(card.notes || '')); }
+      lines.push('TEXT:');
+      lines.push(storyCardToPlainLines(card));
+      lines.push('END_CARD');
+      lines.push('');
+    });
+    lines.push('END_ROW');
+    lines.push('');
+  });
+  return lines.join('\n');
+}
+async function exportStoryToGoogleDocBackup(){
+  const text = storyPlainTextForBackup();
+  const project = (suggestBaseName?.() || window.currentBaseName || 'story');
+  const title = `${project} - Story Backup - ${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}`;
+  setStatusSafe?.('Exporting Story backup to Google Doc…');
+  const res = await fetch(`${API_BASE}/api/google_doc_story/export`, {
+    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ title, text })
+  });
+  const data = await res.json().catch(()=>({}));
+  if (!res.ok || data?.ok === false) throw new Error(data?.detail || data?.error || `HTTP ${res.status}`);
+  const url = data.url || data.document_url || '';
+  setStatusSafe?.('Story backup exported to Google Doc.');
+  const msg = url ? `Story backup created:\n${url}` : 'Story backup created.';
+  if (url && confirm(msg + '\n\nOpen it now?')) window.open(url, '_blank', 'noopener');
+  else alert(msg);
+}
+function storyBackupSections(text){
+  const rows = [];
+  const src = String(text || '').replace(/\r\n/g,'\n').replace(/\r/g,'\n');
+  const rowParts = src.split(/^---\s*STORY\s+ROW\s+\d+\s*---\s*$/gmi).slice(1);
+  rowParts.forEach(part => {
+    const row = createStoryRow();
+    row.cards = [];
+    const cardBlocks = [...part.matchAll(/CARD:\s*\n([\s\S]*?)END_CARD/gmi)].map(m => m[1]);
+    cardBlocks.forEach(block => {
+      const getSingle = (name) => {
+        const rx = new RegExp('^' + name + '\\s*:\\s*(.*)$', 'mi');
+        const m = block.match(rx);
+        return m ? m[1].trim() : '';
+      };
+      const getLong = (name, stops) => {
+        const stop = stops.join('|');
+        const rx = new RegExp('^' + name + '\\s*:\\s*\\n([\\s\\S]*?)(?=^(' + stop + ')\\s*:\\s*|$)', 'mi');
+        const m = block.match(rx);
+        return m ? m[1].trim() : '';
+      };
+      const kind = getSingle('KIND') || 'cue';
+      const track = normalizeStoryTrack(getSingle('TRACK') || 'A');
+      const inText = getSingle('IN');
+      const outText = getSingle('OUT');
+      const start = inText ? parseDisplayedTcToSeconds(inText, getFPS()) : null;
+      const end = outText ? parseDisplayedTcToSeconds(outText, getFPS()) : null;
+      const cueIds = getSingle('CUE_IDS').split(',').map(x=>x.trim()).filter(Boolean);
+      let validCueRefs = cueIds.filter(id => !!storyCueById(id, track));
+      if (!validCueRefs.length && start != null && end != null) validCueRefs = storyCueRefsForRange(start, end, track);
+      const card = {
+        id: makeStoryCardId(), kind, title:getSingle('TITLE'), source:getSingle('SOURCE') || getCurrentStoryMediaLabel(),
+        track, start, end, cueRefs: validCueRefs, sourceCueRefs:[...validCueRefs], labelGroup:getSingle('LABEL_GROUP') || 'shot', label:getSingle('LABEL') || '',
+        body:'', bodyManual:false, notes:getLong('NOTES', ['TEXT','END_CARD']), notesOpen:false,
+      };
+      const textBody = getLong('TEXT', ['NOTES','END_CARD']);
+      if (!validCueRefs.length && textBody){ card.body = textBody; card.bodyManual = true; }
+      row.cards.push(card);
+    });
+    if (row.cards.length) rows.push(row);
+  });
+  return rows;
+}
+async function fetchStoryFromGoogleDocBackup(){
+  const url = prompt('Paste the Google Doc backup/review URL:');
+  if (!url) return;
+  setStatusSafe?.('Fetching Story backup from Google Doc…');
+  const res = await fetch(`${API_BASE}/api/google_doc_story/fetch`, {
+    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ url })
+  });
+  const data = await res.json().catch(()=>({}));
+  if (!res.ok || data?.ok === false) throw new Error(data?.detail || data?.error || `HTTP ${res.status}`);
+  const parsedRows = storyBackupSections(data.text || '');
+  if (!parsedRows.length) throw new Error('No Story Cards were found in this Google Doc backup.');
+  const replace = confirm(`Found ${parsedRows.reduce((n,r)=>n+(r.cards?.length||0),0)} Story Cards.\n\nOK = Replace current Story Mode\nCancel = Append to current Story Mode`);
+  if (replace) storyRows = parsedRows;
+  else storyRows.push(...parsedRows);
+  renderStoryAssembly();
+  storyCommitSharedState(true);
+  setStatusSafe?.('Story backup loaded from Google Doc.');
+}
+
 async function storySendCardForAlignToAudio(rowId, cardId){
   const { row, card } = storyFindCard(rowId, cardId);
   if (!row || !card) return;
@@ -4789,23 +6024,22 @@ async function storySendCardForAlignToAudio(rowId, cardId){
 }
 function storyCueIdFromTextareaLine(textarea, card){
   if (!textarea || !card || !(card.kind === 'cue' || card.kind === 'clip')) return '';
-  const text = String(textarea.value || '');
-  let pos = Number(textarea.selectionStart || 0);
+  const text = String(textarea.value ?? textarea.innerText ?? textarea.textContent ?? '');
+  let lineIndex = 0;
   try{
-    // On contextmenu, selectionStart can still point to the previous caret.
-    // Approximate the clicked line from mouse Y if the browser did not move the caret.
-    const lineHeight = parseFloat(getComputedStyle(textarea).lineHeight) || 32;
+    // Approximate the clicked line from mouse Y. This works for both the old
+    // textarea body and the new contenteditable rich-text body.
+    const lineHeight = parseFloat(getComputedStyle(textarea).lineHeight) || 18;
     const rect = textarea.getBoundingClientRect();
-    const relY = Math.max(0, (window.__storyLastContextY || rect.top) - rect.top + textarea.scrollTop - 8);
-    const clickedLine = Math.max(0, Math.floor(relY / lineHeight));
-    const lineStarts = [0];
-    for (let i = 0; i < text.length; i++){
-      if (text[i] === '\n') lineStarts.push(i + 1);
-    }
-    if (clickedLine < lineStarts.length) pos = lineStarts[clickedLine];
-  }catch(_e){}
-  const lineIndex = text.slice(0, pos).split(/\r?\n/).length - 1;
-  const refs = Array.isArray(card.cueRefs) ? card.cueRefs : [];
+    const relY = Math.max(0, (window.__storyLastContextY || rect.top) - rect.top + (textarea.scrollTop || 0));
+    lineIndex = Math.max(0, Math.floor(relY / Math.max(1, lineHeight)));
+  }catch(_e){
+    try{
+      const pos = Number(textarea.selectionStart || 0);
+      lineIndex = text.slice(0, pos).split(/\r?\n/).length - 1;
+    }catch(_e2){ lineIndex = 0; }
+  }
+  const refs = storyEffectiveCueRefs(card).length ? storyEffectiveCueRefs(card) : (Array.isArray(card.cueRefs) ? card.cueRefs : []);
   return refs[Math.max(0, Math.min(refs.length - 1, lineIndex))] || refs[0] || '';
 }
 function storyOpenCueInTranscript(track='A', cueId=''){
@@ -4859,10 +6093,11 @@ function onStoryFocusIn(ev){
   const rowEl = ev.target.closest?.('.story-row');
   if (!cardEl || !rowEl) return;
   const cueEl = ev.target.closest?.('.story-mini-cue');
+  storySetActiveCard(rowEl.dataset.rowId, cardEl.dataset.cardId);
   if (ev.target?.closest?.('.story-mini-text')) ev.target.dataset.editingNow = '1';
-  sendCollabStoryCursor(rowEl.dataset.rowId, cardEl.dataset.cardId, cueEl?.dataset?.cueId || '', cueEl ? 'mini' : 'card');
+  storyHandleFocusForCollab(ev.target, { force:true });
 }
-function onStoryKeyup(ev){ onStoryFocusIn(ev); }
+function onStoryKeyup(ev){ storyHandleFocusForCollab(ev.target, { force:false }); }
 function onStoryKeydown(ev){
   const miniText = ev.target?.closest?.('.story-mini-text');
   if (!miniText) return;
@@ -4892,7 +6127,7 @@ function onStoryContextMenu(ev){
   const cueId = storyCueIdFromTextareaLine(textarea, card);
   if (!cueId) return;
   ev.preventDefault();
-  storyContextCueTarget = { cueId, track: card.track || 'A', rowId: row.id, cardId: card.id };
+  storyContextCueTarget = { cueId, track: storyEffectiveTrack(card) || card.track || 'A', rowId: row.id, cardId: card.id };
   const menu = ensureStoryContextMenu();
   menu.style.left = (ev.clientX + window.scrollX) + 'px';
   menu.style.top = (ev.clientY + window.scrollY) + 'px';
@@ -5773,6 +7008,29 @@ function ensureYouTubeImportModal(){
     .youtube-icon-btn{display:inline-flex;align-items:center;gap:7px}
     .youtube-icon-btn .yt-icon{display:inline-flex;align-items:center;justify-content:center;width:24px;height:17px;border-radius:5px;background:#ff0033;color:#fff;font-size:10px;line-height:1;padding-left:1px}
     .youtube-icon-btn .yt-icon-label{font-size:13px}
+    .youtube-tabs{display:flex;gap:8px;margin-bottom:12px;border-bottom:1px solid rgba(255,255,255,.08);padding-bottom:10px}
+    .youtube-tab-btn{height:34px;border-radius:999px;padding:0 12px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--ink);cursor:pointer}
+    .youtube-tab-btn.is-active{border-color:var(--gold-2);color:var(--gold-2);background:rgba(215,180,106,.10)}
+    .youtube-tab-panel{display:none}
+    .youtube-tab-panel.is-active{display:grid}
+    .youtube-export-grid{grid-template-columns:1fr 1fr;gap:12px}
+    .youtube-export-grid .full{grid-column:1 / -1}
+    .youtube-export-status{font-size:12px;line-height:1.45;padding:10px;border-radius:12px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.04)}
+    .youtube-doc-loader{display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;padding:10px;border:1px solid rgba(255,255,255,.08);border-radius:12px;background:rgba(255,255,255,.035)}
+    .youtube-doc-loader label{flex:1 1 320px}
+    .youtube-export-textarea{width:100%;min-height:120px;resize:vertical}
+    .youtube-export-tags{width:100%}
+    .youtube-field-hint{display:flex;justify-content:space-between;gap:10px;margin-top:3px;font-size:11px;color:var(--ink-dim)}
+    .youtube-upload-meter{height:8px;border-radius:999px;background:rgba(255,255,255,.12);overflow:hidden;margin-top:6px}
+    .youtube-upload-meter > span{display:block;height:100%;width:0%;background:linear-gradient(90deg,var(--gold),var(--gold-2));transition:width .18s ease}
+    #youtubeImportModal{align-items:center;justify-items:center;overflow:hidden;padding:18px}
+    #youtubeImportModal .youtube-modal-card{width:min(980px,96vw);max-width:96vw;max-height:92vh;display:flex;flex-direction:column;overflow:hidden}
+    #youtubeImportModal .modal-body{flex:1 1 auto;min-height:0;overflow:auto;padding-bottom:12px}
+    #youtubeImportModal .modal-foot{flex:0 0 auto}
+    .youtube-upload-checklist{font-size:12px;line-height:1.55;padding:10px;border-radius:12px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.035)}
+    .youtube-upload-checklist .ok{color:#6ee7b7}.youtube-upload-checklist .warn{color:#fbbf24}.youtube-upload-checklist .bad{color:#fb7185}
+    .youtube-ai-helper{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px;border:1px solid rgba(215,180,106,.22);border-radius:12px;background:rgba(215,180,106,.06)}
+    .youtube-ai-helper .youtube-ai-status{font-size:12px;color:var(--ink-dim)}
   `;
   document.head.appendChild(style);
 
@@ -5780,15 +7038,20 @@ function ensureYouTubeImportModal(){
   wrap.id = 'youtubeImportModal';
   wrap.className = 'modal-overlay hidden';
   wrap.innerHTML = `
-    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="ytTitle" style="max-width:720px">
+    <div class="modal-card youtube-modal-card" role="dialog" aria-modal="true" aria-labelledby="ytTitle">
       <div class="modal-head">
         <div>
-          <div id="ytTitle" class="modal-title">Import YouTube URL</div>
-          <div class="modal-sub">Preview with an iframe. Transcribe/Align uses backend yt-dlp to create temporary 16 kHz mono WAV only when needed.</div>
+          <div id="ytTitle" class="modal-title">YouTube</div>
+          <div class="modal-sub">Import videos/captions from YouTube, or prepare export/upload settings for your channel.</div>
         </div>
         <button class="btn btn-outline btn-mini" id="ytClose" type="button" aria-label="Close">✕</button>
       </div>
-      <div class="modal-body youtube-import-grid">
+      <div class="modal-body">
+        <div class="youtube-tabs" role="tablist">
+          <button class="youtube-tab-btn is-active" id="ytTabImport" type="button" data-yt-tab="import">Import from YouTube</button>
+          <button class="youtube-tab-btn" id="ytTabExport" type="button" data-yt-tab="export">Export to YouTube</button>
+        </div>
+        <div id="ytImportPanel" class="youtube-tab-panel youtube-import-grid is-active">
         <label class="muted" style="display:flex;flex-direction:column;gap:5px">YouTube URL
           <input id="ytUrlInput" class="ui-dark-input" type="url" placeholder="https://www.youtube.com/watch?v=..." style="width:100%">
         </label>
@@ -5818,6 +7081,80 @@ function ensureYouTubeImportModal(){
           </label>
         </div>
         <div id="ytProbeCard" class="youtube-probe-card" style="display:none"></div>
+        </div>
+        <div id="ytExportPanel" class="youtube-tab-panel youtube-export-grid">
+          <div class="youtube-export-status full" id="ytExportStatus">Not connected.</div>
+          <div class="youtube-ai-helper full">
+            <button class="btn btn-outline" id="ytSuggestMetadataAI" type="button">AI Suggest Metadata</button>
+            <label class="muted" style="display:flex;align-items:center;gap:6px;font-size:12px"><input id="ytAiOverwrite" type="checkbox" checked> Fill fields</label>
+            <span class="youtube-ai-status" id="ytAiMetadataStatus">Uses current transcript / story / timeline context.</span>
+          </div>
+          <div class="youtube-doc-loader full">
+            <label class="muted" style="display:flex;flex-direction:column;gap:5px">Google Doc metadata URL
+              <input id="ytGoogleDocUrl" class="ui-dark-input" type="url" placeholder="https://docs.google.com/document/d/...">
+            </label>
+            <button class="btn btn-outline" id="ytFetchGoogleDoc" type="button">Fetch Metadata from Google Doc</button>
+            <span class="muted" id="ytGoogleDocStatus" style="font-size:12px"></span>
+          </div>
+          <label class="muted full" style="display:flex;flex-direction:column;gap:5px">Title
+            <input id="ytExportTitle" class="ui-dark-input" type="text" maxlength="100" placeholder="YouTube title">
+            <span class="youtube-field-hint"><span id="ytTitleHint">Title required</span><span id="ytTitleCount">0 / 100</span></span>
+          </label>
+          <label class="muted full" style="display:flex;flex-direction:column;gap:5px">Description
+            <textarea id="ytExportDescription" class="ui-dark-textarea youtube-export-textarea" placeholder="YouTube description"></textarea>
+            <span class="youtube-field-hint"><span>Description from Google Doc or manual entry</span><span id="ytDescCount">0 / 5000</span></span>
+          </label>
+          <label class="muted full" style="display:flex;flex-direction:column;gap:5px">Tags
+            <input id="ytExportTags" class="ui-dark-input youtube-export-tags" type="text" placeholder="tag1, tag2, tag3">
+            <span class="youtube-field-hint"><span>Comma-separated tags</span><span id="ytTagsCount">0 tags</span></span>
+          </label>
+          <label class="muted full" style="display:flex;flex-direction:column;gap:5px">Thumbnail note / path
+            <input id="ytExportThumbnail" class="ui-dark-input" type="text" placeholder="Optional thumbnail file path or note">
+          </label>
+          <label class="muted full" style="display:flex;flex-direction:column;gap:5px">Schedule / publish note
+            <input id="ytExportSchedule" class="ui-dark-input" type="text" placeholder="Optional schedule time or approval note">
+          </label>
+          <label class="muted full" style="display:flex;flex-direction:column;gap:5px">Video file to upload
+            <input id="ytExportVideoFile" class="ui-dark-input" type="file" accept="video/*">
+          </label>
+          <label class="muted full" style="display:flex;flex-direction:column;gap:5px">Thumbnail image file
+            <input id="ytExportThumbnailFile" class="ui-dark-input" type="file" accept="image/png,image/jpeg,image/webp">
+          </label>
+          <div class="full youtube-caption-options" style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding:10px;border:1px solid rgba(255,255,255,.08);border-radius:12px;background:rgba(255,255,255,.035)">
+            <span class="muted">Caption tracks</span>
+            <label class="muted" style="display:flex;align-items:center;gap:6px"><input id="ytUploadSubA" type="checkbox" checked> Upload Sub A</label>
+            <label class="muted" style="display:flex;align-items:center;gap:6px"><input id="ytUploadSubB" type="checkbox"> Upload Sub B</label>
+          </div>
+          <label class="muted full" style="display:flex;flex-direction:column;gap:5px">OAuth Client ID
+            <input id="ytClientId" class="ui-dark-input" type="text" placeholder="Google OAuth Client ID" autocomplete="off">
+          </label>
+          <label class="muted full" style="display:flex;flex-direction:column;gap:5px">OAuth Client Secret
+            <input id="ytClientSecret" class="ui-dark-input" type="password" placeholder="Google OAuth Client Secret" autocomplete="off">
+          </label>
+          <label class="muted" style="display:flex;flex-direction:column;gap:5px">Default visibility
+            <select id="ytExportPrivacy" class="ui-dark-select"><option value="private">Private</option><option value="unlisted">Unlisted</option><option value="public">Public</option></select>
+          </label>
+          <label class="muted" style="display:flex;flex-direction:column;gap:5px">Category
+            <select id="ytExportCategory" class="ui-dark-select" style="width:100%;height:35px"><option value="1">Film & Animation</option><option value="2">Autos & Vehicles</option><option value="10">Music</option><option value="15">Pets & Animals</option><option value="17">Sports</option><option value="19">Travel & Events</option><option value="20">Gaming</option><option value="22">People & Blogs</option><option value="23">Comedy</option><option value="24">Entertainment</option><option value="25" selected>News & Politics</option><option value="26">Howto & Style</option><option value="27">Education</option><option value="28">Science & Technology</option><option value="29">Nonprofits & Activism</option></select>
+          </label>
+          <label class="muted" style="display:flex;flex-direction:column;gap:5px">Default language
+            <input id="ytExportLanguage" class="ui-dark-input" type="text" value="en" placeholder="en">
+          </label>
+          <label class="muted" style="display:flex;align-items:center;gap:8px;padding-top:24px">
+            <input id="ytExportMadeForKids" type="checkbox"> Made for kids
+          </label>
+          <div class="youtube-upload-checklist full" id="ytUploadChecklist">Upload checklist will appear here.</div>
+          <div class="full" id="ytUploadProgressWrap" style="display:none">
+            <div class="youtube-upload-meter"><span id="ytUploadProgressBar"></span></div>
+            <div class="youtube-field-hint"><span id="ytUploadProgressText">Preparing…</span><span id="ytUploadProgressPct">0%</span></div>
+          </div>
+          <div class="full" style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap">
+            <button class="btn btn-outline" id="ytSaveCredentials" type="button">Save Credentials</button>
+            <button class="btn btn-outline" id="ytUploadPrivate" type="button">Upload to YouTube</button>
+            <button class="btn btn-gold" id="ytConnectAccount" type="button">Connect YouTube Account</button>
+          </div>
+          <div class="muted full" style="font-size:12px;line-height:1.45">Redirect URI to add in Google Cloud: <code id="ytRedirectUri">http://127.0.0.1:8000/api/youtube_export/oauth_callback</code></div>
+        </div>
       </div>
       <div class="modal-foot">
         <button class="btn btn-outline" id="ytCancel" type="button">Cancel</button>
@@ -5852,6 +7189,33 @@ function ensureYouTubeImportModal(){
     document.getElementById(id)?.addEventListener('change', syncMode);
   });
   syncMode();
+
+  const setYtTab = (tab) => {
+    const isExport = tab === 'export';
+    document.getElementById('ytTabImport')?.classList.toggle('is-active', !isExport);
+    document.getElementById('ytTabExport')?.classList.toggle('is-active', isExport);
+    document.getElementById('ytImportPanel')?.classList.toggle('is-active', !isExport);
+    document.getElementById('ytExportPanel')?.classList.toggle('is-active', isExport);
+    const importBtn = document.getElementById('ytImport');
+    if (importBtn) importBtn.style.display = isExport ? 'none' : '';
+    if (isExport) refreshYouTubeExportStatus();
+  };
+  document.getElementById('ytTabImport')?.addEventListener('click', () => setYtTab('import'));
+  document.getElementById('ytTabExport')?.addEventListener('click', () => setYtTab('export'));
+  document.getElementById('ytSaveCredentials')?.addEventListener('click', saveYouTubeExportCredentials);
+  document.getElementById('ytConnectAccount')?.addEventListener('click', connectYouTubeExportAccount);
+  ['ytExportTitle','ytExportDescription','ytExportTags','ytExportVideoFile','ytUploadSubA','ytUploadSubB'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el && !el.__ytCounterBound){
+      el.__ytCounterBound = true;
+      el.addEventListener('input', updateYouTubeExportCounters);
+      el.addEventListener('change', updateYouTubeExportCounters);
+    }
+  });
+  updateYouTubeExportCounters();
+  document.getElementById('ytFetchGoogleDoc')?.addEventListener('click', fetchYouTubeMetadataFromGoogleDoc);
+  document.getElementById('ytSuggestMetadataAI')?.addEventListener('click', suggestYouTubeMetadataWithAI);
+  document.getElementById('ytUploadPrivate')?.addEventListener('click', uploadCurrentYouTubeExport);
 
   wrap.querySelector('#ytProbe').addEventListener('click', async ()=>{
     const url = document.getElementById('ytUrlInput')?.value?.trim() || '';
@@ -5907,6 +7271,356 @@ function ensureYouTubeImportModal(){
   });
 }
 
+async function fetchYouTubeMetadataFromGoogleDoc(){
+  const url = document.getElementById('ytGoogleDocUrl')?.value?.trim() || '';
+  const st = document.getElementById('ytGoogleDocStatus');
+  if (!url){ alert('Paste a Google Doc URL first.'); return; }
+  try{
+    if (st) st.textContent = 'Loading…';
+    let res = await fetch(`${API_BASE}/api/youtube_export/google_doc_metadata`, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ url })
+    });
+    // Fallback for older/running backends that temporarily expose this route as GET only.
+    if (res.status === 405){
+      res = await fetch(`${API_BASE}/api/youtube_export/google_doc_metadata?url=${encodeURIComponent(url)}`);
+    }
+    const data = await res.json().catch(()=>({}));
+    if (!res.ok || data?.ok === false) throw new Error(data?.detail || data?.error || `HTTP ${res.status}`);
+    applyYouTubeMetadataToExportForm(data.metadata || {});
+    if (st) st.textContent = 'Loaded metadata';
+    setStatusSafe('YouTube metadata loaded from Google Doc.');
+  }catch(err){
+    if (st) st.textContent = 'Load failed';
+    alert('Google Doc metadata fetch failed: ' + (err?.message || err));
+  }
+}
+
+
+const YOUTUBE_CATEGORY_NAME_TO_ID = {
+  'film & animation':'1', 'film and animation':'1', 'autos & vehicles':'2', 'autos and vehicles':'2',
+  'music':'10', 'pets & animals':'15', 'pets and animals':'15', 'sports':'17',
+  'travel & events':'19', 'travel and events':'19', 'gaming':'20', 'people & blogs':'22', 'people and blogs':'22',
+  'comedy':'23', 'entertainment':'24', 'news & politics':'25', 'news and politics':'25',
+  'howto & style':'26', 'howto and style':'26', 'how-to & style':'26', 'education':'27',
+  'science & technology':'28', 'science and technology':'28', 'nonprofits & activism':'29', 'nonprofits and activism':'29'
+};
+function normalizeYouTubeCategoryValue(value){
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  if (/^\d+$/.test(raw)) return raw;
+  const key = raw.toLowerCase().replace(/\s+/g, ' ').trim();
+  return YOUTUBE_CATEGORY_NAME_TO_ID[key] || '';
+}
+function getYouTubeCategoryLabelById(id){
+  const sel = document.getElementById('ytExportCategory');
+  const opt = sel ? Array.from(sel.options).find(o => String(o.value) === String(id)) : null;
+  return opt ? opt.textContent : String(id || '');
+}
+function buildYouTubeAIMetadataSource(){
+  const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  let chunks = [];
+  try{
+    if (typeof storyRows !== 'undefined' && Array.isArray(storyRows) && storyRows.length){
+      const storyText = storyRows.map((row, ri) => {
+        const cards = (row.cards || []).map((card, ci) => {
+          const txt = clean(card.text || card.manualText || card.labelText || '');
+          return txt ? `Story ${ri+1}.${ci+1}: ${txt}` : '';
+        }).filter(Boolean).join('\n');
+        return cards;
+      }).filter(Boolean).join('\n');
+      if (storyText) chunks.push('STORY MODE ASSEMBLY:\n' + storyText);
+    }
+  }catch(_e){}
+  try{
+    if (typeof timelineClips !== 'undefined' && Array.isArray(timelineClips) && timelineClips.length){
+      const tl = timelineClips.slice(0, 80).map((c, i) => {
+        const txt = clean(c.text || c.reason || c.title || c.name || '');
+        const st = Number(c.start ?? c.sourceStart ?? 0); const en = Number(c.end ?? c.sourceEnd ?? 0);
+        return `[${i+1}] ${formatTimecodeFromSeconds(st, getFPS())} --> ${formatTimecodeFromSeconds(en, getFPS())} ${txt}`;
+      }).join('\n');
+      if (tl) chunks.push('TIMELINE CLIPS:\n' + tl);
+    }
+  }catch(_e){}
+  const a = entries.slice(0, 220).map((e,i)=>`[${i+1}] ${clean(e.text)}`).filter(Boolean).join('\n');
+  const b = entriesB.slice(0, 220).map((e,i)=>`[${i+1}] ${clean(e.text)}`).filter(Boolean).join('\n');
+  if (a) chunks.push('SUB A TRANSCRIPT:\n' + a);
+  if (b) chunks.push('SUB B TRANSCRIPT:\n' + b);
+  return chunks.join('\n\n').slice(0, 24000);
+}
+function parseAIJsonObject(text){
+  const raw = String(text || '').trim();
+  try { return JSON.parse(raw); } catch(_e) {}
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced){ try { return JSON.parse(fenced[1]); } catch(_e) {} }
+  const first = raw.indexOf('{');
+  const last = raw.lastIndexOf('}');
+  if (first >= 0 && last > first){
+    try { return JSON.parse(raw.slice(first, last + 1)); } catch(_e) {}
+  }
+  throw new Error('AI did not return valid JSON metadata.');
+}
+async function suggestYouTubeMetadataWithAI(){
+  const st = document.getElementById('ytAiMetadataStatus');
+  const overwrite = !!document.getElementById('ytAiOverwrite')?.checked;
+  const source_text = buildYouTubeAIMetadataSource();
+  if (!source_text.trim()){ alert('No transcript/story/timeline content is available for AI metadata.'); return; }
+  const current = getYouTubeExportMetadataDraft();
+  const instructions = `Generate YouTube metadata for a newsroom video. Return strict JSON only with these keys: title, description, tags, category, visibility, language, made_for_kids. Keep title under 100 characters. Use category as a YouTube category name, preferably News & Politics for news content. Tags must be an array of concise tags. Current draft metadata, if any: ${JSON.stringify(current, null, 2)}`;
+  try{
+    if (st) st.textContent = 'Generating metadata with AI…';
+    const res = await fetch(`${API_BASE}/api/ai_assistant`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ task:'youtube_metadata_json', instructions, source_text, model: document.getElementById('aiAssistModel')?.value || 'deepseek-chat', dictionary: loadDictionaryPairs() })
+    });
+    const data = await res.json().catch(()=>({}));
+    if (!res.ok || !data?.ok) throw new Error(data?.detail || data?.message || (`HTTP ${res.status}`));
+    const meta = parseAIJsonObject(data.output || '');
+    if (!overwrite){
+      const existing = getYouTubeExportMetadataDraft();
+      for (const k of Object.keys(meta)){
+        if (existing[k] != null && String(existing[k]).trim && String(existing[k]).trim()) delete meta[k];
+      }
+    }
+    applyYouTubeMetadataToExportForm(meta);
+    if (st) st.textContent = 'AI metadata filled. Please review before uploading.';
+    setStatusSafe('AI YouTube metadata generated.');
+  }catch(err){
+    if (st) st.textContent = 'AI metadata failed.';
+    alert('AI metadata failed: ' + (err?.message || err));
+  }
+}
+
+function applyYouTubeMetadataToExportForm(meta){
+  const setVal = (id, val) => { const el = document.getElementById(id); if (el && val != null && String(val).trim() !== '') el.value = String(val); };
+  setVal('ytExportTitle', meta.title);
+  setVal('ytExportDescription', meta.description);
+  if (Array.isArray(meta.tags)) setVal('ytExportTags', meta.tags.join(', '));
+  else setVal('ytExportTags', meta.tags);
+  setVal('ytExportThumbnail', meta.thumbnail);
+  setVal('ytExportSchedule', meta.schedule || meta.publish_at || meta.publishAt);
+  setVal('ytExportLanguage', meta.language || meta.default_language);
+  const catVal = normalizeYouTubeCategoryValue(meta.category_id || meta.categoryId || meta.category || '');
+  if (catVal) setVal('ytExportCategory', catVal);
+  const privacy = String(meta.visibility || meta.privacy || '').trim().toLowerCase();
+  if (['private','unlisted','public'].includes(privacy)){
+    const el = document.getElementById('ytExportPrivacy'); if (el) el.value = privacy;
+  }
+  const kids = String(meta.made_for_kids ?? meta.madeForKids ?? '').trim().toLowerCase();
+  if (kids){
+    const el = document.getElementById('ytExportMadeForKids');
+    if (el) el.checked = ['yes','true','1','y','made for kids'].includes(kids);
+  }
+  const subA = document.getElementById('ytUploadSubA');
+  const subB = document.getElementById('ytUploadSubB');
+  if (subA && meta.upload_sub_a != null) subA.checked = !!meta.upload_sub_a;
+  if (subB && meta.upload_sub_b != null) subB.checked = !!meta.upload_sub_b;
+  updateYouTubeExportCounters();
+}
+
+
+function updateYouTubeExportCounters(){
+  const title = document.getElementById('ytExportTitle')?.value || '';
+  const desc = document.getElementById('ytExportDescription')?.value || '';
+  const tagsRaw = document.getElementById('ytExportTags')?.value || '';
+  const tags = tagsRaw.split(',').map(x => x.trim()).filter(Boolean);
+  const setText = (id, text) => { const el = document.getElementById(id); if (el) el.textContent = text; };
+  setText('ytTitleCount', `${title.length} / 100`);
+  setText('ytDescCount', `${desc.length} / 5000`);
+  setText('ytTagsCount', `${tags.length} tag${tags.length === 1 ? '' : 's'}`);
+  setText('ytTitleHint', title.trim() ? 'Ready' : 'Title required');
+  const checklist = document.getElementById('ytUploadChecklist');
+  if (checklist){
+    const videoReady = !!document.getElementById('ytExportVideoFile')?.files?.[0];
+    const subAOn = !!document.getElementById('ytUploadSubA')?.checked;
+    const subBOn = !!document.getElementById('ytUploadSubB')?.checked;
+    const subAReady = !subAOn || !!getYouTubeExportCaptionPayload('A');
+    const subBReady = !subBOn || !!getYouTubeExportCaptionPayload('B');
+    const titleReady = !!title.trim();
+    const rows = [
+      [`${titleReady ? 'ok' : 'bad'}`, `${titleReady ? '✓' : '!' } Title`],
+      [`${videoReady ? 'ok' : 'bad'}`, `${videoReady ? '✓' : '!' } Video file selected`],
+      [`${subAReady ? 'ok' : 'warn'}`, `${subAReady ? '✓' : '!' } Sub A captions${subAOn ? '' : ' not selected'}`],
+      [`${subBReady ? 'ok' : 'warn'}`, `${subBReady ? '✓' : '!' } Sub B captions${subBOn ? '' : ' not selected'}`],
+    ];
+    checklist.innerHTML = rows.map(([cls, txt]) => `<span class="${cls}">${escapeHtml(txt)}</span>`).join(' · ');
+  }
+}
+
+function validateYouTubeExportDraft(meta, videoFile){
+  const problems = [];
+  if (!videoFile) problems.push('Choose a video file to upload.');
+  if (!meta.title) problems.push('YouTube title is required.');
+  if (meta.title && meta.title.length > 100) problems.push('Title is longer than 100 characters.');
+  if ((meta.description || '').length > 5000) problems.push('Description is longer than 5000 characters.');
+  if (document.getElementById('ytUploadSubA')?.checked && !getYouTubeExportCaptionPayload('A')) problems.push('Sub A is selected but there are no Sub A cues.');
+  if (document.getElementById('ytUploadSubB')?.checked && !getYouTubeExportCaptionPayload('B')) problems.push('Sub B is selected but there are no Sub B cues.');
+  return problems;
+}
+
+function setYouTubeUploadProgress(pct, text){
+  const wrap = document.getElementById('ytUploadProgressWrap');
+  const bar = document.getElementById('ytUploadProgressBar');
+  const txt = document.getElementById('ytUploadProgressText');
+  const pc = document.getElementById('ytUploadProgressPct');
+  const v = Math.max(0, Math.min(100, Math.round(Number(pct) || 0)));
+  if (wrap) wrap.style.display = '';
+  if (bar) bar.style.width = v + '%';
+  if (txt) txt.textContent = text || 'Uploading…';
+  if (pc) pc.textContent = v + '%';
+}
+
+function postFormDataWithProgress(url, fd, onProgress){
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', url, true);
+    xhr.upload.onprogress = (ev) => {
+      if (ev.lengthComputable && onProgress) onProgress((ev.loaded / ev.total) * 100);
+    };
+    xhr.onload = () => {
+      let data = {};
+      try{ data = JSON.parse(xhr.responseText || '{}'); }catch(_e){}
+      if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+      else reject(new Error(data?.detail || data?.error || `HTTP ${xhr.status}`));
+    };
+    xhr.onerror = () => reject(new Error('Network error during upload.'));
+    xhr.send(fd);
+  });
+}
+
+function getYouTubeExportMetadataDraft(){
+  const tagsRaw = document.getElementById('ytExportTags')?.value || '';
+  return {
+    title: document.getElementById('ytExportTitle')?.value?.trim() || '',
+    description: document.getElementById('ytExportDescription')?.value || '',
+    tags: tagsRaw.split(',').map(x => x.trim()).filter(Boolean),
+    thumbnail: document.getElementById('ytExportThumbnail')?.value?.trim() || '',
+    schedule: document.getElementById('ytExportSchedule')?.value?.trim() || '',
+    privacy: document.getElementById('ytExportPrivacy')?.value || 'private',
+    category_id: document.getElementById('ytExportCategory')?.value?.trim() || '25',
+    language: document.getElementById('ytExportLanguage')?.value?.trim() || 'en',
+    made_for_kids: !!document.getElementById('ytExportMadeForKids')?.checked,
+  };
+}
+
+
+function getYouTubeExportCaptionPayload(track='A'){
+  const list = (track === 'B') ? (Array.isArray(entriesB) ? entriesB : []) : (Array.isArray(entries) ? entries : []);
+  if (!list.length) return '';
+  try { return toSRT(list); } catch(_e) { return ''; }
+}
+
+async function uploadCurrentYouTubeExport(){
+  const statusBox = document.getElementById('ytExportStatus');
+  const meta = getYouTubeExportMetadataDraft();
+  const videoFile = document.getElementById('ytExportVideoFile')?.files?.[0] || null;
+  const thumbFile = document.getElementById('ytExportThumbnailFile')?.files?.[0] || null;
+  updateYouTubeExportCounters();
+  const problems = validateYouTubeExportDraft(meta, videoFile);
+  if (problems.length){ alert('Please fix before uploading:\n\n' + problems.join('\n')); return; }
+  if (!confirm(`Upload "${meta.title}" to YouTube as ${meta.privacy || 'private'}?`)) return;
+
+  const fd = new FormData();
+  fd.append('video', videoFile, videoFile.name || 'upload.mp4');
+  if (thumbFile) fd.append('thumbnail', thumbFile, thumbFile.name || 'thumbnail.jpg');
+  fd.append('metadata', JSON.stringify(meta));
+  fd.append('upload_sub_a', document.getElementById('ytUploadSubA')?.checked ? '1' : '0');
+  fd.append('upload_sub_b', document.getElementById('ytUploadSubB')?.checked ? '1' : '0');
+  if (document.getElementById('ytUploadSubA')?.checked) fd.append('sub_a_srt', getYouTubeExportCaptionPayload('A'));
+  if (document.getElementById('ytUploadSubB')?.checked) fd.append('sub_b_srt', getYouTubeExportCaptionPayload('B'));
+
+  try{
+    if (statusBox) statusBox.innerHTML = 'Uploading video to YouTube…<br><span class="muted">Keep this browser tab open until upload completes.</span>';
+    setStatusSafe('Uploading to YouTube…');
+    setYouTubeUploadProgress(3, 'Preparing upload…');
+    const data = await postFormDataWithProgress(`${API_BASE}/api/youtube_export/upload`, fd, pct => {
+      // This progress reflects browser → backend transfer. The backend then performs the YouTube upload.
+      setYouTubeUploadProgress(Math.min(85, pct * 0.85), 'Sending video package to backend…');
+    });
+    setYouTubeUploadProgress(100, 'YouTube upload completed.');
+    if (data?.ok === false) throw new Error(data?.detail || data?.error || 'Upload failed');
+    const link = data.watch_url || (data.video_id ? `https://www.youtube.com/watch?v=${data.video_id}` : '');
+    if (statusBox){
+      const cap = Array.isArray(data.captions) && data.captions.length ? `<br>Captions: ${data.captions.map(x => `${escapeHtml(x.track || x.name || 'caption')}${x.ok === false ? ' ⚠️' : ''}`).join(', ')}` : '';
+      const studio = data.studio_url ? ` · <a href="${escapeHtml(data.studio_url)}" target="_blank" rel="noopener">Open Studio</a>` : '';
+      const thumb = data.thumbnail ? `<br>Thumbnail: ${data.thumbnail.ok === false ? '⚠️ failed' : 'uploaded'}` : '';
+      statusBox.innerHTML = `✅ Uploaded to YouTube.<br>${link ? `<a href="${escapeHtml(link)}" target="_blank" rel="noopener">Open video</a>${studio}` : ''}${cap}${thumb}`;
+    }
+    setStatusSafe('YouTube upload completed.');
+  }catch(err){
+    if (statusBox) statusBox.textContent = 'YouTube upload failed: ' + (err?.message || err);
+    alert('YouTube upload failed: ' + (err?.message || err));
+  }
+}
+
+async function refreshYouTubeExportStatus(){
+  const statusEl2 = document.getElementById('ytExportStatus');
+  try{
+    const res = await fetch(`${API_BASE}/api/youtube_export/status`);
+    const data = await res.json().catch(()=>({}));
+    if (!res.ok) throw new Error(data?.detail || data?.error || `HTTP ${res.status}`);
+    const idEl = document.getElementById('ytClientId');
+    const secEl = document.getElementById('ytClientSecret');
+    const privEl = document.getElementById('ytExportPrivacy');
+    const catEl = document.getElementById('ytExportCategory');
+    const langEl = document.getElementById('ytExportLanguage');
+    const kidsEl = document.getElementById('ytExportMadeForKids');
+    const redirEl = document.getElementById('ytRedirectUri');
+    if (idEl && data.client_id && !idEl.value) idEl.value = data.client_id;
+    if (secEl && data.client_secret_saved && !secEl.value) secEl.placeholder = 'Saved client secret';
+    if (privEl && data.default_privacy) privEl.value = data.default_privacy;
+    if (catEl && data.default_category_id) catEl.value = data.default_category_id;
+    if (langEl && data.default_language) langEl.value = data.default_language;
+    if (kidsEl) kidsEl.checked = !!data.made_for_kids;
+    if (redirEl && data.redirect_uri) redirEl.textContent = data.redirect_uri;
+    if (statusEl2){
+      const docsOk = !!data.google_docs_connected;
+      const base = data.connected ? '✅ Connected to YouTube' : data.configured ? '⚠️ Credentials saved. Connect account next.' : 'Not configured.';
+      const docsMsg = data.connected ? (docsOk ? ' · Google Docs backup enabled' : ' · ⚠️ Google Docs backup needs reconnect') : '';
+      statusEl2.innerHTML = `${base}${docsMsg}<br><span class="muted">OAuth scopes: ${escapeHtml((data.scopes || []).join(', '))}</span>`;
+    }
+  }catch(err){
+    if (statusEl2) statusEl2.textContent = 'YouTube export status failed: ' + (err?.message || err);
+  }
+}
+
+async function saveYouTubeExportCredentials(){
+  const body = {
+    client_id: document.getElementById('ytClientId')?.value?.trim() || '',
+    client_secret: document.getElementById('ytClientSecret')?.value?.trim() || '',
+    default_privacy: document.getElementById('ytExportPrivacy')?.value || 'private',
+    default_category_id: document.getElementById('ytExportCategory')?.value?.trim() || '25',
+    default_language: document.getElementById('ytExportLanguage')?.value?.trim() || 'en',
+    made_for_kids: !!document.getElementById('ytExportMadeForKids')?.checked,
+  };
+  if (!body.client_id || !body.client_secret){ alert('Client ID and Client Secret are required.'); return; }
+  const res = await fetch(`${API_BASE}/api/youtube_export/config`, {
+    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+  });
+  const data = await res.json().catch(()=>({}));
+  if (!res.ok) { alert('Save failed: ' + (data?.detail || data?.error || `HTTP ${res.status}`)); return; }
+  await refreshYouTubeExportStatus();
+  setStatusSafe('YouTube export credentials saved.');
+}
+
+async function connectYouTubeExportAccount(){
+  try{
+    await saveYouTubeExportCredentials();
+    const res = await fetch(`${API_BASE}/api/youtube_export/auth_url?force=1`);
+    const data = await res.json().catch(()=>({}));
+    if (!res.ok || !data.auth_url) throw new Error(data?.detail || data?.error || `HTTP ${res.status}`);
+    window.open(data.auth_url, 'youtubeExportOAuth', 'width=720,height=820');
+  }catch(err){
+    alert('YouTube connect failed: ' + (err?.message || err));
+  }
+}
+
+window.addEventListener('message', (ev) => {
+  if (ev?.data?.type === 'youtube-export-connected'){
+    refreshYouTubeExportStatus();
+    setStatusSafe('YouTube account connected.');
+  }
+});
+
 function renderYouTubeProbe(meta){
   const card = document.getElementById('ytProbeCard');
   if (!card) return;
@@ -5947,6 +7661,7 @@ async function openYouTubeImportModal(){
   const out = document.getElementById('ytOutputDir');
   if (out && defaults?.default_download_dir) out.value = defaults.default_download_dir;
   wrap?.classList.remove('hidden');
+  refreshYouTubeExportStatus();
   setTimeout(()=>document.getElementById('ytUrlInput')?.focus(), 50);
 }
 
@@ -8236,6 +9951,7 @@ function getShareableMediaSource(){
 
 function buildShareSessionState(){
   try{ flushEditsFromDOM(); }catch(_e){}
+  try{ storySyncAllRichBodiesToCards?.({ commit:false, reconcile:false }); }catch(_e){}
   try{ ensureCueIds?.(entries); ensureCueIds?.(entriesB); }catch(_e){}
   const box = document.getElementById('alignSrtText');
   return {
@@ -9066,6 +10782,7 @@ function handleCollabWebSocketMessage(msg){
       COLLAB_LAST_HASH = hashSessionState(buildShareSessionState());
     }
     try{ applyTimelineLocksFromList(msg.locks || []); }catch(_e){}
+    try{ applyStoryLocksFromList(msg.locks || []); }catch(_e){}
     setCollabSyncStatus('live');
     return;
   }
@@ -9113,7 +10830,7 @@ function handleCollabWebSocketMessage(msg){
   if (type === 'story_cursor_update'){
     if (msg.user_id && msg.user_id !== COLLAB_USER_ID){
       COLLAB_REMOTE_STORY[msg.user_id] = { row_id:String(msg.row_id || ''), card_id:String(msg.card_id || ''), cue_id:String(msg.cue_id || ''), mode:String(msg.mode || 'card'), ts:Date.now() };
-      applyStoryCollabAwareness();
+      scheduleApplyStoryCollabAwareness();
     }
     return;
   }
@@ -9145,14 +10862,36 @@ function handleCollabWebSocketMessage(msg){
     COLLAB_REMOTE_LOCKS = {};
     (msg.locks || []).forEach(l => {
       if (!l || l.user_id === COLLAB_USER_ID) return;
-      if (l.kind === 'timeline_clip' || l.clip_id) return;
+      if (l.kind === 'timeline_clip' || l.clip_id || l.kind === 'story_card' || l.card_id) return;
       COLLAB_REMOTE_LOCKS[collabLockKey(l.track || 'A', Number(l.cue_index || 0))] = l;
     });
     applyCollabCueAwareness();
     applyTimelineLocksFromList(msg.locks || []);
+    applyStoryLocksFromList(msg.locks || []);
     return;
   }
 
+
+  if (type === 'story_locks'){
+    applyStoryLocksFromList(msg.locks || []);
+    return;
+  }
+
+  if (type === 'lock_story_card'){
+    if (msg.user_id && msg.user_id !== COLLAB_USER_ID && msg.card_id){
+      COLLAB_STORY_LOCKS[String(msg.card_id)] = {
+        kind:'story_card', card_id:String(msg.card_id), row_id:String(msg.row_id || ''), action:String(msg.action || 'edit'),
+        user_id:msg.user_id, user_label:msg.user_label || collabUserName(msg.user_id), user_color:msg.user_color || collabUserColor(msg.user_id), updated_at:Date.now() / 1000,
+      };
+      if (isStoryMode) applyStoryCollabAwareness();
+    }
+    return;
+  }
+  if (type === 'unlock_story_card'){
+    if (msg.card_id) delete COLLAB_STORY_LOCKS[String(msg.card_id)];
+    if (isStoryMode) applyStoryCollabAwareness();
+    return;
+  }
 
   if (type === 'timeline_presence'){
     if (msg.user_id && msg.user_id !== COLLAB_USER_ID){
@@ -9250,7 +10989,8 @@ function maybeSendCollabStateOverWebSocket(opts={}){
   if (!COLLAB_WS_CONNECTED || !COLLAB_WS || COLLAB_WS.readyState !== WebSocket.OPEN) return;
   if (!COLLAB_SESSION_ID || !COLLAB_USER_ID || VIEW_ONLY_SESSION || COLLAB_APPLYING) return;
   const now = Date.now();
-  if (!opts.force && now - COLLAB_WS_LAST_SEND_MS < 500) return;
+  const minStateInterval = (isStoryMode && storyIsEditingOrSelecting()) ? 1400 : 500;
+  if (!opts.force && now - COLLAB_WS_LAST_SEND_MS < minStateInterval) return;
 
   const state = buildShareSessionState();
   const hash = hashSessionState(state);
@@ -9258,6 +10998,10 @@ function maybeSendCollabStateOverWebSocket(opts={}){
   // are used only by users who explicitly choose Follow Presenter.
   sendCollabPlayheadUpdate();
   if (isTimelineMode) sendTimelinePresence('viewing');
+  if (isStoryMode){
+    const snap = storySnapshotEditingFocus();
+    if (snap?.rowId && snap?.cardId) sendCollabStoryCursor(snap.rowId, snap.cardId, snap.cueId || '', snap.field === 'mini' ? 'mini' : 'card');
+  }
   if (hash === COLLAB_LAST_HASH){
     // Presence heartbeat keeps live user list fresh without sending transcript state.
     if (now - COLLAB_WS_LAST_SEND_MS > 5000){
@@ -9333,7 +11077,7 @@ async function syncCollaborativeSession(){
     try{
       const active = document.activeElement;
       const wasEditingText = !!(active && active.closest && active.closest('.text'));
-      applySharedSessionState(data.state);
+      applySharedSessionState(data.state, { remoteUpdate: true });
       COLLAB_REVISION = serverRev;
       COLLAB_LAST_HASH = hashSessionState(buildShareSessionState());
       setCollabSyncStatus('updated');
@@ -9414,7 +11158,7 @@ function applyViewOnlyMode(){
     }
   }
 
-  document.querySelectorAll('#transcript .text, #transcriptB .text, .timepill, .txt-script-editor').forEach(el => {
+  document.querySelectorAll('#transcript .text, #transcriptB .text, .timepill, .txt-script-editor, .story-card-body, .story-mini-text').forEach(el => {
     try{ el.contentEditable = 'false'; }catch(_e){}
   });
   document.querySelectorAll('.transcript .line').forEach(el => {
@@ -9454,7 +11198,11 @@ function applySharedSessionState(state, opts={}){
     if (isTimelineMode) requestTimelineRender();
   }
   if (Array.isArray(st.story_rows)){
-    applySharedStoryRows(st.story_rows);
+    if (opts.remoteUpdate && storyIsEditingOrSelecting()){
+      storyQueueRemoteRows(st.story_rows);
+    } else {
+      applySharedStoryRows(st.story_rows, { remoteUpdate: !!opts.remoteUpdate });
+    }
   }
 
   const box = document.getElementById('alignSrtText');
@@ -10394,6 +12142,147 @@ function setTimelineSelection(start, end, { seek=true } = {}){
 function getTimelineSelectedClip(){
   return timelineClips.find(c => c.id === timelineSelectedClipId) || null;
 }
+function isTimelineListNameEditing(){
+  const active = document.activeElement;
+  return !!(active && active.classList && active.classList.contains('tl-list-name') && timelineModeEl?.contains(active));
+}
+function timelineMakeUndoSnapshot(reason='edit'){
+  return {
+    reason,
+    clips: JSON.parse(JSON.stringify((timelineClips || []).map((c, idx) => cleanTimelineClipForShare(c, idx)))),
+    selectedClipId: String(timelineSelectedClipId || ''),
+    selection: timelineSelection ? { start:Number(timelineSelection.start)||0, end:Number(timelineSelection.end)||0 } : null,
+  };
+}
+function timelinePushUndo(reason='edit'){
+  try{
+    timelineUndoStack.push(timelineMakeUndoSnapshot(reason));
+    if (timelineUndoStack.length > 40) timelineUndoStack.shift();
+  }catch(_e){}
+}
+function timelineUndoLast(){
+  const snap = timelineUndoStack.pop();
+  if (!snap){ timelineSetStatus?.('Nothing to undo.'); return false; }
+  timelineClips = Array.isArray(snap.clips) ? snap.clips.map((c, idx) => cleanTimelineClipForShare(c, idx)) : [];
+  normalizeTimelineClips();
+  timelineSelectedClipId = timelineClips.some(c => c.id === snap.selectedClipId) ? snap.selectedClipId : '';
+  timelineSelection = snap.selection ? { start:Number(snap.selection.start)||0, end:Number(snap.selection.end)||0 } : null;
+  requestTimelineRender();
+  timelineCommitSharedState(true);
+  timelineSetStatus?.(`Undid ${snap.reason || 'last timeline edit'}.`);
+  return true;
+}
+function ensureTimelineConfirmModal(){
+  if (timelineConfirmModalEl && document.body.contains(timelineConfirmModalEl)) return timelineConfirmModalEl;
+  const wrap = document.createElement('div');
+  wrap.id = 'timelineConfirmModal';
+  wrap.className = 'tl-confirm-overlay hidden';
+  wrap.innerHTML = `
+    <div class="tl-confirm-card" role="dialog" aria-modal="true" aria-labelledby="tlConfirmTitle">
+      <div class="tl-confirm-title" id="tlConfirmTitle">Delete timeline clip?</div>
+      <div class="tl-confirm-body" id="tlConfirmBody">This will remove the selected clip from the timeline.</div>
+      <div class="tl-confirm-actions">
+        <button class="btn btn-outline" id="tlConfirmCancel" type="button">Cancel</button>
+        <button class="btn btn-gold danger" id="tlConfirmDelete" type="button">Delete</button>
+      </div>
+    </div>`;
+  document.body.appendChild(wrap);
+  return wrap;
+}
+function timelineConfirmDeleteClip(clip){
+  return new Promise(resolve => {
+    const modal = ensureTimelineConfirmModal();
+    const body = modal.querySelector('#tlConfirmBody');
+    const title = modal.querySelector('#tlConfirmTitle');
+    const cancel = modal.querySelector('#tlConfirmCancel');
+    const del = modal.querySelector('#tlConfirmDelete');
+    const name = getTimelineClipDisplayName(clip, Math.max(0, timelineClips.findIndex(c => c.id === clip?.id)));
+    if (title) title.textContent = 'Delete timeline clip?';
+    if (body) body.innerHTML = `<b>${escapeHtml(name || 'Selected clip')}</b><br><span>${fmtTimelineTime(clip.start)} → ${fmtTimelineTime(clip.end)}</span><br><small>You can undo this with Ctrl+Z after deleting.</small>`;
+    const close = (ok) => {
+      modal.classList.add('hidden');
+      cancel?.removeEventListener('click', onCancel);
+      del?.removeEventListener('click', onDelete);
+      modal.removeEventListener('click', onOverlay);
+      document.removeEventListener('keydown', onKey);
+      resolve(!!ok);
+    };
+    const onCancel = () => close(false);
+    const onDelete = () => close(true);
+    const onOverlay = (ev) => { if (ev.target === modal) close(false); };
+    const onKey = (ev) => { if (ev.key === 'Escape') close(false); if (ev.key === 'Enter') close(true); };
+    cancel?.addEventListener('click', onCancel);
+    del?.addEventListener('click', onDelete);
+    modal.addEventListener('click', onOverlay);
+    document.addEventListener('keydown', onKey);
+    modal.classList.remove('hidden');
+    setTimeout(() => del?.focus?.(), 0);
+  });
+}
+async function deleteTimelineClipWithConfirm(clipId){
+  const clip = timelineClips.find(c => c.id === clipId);
+  if (!clip) return false;
+  if (isTimelineClipRemoteLocked(clip.id)){ timelineSetStatus('This clip is locked by another user.'); return false; }
+  const ok = await timelineConfirmDeleteClip(clip);
+  if (!ok) return false;
+  timelinePushUndo('clip deletion');
+  timelineClips = timelineClips.filter(c => c.id !== clip.id);
+  if (timelineSelectedClipId === clip.id) timelineSelectedClipId = '';
+  requestTimelineRender();
+  timelineCommitSharedState(true);
+  timelineSetStatus(`Deleted ${getTimelineClipDisplayName(clip)}. Press Ctrl+Z to undo.`);
+  return true;
+}
+function getTimelineActivePreviewRange(){
+  const clip = getTimelineSelectedClip();
+  if (clip && Number(clip.end) > Number(clip.start)){
+    return { start:Number(clip.start), end:Number(clip.end), clip, source:'clip' };
+  }
+  if (!timelineSelection) createDefaultTimelineSelection();
+  if (timelineSelection){
+    const a = Math.min(Number(timelineSelection.start) || 0, Number(timelineSelection.end) || 0);
+    const b = Math.max(Number(timelineSelection.start) || 0, Number(timelineSelection.end) || 0);
+    return { start:a, end:b, clip:null, source:'selection' };
+  }
+  return null;
+}
+function previewTimelineActiveClipOrSelection(){
+  const range = getTimelineActivePreviewRange();
+  if (!range || range.end <= range.start + (1 / getFPS())){ alert('No valid clip or range to preview.'); return; }
+  timelineSelection = { start:range.start, end:range.end };
+  requestTimelineRender();
+  const label = range.clip ? `Preview Clip · ${getTimelineClipDisplayName(range.clip)}` : 'Preview Selection';
+  previewMediaRange(range.start, range.end, {
+    label,
+    onStop: () => {
+      try{ timelineSetStatus(`Preview stopped at ${fmtTimelineTime(range.end)}.`); }catch(_e){}
+      requestTimelineRender();
+    }
+  });
+}
+function trimTimelineSelectedClipToPlayhead(edge){
+  const clip = getTimelineSelectedClip();
+  if (!clip) return false;
+  if (isTimelineClipRemoteLocked(clip.id)){ timelineSetStatus('This clip is locked by another user.'); return true; }
+  const t = snapTimeToFrameValue((typeof getMediaCurrentTime === 'function') ? getMediaCurrentTime() : 0);
+  const minDur = 1 / getFPS();
+  if (edge === 'in'){
+    if (t >= Number(clip.end) - minDur){ timelineSetStatus('In point must stay before the clip Out point.'); return true; }
+    clip.start = Math.max(0, t);
+  } else if (edge === 'out'){
+    if (t <= Number(clip.start) + minDur){ timelineSetStatus('Out point must stay after the clip In point.'); return true; }
+    clip.end = Math.min(getTimelineDuration(), t);
+  } else {
+    return false;
+  }
+  clip.start = snapTimeToFrameValue(clip.start);
+  clip.end = snapTimeToFrameValue(clip.end);
+  timelineSelection = { start:clip.start, end:clip.end };
+  timelineSetStatus(`${edge === 'in' ? 'In' : 'Out'} set for ${getTimelineClipDisplayName(clip)}.`);
+  requestTimelineRender();
+  timelineCommitSharedState(true);
+  return true;
+}
 function moveTimelineClipOrder(clipId, dir){
   const i = timelineClips.findIndex(c => c.id === clipId);
   if (i < 0) return;
@@ -10695,6 +12584,7 @@ function ensureTimelineMode(){
         <button class="btn btn-outline" id="tlSnapCue" type="button">Snap to Cue</button>
         <button class="btn btn-outline" id="tlSetIn" type="button">Set In</button>
         <button class="btn btn-outline" id="tlSetOut" type="button">Set Out</button>
+        <button class="btn btn-outline" id="tlPreviewClip" type="button">Preview Clip</button>
         <button class="btn btn-gold" id="tlAddClip" type="button">Add Clip</button>
         <button class="btn btn-gold" id="tlAiSelect" type="button">AI Select</button>
       </div>
@@ -10760,6 +12650,7 @@ function bindTimelineMode(){
   el.querySelector('#tlZoomIn')?.addEventListener('click', () => setTimelineZoom(timelinePxPerSec * 1.25));
   el.querySelector('#tlZoomOut')?.addEventListener('click', () => setTimelineZoom(timelinePxPerSec / 1.25));
   zoom?.addEventListener('input', () => setTimelineZoom(Number(zoom.value) || timelinePxPerSec));
+  el.querySelector('#tlPreviewClip')?.addEventListener('click', () => previewTimelineActiveClipOrSelection());
   el.querySelector('#tlAddClip')?.addEventListener('click', () => addTimelineClipFromSelection());
   el.querySelector('#tlAiSelect')?.addEventListener('click', () => openTimelineAiModal());
   el.querySelector('#tlExport')?.addEventListener('click', () => exportTimelineCut());
@@ -10786,15 +12677,17 @@ function bindTimelineMode(){
   lane?.addEventListener('pointerdown', onTimelineLanePointerDown);
   document.addEventListener('keydown', (ev) => {
     if (!isTimelineMode) return;
+    if (timelineConfirmModalEl && !timelineConfirmModalEl.classList.contains('hidden')) return;
     if (ev.target && ['INPUT','TEXTAREA','SELECT'].includes(ev.target.tagName)) return;
+    if ((ev.ctrlKey || ev.metaKey) && String(ev.key || '').toLowerCase() === 'z'){
+      ev.preventDefault();
+      timelineUndoLast();
+      return;
+    }
     if (ev.key === 'Delete' || ev.key === 'Backspace'){
       if (timelineSelectedClipId){
         ev.preventDefault();
-        if (isTimelineClipRemoteLocked(timelineSelectedClipId)){ timelineSetStatus('This clip is locked by another user.'); return; }
-        timelineClips = timelineClips.filter(c => c.id !== timelineSelectedClipId);
-        timelineSelectedClipId = '';
-        requestTimelineRender();
-        timelineCommitSharedState(true);
+        deleteTimelineClipWithConfirm(timelineSelectedClipId);
       }
     } else if (ev.key === '['){
       ev.preventDefault(); setTimelineInAtPlayhead();
@@ -11007,6 +12900,9 @@ function addTimelineClipFromSelection(){
 function renderTimelineClipList(){
   const host = timelineModeEl?.querySelector('#tlClipList');
   if (!host) return;
+  // Do not rebuild the clip list while the user is renaming a clip. A full
+  // re-render replaces the <input>, which makes Chrome drop focus/caret.
+  if (isTimelineListNameEditing()) return;
   if (TIMELINE_COLOR_PICKER_OPEN && document.activeElement?.classList?.contains('tl-list-color')) return;
   if (!timelineClips.length){ host.innerHTML = '<div class="tl-empty">Selected clips will appear here. Export order follows this list.</div>'; return; }
   host.innerHTML = '';
@@ -11029,7 +12925,13 @@ function renderTimelineClipList(){
     row.querySelector('.tl-list-main').onclick = () => { timelineSelectedClipId = clip.id; timelineSelection = { start:clip.start, end:clip.end }; timelineLiveSeek(clip.start); requestTimelineRender(); };
     const nameInput = row.querySelector('.tl-list-name');
     nameInput.addEventListener('focus', () => { timelineSelectedClipId = clip.id; row.classList.add('selected'); });
-    nameInput.addEventListener('change', () => { clip.label = nameInput.value.trim() || timelineClipBaseLabel(idx); requestTimelineRender(); timelineCommitSharedState(); });
+    nameInput.addEventListener('input', () => {
+      clip.label = nameInput.value;
+      const blockLabel = timelineModeEl?.querySelector(`.tl-clip[data-id="${CSS.escape(clip.id)}"] .tl-clip-label`);
+      if (blockLabel) blockLabel.innerHTML = `<b>${idx+1}</b> ${escapeHtml(getTimelineClipDisplayName(clip, idx))}`;
+    });
+    nameInput.addEventListener('change', () => { clip.label = nameInput.value.trim() || timelineClipBaseLabel(idx); timelineCommitSharedState(); requestTimelineRender(); });
+    nameInput.addEventListener('blur', () => { clip.label = nameInput.value.trim() || timelineClipBaseLabel(idx); timelineCommitSharedState(); requestTimelineRender(); });
     nameInput.addEventListener('keydown', (ev) => { if (ev.key === 'Enter'){ ev.preventDefault(); nameInput.blur(); } });
     const colorInput = row.querySelector('.tl-list-color');
     const openColorPicker = () => { TIMELINE_COLOR_PICKER_OPEN = true; TIMELINE_COLOR_PICKER_CLIP_ID = clip.id; timelineSelectedClipId = clip.id; };
@@ -11042,7 +12944,7 @@ function renderTimelineClipList(){
     colorInput.addEventListener('blur', closeColorPicker);
     row.querySelector('[data-act="up"]').onclick = () => moveTimelineClipOrder(clip.id, -1);
     row.querySelector('[data-act="down"]').onclick = () => moveTimelineClipOrder(clip.id, 1);
-    row.querySelector('.tl-list-del').onclick = () => { if (isTimelineClipRemoteLocked(clip.id)){ timelineSetStatus('This clip is locked by another user.'); return; } timelineClips = timelineClips.filter(c => c.id !== clip.id); if (timelineSelectedClipId === clip.id) timelineSelectedClipId=''; requestTimelineRender(); timelineCommitSharedState(true); };
+    row.querySelector('.tl-list-del').onclick = () => { deleteTimelineClipWithConfirm(clip.id); };
     row.querySelector('.tl-list-drag')?.addEventListener('dragstart', (ev) => { ev.dataTransfer.setData('text/plain', clip.id); row.classList.add('dragging'); });
     row.addEventListener('dragend', () => row.classList.remove('dragging'));
     row.addEventListener('dragover', (ev) => { ev.preventDefault(); row.classList.add('drop-target'); });
@@ -11082,18 +12984,20 @@ function snapTimelineSelectionToCurrentCue(){
   setTimelineSelection(cue.start, cue.end);
 }
 function setTimelineInAtPlayhead(){
+  if (trimTimelineSelectedClipToPlayhead('in')) return;
   const t = snapTimeToFrameValue((typeof getMediaCurrentTime === 'function') ? getMediaCurrentTime() : 0);
   if (!timelineSelection) createDefaultTimelineSelection();
   setTimelineSelection(t, Math.max(t + 1/getFPS(), timelineSelection.end), { seek:false });
 }
 function setTimelineOutAtPlayhead(){
+  if (trimTimelineSelectedClipToPlayhead('out')) return;
   const t = snapTimeToFrameValue((typeof getMediaCurrentTime === 'function') ? getMediaCurrentTime() : 0);
   if (!timelineSelection) createDefaultTimelineSelection();
   setTimelineSelection(Math.min(timelineSelection.start, t - 1/getFPS()), t, { seek:false });
 }
 
 let timelinePreviewModalEl = null;
-let tlModalPreview = { clips: [], index: 0, playing: false, ratio:'16:9', scale:1, x:0, y:0, raf:0 };
+let tlModalPreview = { clips: [], index: 0, playing: false, ratio:'16:9', scale:1, x:0, y:0, raf:0, iframeMode:false, iframeType:'', virtualMediaTime:0, virtualLastMs:0 };
 function ensureTimelinePreviewModal(){
   if (timelinePreviewModalEl && document.body.contains(timelinePreviewModalEl)) return timelinePreviewModalEl;
   const wrap = document.createElement('div');
@@ -11112,6 +13016,8 @@ function ensureTimelinePreviewModal(){
         <div class="tl-preview-stage-wrap">
           <div id="tlPreviewStage" class="tl-preview-stage ratio-16x9">
             <video id="tlPreviewVideo" playsinline></video>
+            <iframe id="tlPreviewIframe" class="tl-preview-iframe" title="Timeline iframe preview" allow="autoplay; encrypted-media; picture-in-picture; web-share" allowfullscreen hidden></iframe>
+            <div id="tlPreviewIframeNote" class="tl-preview-iframe-note" hidden>Iframe preview uses virtual timing. For exact frame-accurate preview/export, cache the media first.</div>
             <div id="tlPreviewSafe" class="tl-preview-safe"></div>
             <div id="tlPreviewSubtitle" class="tl-preview-subtitle"></div>
           </div>
@@ -11140,7 +13046,7 @@ function ensureTimelinePreviewModal(){
     </div>`;
   document.body.appendChild(wrap);
   timelinePreviewModalEl = wrap;
-  const close = () => { stopTimelineModalPreview(); wrap.classList.add('hidden'); };
+  const close = () => { stopTimelineModalPreview(); try{ const f=wrap.querySelector('#tlPreviewIframe'); if(f) f.removeAttribute('src'); }catch(_e){} wrap.classList.add('hidden'); };
   wrap.querySelector('#tlPreviewClose').onclick = close;
   wrap.addEventListener('click', ev => { if (ev.target === wrap) close(); });
   wrap.querySelector('#tlPreviewPlay').onclick = () => toggleTimelineModalPreview();
@@ -11173,16 +13079,92 @@ function getTimelinePreviewClips(){
   }
   return [];
 }
+
+function getTimelinePreviewIframeType(){
+  if (currentMediaSource?.type === 'youtube') return 'youtube';
+  if (currentMediaSource?.type === 'drive' && currentMediaSource?.playerMode === 'iframe') return 'drive';
+  return '';
+}
+function timelinePreviewBuildIframeSrc(time=0, { autoplay=false }={}){
+  const t = Math.max(0, Math.floor(Number(time) || 0));
+  const type = getTimelinePreviewIframeType();
+  if (type === 'youtube'){
+    const vid = currentMediaSource?.videoId || parseYouTubeVideoId(currentMediaSource?.url || '');
+    if (!vid) return '';
+    const origin = encodeURIComponent(window.location.origin || 'http://127.0.0.1');
+    const params = new URLSearchParams({ rel:'0', modestbranding:'1', playsinline:'1', enablejsapi:'1', origin:decodeURIComponent(origin), start:String(t) });
+    if (autoplay) params.set('autoplay', '1');
+    return `https://www.youtube.com/embed/${encodeURIComponent(vid)}?${params.toString()}`;
+  }
+  if (type === 'drive'){
+    const fid = currentMediaSource?.fileId || parseGoogleDriveFileId(currentMediaSource?.url || '');
+    return fid ? getGoogleDrivePreviewUrl(fid, t, { autoplay }) : '';
+  }
+  return '';
+}
+function timelinePreviewIframePost(func, args=[]){
+  const iframe = timelinePreviewModalEl?.querySelector?.('#tlPreviewIframe');
+  if (!iframe || !iframe.contentWindow || tlModalPreview.iframeType !== 'youtube') return false;
+  const payload = JSON.stringify({ event:'command', func, args: Array.isArray(args) ? args : [] });
+  try{ iframe.contentWindow.postMessage(payload, 'https://www.youtube.com'); return true; }
+  catch(_e){ try{ iframe.contentWindow.postMessage(payload, '*'); return true; }catch(_e2){ return false; } }
+}
+function timelinePreviewSetIframeVisible(modal, on){
+  const iframe = modal?.querySelector?.('#tlPreviewIframe');
+  const note = modal?.querySelector?.('#tlPreviewIframeNote');
+  const video = modal?.querySelector?.('#tlPreviewVideo');
+  if (iframe) iframe.hidden = !on;
+  if (note) note.hidden = !on;
+  if (video) video.hidden = !!on;
+}
+function timelinePreviewIframeMediaTime(){
+  if (!tlModalPreview.iframeMode) return Number(timelinePreviewModalEl?.querySelector?.('#tlPreviewVideo')?.currentTime || 0);
+  if (tlModalPreview.playing && tlModalPreview.virtualLastMs){
+    const now = performance.now();
+    const dt = Math.max(0, Math.min(1.0, (now - tlModalPreview.virtualLastMs) / 1000));
+    if (dt){
+      tlModalPreview.virtualMediaTime = Math.max(0, Number(tlModalPreview.virtualMediaTime || 0) + dt);
+      tlModalPreview.virtualLastMs = now;
+    }
+  }
+  return Number(tlModalPreview.virtualMediaTime || 0);
+}
+function timelinePreviewSetIframeTime(time, play=false){
+  const modal = ensureTimelinePreviewModal();
+  const iframe = modal.querySelector('#tlPreviewIframe');
+  const t = Math.max(0, Number(time) || 0);
+  tlModalPreview.virtualMediaTime = t;
+  tlModalPreview.virtualLastMs = performance.now();
+  timelinePreviewSetIframeVisible(modal, true);
+  if (!iframe) return;
+  if (tlModalPreview.iframeType === 'youtube'){
+    const src = timelinePreviewBuildIframeSrc(t, { autoplay: play });
+    if (!iframe.src || !iframe.src.includes('/embed/') || Math.abs(t - Number(tlModalPreview._lastIframeStart || -999)) > 1.2){
+      iframe.src = src;
+      tlModalPreview._lastIframeStart = t;
+    }
+    timelinePreviewIframePost('seekTo', [t, true]);
+    timelinePreviewIframePost(play ? 'playVideo' : 'pauseVideo', []);
+  } else if (tlModalPreview.iframeType === 'drive'){
+    const src = timelinePreviewBuildIframeSrc(t, { autoplay: play });
+    if (src) iframe.src = src;
+  }
+}
 function openTimelinePreviewModal(){
   const modal = ensureTimelinePreviewModal();
   tlModalPreview.clips = getTimelinePreviewClips();
   tlModalPreview.index = 0;
   tlModalPreview.playing = false;
+  tlModalPreview.iframeType = getTimelinePreviewIframeType();
+  tlModalPreview.iframeMode = !!tlModalPreview.iframeType;
+  tlModalPreview.virtualMediaTime = 0;
+  tlModalPreview.virtualLastMs = performance.now();
   tlPreviewCues = buildTimelinePreviewCues(tlModalPreview.clips);
   modal.classList.remove('hidden');
   const src = player?.currentSrc || player?.src || '';
   const v = modal.querySelector('#tlPreviewVideo');
-  if (v && src && v.src !== src) v.src = src;
+  timelinePreviewSetIframeVisible(modal, tlModalPreview.iframeMode);
+  if (!tlModalPreview.iframeMode && v && src && v.src !== src) v.src = src;
   applyTimelinePreviewStageSettings();
   renderTimelinePreviewSubtitlePanel();
   loadTimelineModalPreviewClip(0, false);
@@ -11196,8 +13178,10 @@ function applyTimelinePreviewStageSettings(){
   const x = Number(modal.querySelector('#tlPreviewX')?.value || 0);
   const y = Number(modal.querySelector('#tlPreviewY')?.value || 0);
   tlModalPreview.ratio = ratio; tlModalPreview.scale = scale; tlModalPreview.x = x; tlModalPreview.y = y;
+  const iframe = modal.querySelector('#tlPreviewIframe');
   if (stage){ stage.classList.toggle('ratio-9x16', ratio === '9:16'); stage.classList.toggle('ratio-16x9', ratio !== '9:16'); }
   if (video){ video.style.transform = `translate(${x}%, ${y}%) scale(${scale})`; }
+  if (iframe){ iframe.style.transform = `translate(${x}%, ${y}%) scale(${scale})`; }
 }
 function loadTimelineModalPreviewClip(index, play=true){
   const modal = ensureTimelinePreviewModal();
@@ -11206,28 +13190,56 @@ function loadTimelineModalPreviewClip(index, play=true){
   tlModalPreview.index = Math.max(0, Math.min(clips.length - 1, index));
   const clip = clips[tlModalPreview.index];
   const v = modal.querySelector('#tlPreviewVideo');
-  if (!v) return;
-  try{ v.currentTime = Math.max(0, clip.start || 0); }catch(_e){}
   const st = modal.querySelector('#tlPreviewStatus');
   if (st) st.textContent = `${tlModalPreview.index + 1}/${clips.length} · ${clip.label || 'Clip'} · ${fmtTimelineTime(clip.start)} → ${fmtTimelineTime(clip.end)}`;
+  if (tlModalPreview.iframeMode){
+    tlModalPreview.playing = !!play;
+    timelinePreviewSetIframeTime(Math.max(0, clip.start || 0), !!play);
+    modal.querySelector('#tlPreviewPlay').textContent = play ? 'Pause' : 'Play';
+    updateTimelinePreviewSubtitle();
+    if (play) startTimelineModalPreviewLoop();
+    return;
+  }
+  if (!v) return;
+  try{ v.currentTime = Math.max(0, clip.start || 0); }catch(_e){}
   updateTimelinePreviewSubtitle();
   if (play){ tlModalPreview.playing = true; v.play().catch(()=>{}); modal.querySelector('#tlPreviewPlay').textContent = 'Pause'; startTimelineModalPreviewLoop(); }
   else { tlModalPreview.playing = false; v.pause(); modal.querySelector('#tlPreviewPlay').textContent = 'Play'; }
 }
 function toggleTimelineModalPreview(){
   const modal = ensureTimelinePreviewModal();
-  const v = modal.querySelector('#tlPreviewVideo');
-  if (!v) return;
-  if (tlModalPreview.playing){ tlModalPreview.playing=false; v.pause(); modal.querySelector('#tlPreviewPlay').textContent='Play'; return; }
+  if (tlModalPreview.playing){
+    tlModalPreview.playing=false;
+    if (tlModalPreview.iframeMode){
+      tlModalPreview.virtualMediaTime = timelinePreviewIframeMediaTime();
+      timelinePreviewIframePost('pauseVideo', []);
+    } else {
+      const v = modal.querySelector('#tlPreviewVideo');
+      try{ v?.pause(); }catch(_e){}
+    }
+    modal.querySelector('#tlPreviewPlay').textContent='Play';
+    return;
+  }
   if (!tlModalPreview.clips?.length) tlModalPreview.clips = getTimelinePreviewClips();
   if (!tlModalPreview.clips.length) return;
   tlModalPreview.playing=true; modal.querySelector('#tlPreviewPlay').textContent='Pause';
-  v.play().catch(()=>{}); startTimelineModalPreviewLoop();
+  if (tlModalPreview.iframeMode){
+    tlModalPreview.virtualLastMs = performance.now();
+    if (tlModalPreview.iframeType === 'youtube') timelinePreviewIframePost('playVideo', []);
+    else timelinePreviewSetIframeTime(timelinePreviewIframeMediaTime(), true);
+  } else {
+    const v = modal.querySelector('#tlPreviewVideo');
+    v?.play?.().catch(()=>{});
+  }
+  startTimelineModalPreviewLoop();
 }
 function stopTimelineModalPreview(){
   tlModalPreview.playing = false;
   if (tlModalPreview.raf) cancelAnimationFrame(tlModalPreview.raf);
   tlModalPreview.raf = 0;
+  if (tlModalPreview.iframeMode){
+    try{ timelinePreviewIframePost('pauseVideo', []); }catch(_e){}
+  }
   const v = timelinePreviewModalEl?.querySelector('#tlPreviewVideo');
   try{ v?.pause(); }catch(_e){}
 }
@@ -11244,9 +13256,11 @@ function startTimelineModalPreviewLoop(){
     const modal = timelinePreviewModalEl;
     const v = modal?.querySelector('#tlPreviewVideo');
     const clip = tlModalPreview.clips?.[tlModalPreview.index || 0];
-    if (!modal || modal.classList.contains('hidden') || !v || !clip || !tlModalPreview.playing){ tlModalPreview.raf = 0; return; }
+    if (!modal || modal.classList.contains('hidden') || !clip || !tlModalPreview.playing){ tlModalPreview.raf = 0; return; }
+    if (!tlModalPreview.iframeMode && !v){ tlModalPreview.raf = 0; return; }
     updateTimelinePreviewSubtitle();
-    if (Number(v.currentTime || 0) >= Number(clip.end || 0) - 0.015){ advanceTimelineModalPreview(); return; }
+    const mediaT = tlModalPreview.iframeMode ? timelinePreviewIframeMediaTime() : Number(v.currentTime || 0);
+    if (Number(mediaT || 0) >= Number(clip.end || 0) - 0.015){ advanceTimelineModalPreview(); return; }
     tlModalPreview.raf = requestAnimationFrame(tick);
   };
   tlModalPreview.raf = requestAnimationFrame(tick);
@@ -11307,12 +13321,14 @@ function buildTimelinePreviewCues(clips){
   return out;
 }
 function getTimelinePreviewAssembledTime(){
-  const v = timelinePreviewModalEl?.querySelector('#tlPreviewVideo');
   const clip = tlModalPreview.clips?.[tlModalPreview.index || 0];
-  if (!v || !clip) return 0;
+  if (!clip) return 0;
+  const v = timelinePreviewModalEl?.querySelector('#tlPreviewVideo');
+  if (!tlModalPreview.iframeMode && !v) return 0;
   const offsets = timelinePreviewClipOffsets();
   const off = offsets[tlModalPreview.index || 0]?.start || 0;
-  return off + Math.max(0, Number(v.currentTime || 0) - (Number(clip.start) || 0));
+  const mediaTime = tlModalPreview.iframeMode ? timelinePreviewIframeMediaTime() : Number(v.currentTime || 0);
+  return off + Math.max(0, Number(mediaTime || 0) - (Number(clip.start) || 0));
 }
 function seekTimelinePreviewToAssembledTime(t, play=false){
   const clips = tlModalPreview.clips || [];
@@ -11324,11 +13340,21 @@ function seekTimelinePreviewToAssembledTime(t, play=false){
   const local = Math.max(0, target - found.start);
   tlModalPreview.index = found.index;
   const v = timelinePreviewModalEl?.querySelector('#tlPreviewVideo');
-  if (!v) return;
-  try{ v.currentTime = (Number(found.clip.start) || 0) + local; }catch(_e){}
+  const mediaTarget = (Number(found.clip.start) || 0) + local;
+  if (tlModalPreview.iframeMode){
+    timelinePreviewSetIframeTime(mediaTarget, !!play);
+  } else {
+    if (!v) return;
+    try{ v.currentTime = mediaTarget; }catch(_e){}
+  }
   const st = timelinePreviewModalEl?.querySelector('#tlPreviewStatus');
   if (st) st.textContent = `${found.index + 1}/${clips.length} · ${found.clip.label || 'Clip'} · ${fmtTimelineTime(found.clip.start)} → ${fmtTimelineTime(found.clip.end)}`;
-  if (play){ tlModalPreview.playing = true; v.play().catch(()=>{}); timelinePreviewModalEl.querySelector('#tlPreviewPlay').textContent='Pause'; startTimelineModalPreviewLoop(); }
+  if (play){
+    tlModalPreview.playing = true;
+    if (!tlModalPreview.iframeMode) v?.play?.().catch(()=>{});
+    timelinePreviewModalEl.querySelector('#tlPreviewPlay').textContent='Pause';
+    startTimelineModalPreviewLoop();
+  }
   updateTimelinePreviewSubtitle();
 }
 function renderTimelinePreviewSubtitlePanel(){
@@ -11437,7 +13463,7 @@ function updateTimelinePreviewSubtitle(){
   if (!modal || modal.classList.contains('hidden')) return;
   const v = modal.querySelector('#tlPreviewVideo');
   const sub = modal.querySelector('#tlPreviewSubtitle');
-  if (!v || !sub) return;
+  if ((!tlModalPreview.iframeMode && !v) || !sub) return;
   const assembled = getTimelinePreviewAssembledTime();
   const cue = (tlPreviewCues || []).find(c => assembled >= Number(c.start||0) && assembled <= Number(c.end||0));
   sub.textContent = cue ? wrapSubtitleTextByChars(String(cue.text || '').trim(), getCaptionMaxChars()) : '';
