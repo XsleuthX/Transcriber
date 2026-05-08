@@ -5765,87 +5765,270 @@ function ensureStoryModal(){
   return storyModalEl;
 }
 function hideStoryModal(){ if (storyModalEl){ storyModalEl.remove(); storyModalEl = null; } }
+function storyCueFinderUsedMap(track='A'){
+  const wanted = normalizeStoryTrack(track || 'A');
+  const map = new Map();
+  (storyRows || []).forEach((row, rowIndex) => {
+    (row?.cards || []).forEach(card => {
+      let refs = [];
+      if (card?.altCueRefs && Array.isArray(card.altCueRefs[wanted])) refs = refs.concat(card.altCueRefs[wanted]);
+      if (normalizeStoryTrack(card?.track || 'A') === wanted && Array.isArray(card?.cueRefs)) refs = refs.concat(card.cueRefs);
+      storyUniqueRefs(refs).forEach(id => {
+        const key = String(id || '');
+        if (!key) return;
+        if (!map.has(key)) map.set(key, []);
+        const rows = map.get(key);
+        const rowNo = rowIndex + 1;
+        if (!rows.includes(rowNo)) rows.push(rowNo);
+      });
+    });
+  });
+  return map;
+}
+function storyCueFinderNorm(v){ return String(v ?? '').toLowerCase().replace(/\s+/g, ' ').trim(); }
+function storyCueFinderEscapeRegExp(v){ return String(v ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+function storyCueFinderHighlightText(text, query){
+  const raw = String(text ?? '');
+  const q = String(query ?? '').trim();
+  if (!q || q.length < 2 || /^[\d:.;,-]+$/.test(q)) return escapeHtml(raw);
+  const terms = q.split(/\s+/).filter(t => t.length >= 2).slice(0, 4);
+  if (!terms.length) return escapeHtml(raw);
+  const re = new RegExp('(' + terms.map(storyCueFinderEscapeRegExp).join('|') + ')', 'ig');
+  return escapeHtml(raw).replace(re, '<mark>$1</mark>');
+}
+function storyCueFinderCurrentRange(kind='range'){
+  if (kind === 'near'){
+    const t = (typeof getMediaCurrentTime === 'function') ? Number(getMediaCurrentTime()) : 0;
+    const center = Number.isFinite(t) ? t : 0;
+    return { start:Math.max(0, center - 30), end:center + 30, label:`Playhead ±30s (${fmtTC(Math.max(0, center - 30))} → ${fmtTC(center + 30)})` };
+  }
+  if (kind === 'selection' && timelineSelection){
+    const a = Math.min(Number(timelineSelection.start || 0), Number(timelineSelection.end || 0));
+    const b = Math.max(Number(timelineSelection.start || 0), Number(timelineSelection.end || 0));
+    if (Number.isFinite(a) && Number.isFinite(b) && b > a) return { start:a, end:b, label:`Selected range (${fmtTC(a)} → ${fmtTC(b)})` };
+  }
+  if (kind === 'activeCard'){
+    const active = storyGetActiveCard?.();
+    const range = active?.card ? (storyCardRange(active.card) || storyTimelineRangeForCard?.(active.card) || null) : null;
+    if (range && Number(range.end) > Number(range.start)) return { start:Number(range.start), end:Number(range.end), label:`Active card (${fmtTC(range.start)} → ${fmtTC(range.end)})` };
+  }
+  return null;
+}
+function storyCueFinderCueOverlaps(cue, range){
+  if (!range) return true;
+  const cs = Number(cue?.start ?? 0), ce = Number(cue?.end ?? 0);
+  if (!Number.isFinite(cs) || !Number.isFinite(ce)) return false;
+  return Math.min(ce, Number(range.end)) - Math.max(cs, Number(range.start)) > 0.001;
+}
 function showStoryCueModal(rowId){
   const modal = ensureStoryModal();
-  const track = normalizeStoryTrack(storyActiveSubTrack || subsMode || 'A');
-  const list = storyEnsureCueIds(track);
+  const state = {
+    track: normalizeStoryTrack(storyActiveSubTrack || subsMode || 'A'),
+    query: '',
+    filter: 'all',
+    unusedOnly: false,
+    selected: new Set(),
+    anchor: -1,
+    lastScrollTop: 0,
+    rowHeight: 72
+  };
   modal.innerHTML = `
-    <div class="story-modal-card story-cue-picker-card">
-      <div class="story-modal-head"><div><strong>Select Cues</strong><div class="story-modal-sub">Track ${escapeHtml(track)} · ${escapeHtml(getCurrentStoryMediaLabel())} · Drag across rows, Shift-click, or Ctrl-click to select multiple cues.</div></div><button class="story-modal-close" type="button">×</button></div>
-      <div class="story-cue-picker-list" tabindex="0">
-        ${(list || []).map((cue, i) => `<div class="story-cue-picker-row" data-cue-id="${escapeStoryAttr(cue.id)}" data-index="${i}"><button class="story-cue-picker-time" type="button">${fmtTC(cue.start)} → ${fmtTC(cue.end)}</button><div class="story-cue-picker-text">${escapeHtml(cue.text || '')}</div></div>`).join('') || '<div class="story-modal-empty">No cues available.</div>'}
+    <div class="story-modal-card story-cue-finder-card">
+      <div class="story-modal-head story-cue-finder-head">
+        <div>
+          <strong>Cue Finder</strong>
+          <div class="story-modal-sub">${escapeHtml(getCurrentStoryMediaLabel())} · Search, filter, preview, then add cues into this Story Card.</div>
+        </div>
+        <button class="story-modal-close" type="button" aria-label="Close">×</button>
       </div>
-      <div class="story-modal-foot"><button class="btn btn-outline story-modal-cancel" type="button">Cancel</button><button class="btn btn-gold story-modal-add" type="button">Add Selected Cues</button></div>
+      <div class="story-cue-finder-tools">
+        <input class="story-cue-finder-search" type="search" placeholder="Search cue text, cue number, or timecode…" autocomplete="off">
+        <label class="story-cue-finder-track">Track <select class="story-cue-finder-track-select"><option value="A">Sub A</option><option value="B">Sub B</option></select></label>
+        <button class="story-cue-filter is-active" type="button" data-filter="all">All</button>
+        <button class="story-cue-filter" type="button" data-filter="near">Playhead ±30s</button>
+        <button class="story-cue-filter" type="button" data-filter="selection">Selected range</button>
+        <button class="story-cue-filter" type="button" data-filter="activeCard">Active card</button>
+        <label class="story-cue-finder-check"><input type="checkbox" class="story-cue-unused-only"> Unused only</label>
+      </div>
+      <div class="story-cue-finder-status"></div>
+      <div class="story-cue-finder-table-head" aria-hidden="true"><span></span><span>No.</span><span>Timecode</span><span>Cue text</span><span>Used</span><span></span></div>
+      <div class="story-cue-finder-viewport" tabindex="0" role="listbox" aria-label="Transcript cues">
+        <div class="story-cue-finder-spacer"><div class="story-cue-finder-rows"></div></div>
+      </div>
+      <div class="story-modal-foot story-cue-finder-foot">
+        <span class="story-cue-finder-selected-count">0 selected</span>
+        <button class="btn btn-outline story-modal-cancel" type="button">Cancel</button>
+        <button class="btn btn-gold story-modal-add" type="button">Add Selected Cues</button>
+      </div>
     </div>`;
-  modal.querySelector('.story-modal-close').onclick = hideStoryModal;
-  modal.querySelector('.story-modal-cancel').onclick = hideStoryModal;
-  const listEl = modal.querySelector('.story-cue-picker-list');
-  let dragSelecting = false;
-  let dragAnchor = -1;
-  let lastClicked = -1;
-  const rows = () => [...modal.querySelectorAll('.story-cue-picker-row')];
-  const setRangeSelected = (a, b, additive=false) => {
-    const min = Math.min(a, b), max = Math.max(a, b);
-    if (!additive) rows().forEach(r => r.classList.remove('is-selected'));
-    rows().forEach(r => {
-      const ix = Number(r.dataset.index || -1);
-      if (ix >= min && ix <= max) r.classList.add('is-selected');
+
+  const close = () => hideStoryModal();
+  modal.querySelector('.story-modal-close').onclick = close;
+  modal.querySelector('.story-modal-cancel').onclick = close;
+  const searchInput = modal.querySelector('.story-cue-finder-search');
+  const trackSelect = modal.querySelector('.story-cue-finder-track-select');
+  const unusedOnly = modal.querySelector('.story-cue-unused-only');
+  const viewport = modal.querySelector('.story-cue-finder-viewport');
+  const spacer = modal.querySelector('.story-cue-finder-spacer');
+  const rowsLayer = modal.querySelector('.story-cue-finder-rows');
+  const status = modal.querySelector('.story-cue-finder-status');
+  const selectedCount = modal.querySelector('.story-cue-finder-selected-count');
+  if (trackSelect) trackSelect.value = state.track;
+
+  let currentFiltered = [];
+  let renderToken = 0;
+  const readAll = () => (storyEnsureCueIds(state.track) || []).map((cue, index) => ({ cue, index, id:String(cue?.id || ''), no:index + 1 }));
+  const cueSearchHaystack = (item) => storyCueFinderNorm([
+    item.no,
+    item.index,
+    item.id,
+    fmtTC(item.cue?.start ?? 0),
+    fmtTC(item.cue?.end ?? 0),
+    item.cue?.text || ''
+  ].join(' '));
+  const computeFiltered = () => {
+    const q = storyCueFinderNorm(state.query);
+    const used = storyCueFinderUsedMap(state.track);
+    const range = state.filter === 'all' ? null : storyCueFinderCurrentRange(state.filter);
+    return readAll().filter(item => {
+      if (state.unusedOnly && used.has(item.id)) return false;
+      if (range && !storyCueFinderCueOverlaps(item.cue, range)) return false;
+      if (!q) return true;
+      return cueSearchHaystack(item).includes(q);
     });
   };
-  const stopDragSelection = () => { dragSelecting = false; dragAnchor = -1; listEl?.classList.remove('is-drag-selecting'); };
-  listEl?.addEventListener('pointerdown', ev => {
-    const row = ev.target.closest?.('.story-cue-picker-row');
-    if (!row) return;
-    ev.preventDefault();
-    dragSelecting = true;
-    listEl.classList.add('is-drag-selecting');
-    try{ listEl.setPointerCapture?.(ev.pointerId); }catch(_e){}
-    dragAnchor = Number(row.dataset.index || -1);
-    if (ev.shiftKey && lastClicked >= 0) setRangeSelected(lastClicked, dragAnchor, ev.ctrlKey || ev.metaKey);
-    else if (ev.ctrlKey || ev.metaKey) row.classList.toggle('is-selected');
-    else setRangeSelected(dragAnchor, dragAnchor, false);
-    lastClicked = dragAnchor;
+  const updateFilterButtons = () => {
+    modal.querySelectorAll('.story-cue-filter').forEach(btn => btn.classList.toggle('is-active', btn.dataset.filter === state.filter));
+  };
+  const updateFooter = () => {
+    selectedCount.textContent = `${state.selected.size} selected`;
+    modal.querySelector('.story-modal-add')?.toggleAttribute('disabled', state.selected.size === 0);
+  };
+  const renderRows = () => {
+    renderToken += 1;
+    const token = renderToken;
+    currentFiltered = computeFiltered();
+    const used = storyCueFinderUsedMap(state.track);
+    const activeRange = state.filter === 'all' ? null : storyCueFinderCurrentRange(state.filter);
+    const rowH = state.rowHeight;
+    const total = currentFiltered.length;
+    spacer.style.height = `${Math.max(rowH, total * rowH)}px`;
+    const scrollTop = viewport.scrollTop || 0;
+    const viewportHeight = viewport.clientHeight || 420;
+    const startIx = Math.max(0, Math.floor(scrollTop / rowH) - 8);
+    const endIx = Math.min(total, Math.ceil((scrollTop + viewportHeight) / rowH) + 8);
+    const visible = currentFiltered.slice(startIx, endIx);
+    rowsLayer.innerHTML = visible.map((item, localIx) => {
+      const filteredIx = startIx + localIx;
+      const cue = item.cue || {};
+      const selected = state.selected.has(item.id);
+      const usedRows = used.get(item.id) || [];
+      const usedLabel = usedRows.length ? `Row ${usedRows.slice(0, 3).join(', ')}${usedRows.length > 3 ? '…' : ''}` : '';
+      return `<div class="story-cue-finder-row${selected ? ' is-selected' : ''}" style="transform:translateY(${filteredIx * rowH}px)" data-filter-index="${filteredIx}" data-cue-id="${escapeStoryAttr(item.id)}" role="option" aria-selected="${selected ? 'true' : 'false'}">
+        <label class="story-cue-finder-select"><input type="checkbox" ${selected ? 'checked' : ''} aria-label="Select cue ${item.no}"></label>
+        <button class="story-cue-finder-no" type="button" title="Seek to cue ${item.no}">${item.no}</button>
+        <button class="story-cue-finder-time" type="button" title="Seek to ${fmtTC(cue.start || 0)}">${fmtTC(cue.start || 0)} → ${fmtTC(cue.end || 0)}</button>
+        <div class="story-cue-finder-text" title="Click to seek, Shift-click to range select">${storyCueFinderHighlightText(cue.text || '', state.query)}</div>
+        <div class="story-cue-finder-used">${usedLabel ? `<button type="button" class="story-cue-used-jump" title="Already used in ${escapeStoryAttr(usedLabel)}">${escapeHtml(usedLabel)}</button>` : '<span class="story-cue-unused-pill">Unused</span>'}</div>
+        <div class="story-cue-finder-row-actions"><button class="story-cue-preview-one" type="button" title="Preview this cue">▶</button><button class="story-cue-add-one" type="button" title="Add this cue">Add</button></div>
+      </div>`;
+    }).join('') || `<div class="story-cue-finder-empty" style="top:0">No cues match this search/filter.</div>`;
+    const filterLabel = activeRange?.label || (state.filter === 'all' ? 'All cues' : 'No matching range available');
+    status.textContent = `${total} cue(s) · Track ${state.track} · ${filterLabel}${state.unusedOnly ? ' · Unused only' : ''}`;
+    if (token === renderToken) updateFooter();
+  };
+  const scheduleRender = () => requestAnimationFrame(renderRows);
+  const getItemFromEvent = (ev) => {
+    const row = ev.target?.closest?.('.story-cue-finder-row');
+    if (!row) return { row:null, item:null, ix:-1 };
+    const ix = Number(row.dataset.filterIndex || -1);
+    return { row, item:currentFiltered[ix] || null, ix };
+  };
+  const setSelectedRange = (fromIx, toIx, additive=false) => {
+    if (!additive) state.selected.clear();
+    const a = Math.min(fromIx, toIx), b = Math.max(fromIx, toIx);
+    for (let i = a; i <= b; i++){
+      const id = currentFiltered[i]?.id;
+      if (id) state.selected.add(id);
+    }
+    scheduleRender();
+  };
+  const toggleItem = (ix, additive=true) => {
+    const id = currentFiltered[ix]?.id;
+    if (!id) return;
+    if (!additive) state.selected.clear();
+    if (state.selected.has(id)) state.selected.delete(id); else state.selected.add(id);
+    state.anchor = ix;
+    scheduleRender();
+  };
+  const selectByClick = (ev, ix) => {
+    if (ix < 0) return;
+    if (ev.shiftKey && state.anchor >= 0) setSelectedRange(state.anchor, ix, ev.ctrlKey || ev.metaKey);
+    else toggleItem(ix, true);
+  };
+
+  viewport?.addEventListener('scroll', () => { state.lastScrollTop = viewport.scrollTop || 0; renderRows(); }, { passive:true });
+  searchInput?.addEventListener('input', () => { state.query = searchInput.value || ''; viewport.scrollTop = 0; scheduleRender(); });
+  trackSelect?.addEventListener('change', () => { state.track = normalizeStoryTrack(trackSelect.value); state.selected.clear(); state.anchor = -1; viewport.scrollTop = 0; updateFilterButtons(); scheduleRender(); });
+  unusedOnly?.addEventListener('change', () => { state.unusedOnly = !!unusedOnly.checked; viewport.scrollTop = 0; scheduleRender(); });
+  modal.querySelectorAll('.story-cue-filter').forEach(btn => btn.addEventListener('click', () => { state.filter = btn.dataset.filter || 'all'; viewport.scrollTop = 0; updateFilterButtons(); scheduleRender(); }));
+  rowsLayer?.addEventListener('click', ev => {
+    const { row, item, ix } = getItemFromEvent(ev);
+    if (!row || !item) return;
+    const cue = item.cue || {};
+    if (ev.target?.closest?.('.story-cue-add-one')){
+      addCuePayloadToStory({ cueIds:[item.id], track:state.track, start:cue.start ?? null, end:cue.end ?? null, source:getCurrentStoryMediaLabel() }, rowId);
+      hideStoryModal();
+      return;
+    }
+    if (ev.target?.closest?.('.story-cue-preview-one')){
+      if (typeof previewMediaRange === 'function') previewMediaRange(Number(cue.start || 0), Number(cue.end || cue.start || 0), { label:`Cue ${item.no}` });
+      else seekMediaTo(Math.max(0, Number(cue.start || 0)) + 0.001, { play:true });
+      return;
+    }
+    if (ev.target?.closest?.('.story-cue-used-jump')){
+      const rows = storyCueFinderUsedMap(state.track).get(item.id) || [];
+      if (rows.length){
+        const rowEl = storyModeEl?.querySelector?.(`.story-row:nth-child(${rows[0]})`);
+        rowEl?.scrollIntoView?.({ behavior:'smooth', block:'center' });
+      }
+      return;
+    }
+    if (ev.target?.closest?.('.story-cue-finder-time,.story-cue-finder-no,.story-cue-finder-text')){
+      seekMediaTo(Math.max(0, Number(cue.start || 0)) + 0.001, { play:false });
+    }
+    selectByClick(ev, ix);
   });
-  listEl?.addEventListener('pointermove', ev => {
-    if (!dragSelecting || !(ev.buttons & 1)) return;
-    const el = document.elementFromPoint(ev.clientX, ev.clientY);
-    const row = el?.closest?.('.story-cue-picker-row');
-    if (!row || !listEl.contains(row)) return;
-    const ix = Number(row.dataset.index || -1);
-    if (ix >= 0 && dragAnchor >= 0) setRangeSelected(dragAnchor, ix, false);
+  rowsLayer?.addEventListener('change', ev => {
+    if (!ev.target?.matches?.('.story-cue-finder-select input')) return;
+    const { ix } = getItemFromEvent(ev);
+    selectByClick(ev, ix);
   });
-  listEl?.addEventListener('pointerup', stopDragSelection);
-  listEl?.addEventListener('pointercancel', stopDragSelection);
-  listEl?.addEventListener('pointerleave', ev => { if (!(ev.buttons & 1)) stopDragSelection(); });
-  window.addEventListener('pointerup', stopDragSelection);
-  listEl?.addEventListener('click', ev => {
-    const timeBtn = ev.target.closest?.('.story-cue-picker-time');
-    if (timeBtn){
-      const row = timeBtn.closest('.story-cue-picker-row');
-      const cue = list[Number(row?.dataset.index || -1)];
-      if (cue) seekMediaTo(Math.max(0, cue.start) + 0.001, { play:false });
+  viewport?.addEventListener('keydown', ev => {
+    if (ev.key === 'Enter'){
+      const ids = currentFiltered.map(item => item.id).filter(id => state.selected.has(id));
+      if (ids.length){
+        addCuePayloadToStory({ cueIds:ids, track:state.track, source:getCurrentStoryMediaLabel() }, rowId);
+        hideStoryModal();
+      }
     }
   });
   modal.querySelector('.story-modal-add').onclick = () => {
-    let cueIds = rows().filter(r => r.classList.contains('is-selected')).map(r => r.dataset.cueId).filter(Boolean);
-    if (!cueIds.length){
-      // Fallback: if the browser text selection crosses cue rows, infer cue rows from the selected range.
-      const sel = window.getSelection();
-      if (sel && sel.rangeCount){
-        const a = sel.anchorNode, f = sel.focusNode;
-        const ar = a?.nodeType === 3 ? a.parentElement?.closest('.story-cue-picker-row') : a?.closest?.('.story-cue-picker-row');
-        const fr = f?.nodeType === 3 ? f.parentElement?.closest('.story-cue-picker-row') : f?.closest?.('.story-cue-picker-row');
-        if (ar && fr){
-          const ai = Number(ar.dataset.index || -1), fi = Number(fr.dataset.index || -1);
-          const min = Math.min(ai, fi), max = Math.max(ai, fi);
-          cueIds = rows().filter(r => Number(r.dataset.index || -1) >= min && Number(r.dataset.index || -1) <= max).map(r => r.dataset.cueId).filter(Boolean);
-        }
-      }
-    }
-    if (cueIds.length) addCuePayloadToStory({ cueIds, track, source:getCurrentStoryMediaLabel() }, rowId);
+    const ordered = currentFiltered.map(item => item.id).filter(id => state.selected.has(id));
+    const extra = [...state.selected].filter(id => !ordered.includes(id));
+    const cueIds = ordered.concat(extra);
+    if (!cueIds.length){ alert('Select at least one cue first.'); return; }
+    const selectedCues = cueIds.map(id => storyCueById(id, state.track)).filter(Boolean);
+    const start = selectedCues.length ? Math.min(...selectedCues.map(c => Number(c.start || 0))) : null;
+    const end = selectedCues.length ? Math.max(...selectedCues.map(c => Number(c.end || 0))) : null;
+    addCuePayloadToStory({ cueIds, track:state.track, start, end, source:getCurrentStoryMediaLabel() }, rowId);
     hideStoryModal();
   };
+  updateFilterButtons();
+  renderRows();
+  setTimeout(() => searchInput?.focus?.({ preventScroll:true }), 0);
 }
+
 function showStoryClipModal(rowId){
   const modal = ensureStoryModal();
   normalizeTimelineClips?.();
