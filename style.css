@@ -4914,3 +4914,85 @@ body.theme-light .story-cue-add-one{background:#fff;border-color:var(--line);}
   .story-cue-finder-used{display:none;}
   .story-cue-finder-row-actions{grid-column:4;grid-row:1 / span 2;flex-direction:column;align-items:stretch;}
 }
+
+/* Story Cue Finder: manual Select Range popover */
+.story-cue-range-popover{
+  position:fixed;
+  z-index:10020;
+  width:min(320px, calc(100vw - 24px));
+  padding:12px;
+  border:1px solid rgba(215,180,106,.34);
+  border-radius:14px;
+  background:#151515;
+  color:var(--ink);
+  box-shadow:0 18px 52px rgba(0,0,0,.38);
+}
+.story-cue-range-title{
+  font-weight:700;
+  font-size:13px;
+  margin-bottom:10px;
+  color:var(--gold-2);
+}
+.story-cue-range-popover label{
+  display:grid;
+  grid-template-columns:44px 1fr;
+  gap:8px;
+  align-items:center;
+  color:var(--ink-dim);
+  font-size:12px;
+  margin:7px 0;
+}
+.story-cue-range-popover input{
+  width:100%;
+  border:1px solid rgba(255,255,255,.14);
+  border-radius:10px;
+  background:rgba(0,0,0,.22);
+  color:var(--ink);
+  padding:8px 10px;
+  font-variant-numeric:tabular-nums;
+  outline:none;
+}
+.story-cue-range-popover input:focus{
+  border-color:rgba(215,180,106,.75);
+  box-shadow:0 0 0 3px rgba(215,180,106,.14);
+}
+.story-cue-range-actions{
+  display:flex;
+  justify-content:flex-end;
+  gap:8px;
+  margin-top:12px;
+}
+.story-cue-range-actions button{
+  border:1px solid rgba(255,255,255,.14);
+  border-radius:10px;
+  background:rgba(255,255,255,.05);
+  color:var(--ink);
+  padding:7px 9px;
+  font-size:12px;
+  cursor:pointer;
+}
+.story-cue-range-actions .story-cue-range-apply{
+  border-color:rgba(215,180,106,.48);
+  background:rgba(215,180,106,.16);
+  color:var(--gold-2);
+}
+body.theme-light .story-cue-range-popover{
+  background:#fffdf8;
+  border-color:#dfd6c5;
+  box-shadow:0 18px 52px rgba(64,42,12,.18);
+}
+body.theme-light .story-cue-range-popover input{
+  background:#fff;
+  color:var(--ink);
+  border-color:var(--line);
+}
+body.theme-light .story-cue-range-actions button{
+  background:#fff;
+  color:var(--ink);
+  border-color:var(--line);
+}
+body.theme-light .story-cue-range-actions .story-cue-range-apply{
+  background:#f6f1e6;
+  color:#7b5615;
+  border-color:#b8892f;
+}
