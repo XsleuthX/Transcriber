@@ -4381,6 +4381,72 @@ function addCuePayloadToStory(payload, rowId=storyDefaultRowId()){
   const card = createCueStoryCard(payload);
   addStoryCardToRow(rowId, card);
 }
+function storyCueSelectionGroups(cueIds, track='A'){
+  const normalizedTrack = normalizeStoryTrack(track || 'A');
+  const cues = storyEnsureCueIds(normalizedTrack) || [];
+  const indexById = new Map();
+  cues.forEach((cue, index) => {
+    const id = String(cue?.id || '');
+    if (id && !indexById.has(id)) indexById.set(id, index);
+  });
+  const seen = new Set();
+  const items = [];
+  (cueIds || []).forEach(rawId => {
+    const id = String(rawId || '');
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    const index = indexById.has(id) ? indexById.get(id) : -1;
+    if (index < 0) return;
+    items.push({ id, index, cue:cues[index] });
+  });
+  items.sort((a, b) => a.index - b.index);
+  const groups = [];
+  let cur = [];
+  const flush = () => { if (cur.length){ groups.push(cur); cur = []; } };
+  items.forEach(item => {
+    if (!cur.length){ cur.push(item); return; }
+    const prev = cur[cur.length - 1];
+    // Consecutive cue index means the user selected a continuous transcript
+    // span. A missing cue index means the selection is staggered and should
+    // become a separate Story Card.
+    if (item.index === prev.index + 1) cur.push(item);
+    else { flush(); cur.push(item); }
+  });
+  flush();
+  return groups.map(group => {
+    const starts = group.map(x => Number(x.cue?.start ?? 0)).filter(Number.isFinite);
+    const ends = group.map(x => Number(x.cue?.end ?? x.cue?.start ?? 0)).filter(Number.isFinite);
+    return {
+      track: normalizedTrack,
+      cueIds: group.map(x => x.id),
+      start: starts.length ? Math.min(...starts) : null,
+      end: ends.length ? Math.max(...ends) : null,
+      firstIndex: group[0]?.index ?? -1,
+      lastIndex: group[group.length - 1]?.index ?? -1
+    };
+  }).filter(g => g.cueIds.length);
+}
+function addCueSelectionToStory(payload, rowId=storyDefaultRowId()){
+  if (!payload) return;
+  const cueIds = storyUniqueRefs(payload.cueIds || payload.cueRefs || []);
+  if (!cueIds.length) return;
+  const track = normalizeStoryTrack(payload.track || 'A');
+  const groups = storyCueSelectionGroups(cueIds, track);
+  if (!groups.length){
+    return addCuePayloadToStory({ ...payload, cueIds, track }, rowId);
+  }
+  const cards = groups.map(group => createCueStoryCard({
+    ...payload,
+    track,
+    cueIds: group.cueIds,
+    cueRefs: group.cueIds,
+    start: group.start,
+    end: group.end,
+    source: payload.source || getCurrentStoryMediaLabel()
+  }));
+  addStoryCardsToRow(rowId, cards);
+  return cards;
+}
 function selectedCuePayloadFromSrtDom(){
   const sel = window.getSelection();
   return buildCueClipboardPayloadFromDomSelection(sel);
@@ -5829,6 +5895,7 @@ function showStoryCueModal(rowId){
     unusedOnly: false,
     selected: new Set(),
     anchor: -1,
+    customRange: null,
     lastScrollTop: 0,
     rowHeight: 72
   };
@@ -5846,9 +5913,19 @@ function showStoryCueModal(rowId){
         <label class="story-cue-finder-track">Track <select class="story-cue-finder-track-select"><option value="A">Sub A</option><option value="B">Sub B</option></select></label>
         <button class="story-cue-filter is-active" type="button" data-filter="all">All</button>
         <button class="story-cue-filter" type="button" data-filter="near">Playhead ±30s</button>
-        <button class="story-cue-filter" type="button" data-filter="selection">Selected range</button>
+        <button class="story-cue-filter" type="button" data-filter="range">Select Range</button>
         <button class="story-cue-filter" type="button" data-filter="activeCard">Active card</button>
         <label class="story-cue-finder-check"><input type="checkbox" class="story-cue-unused-only"> Unused only</label>
+      </div>
+      <div class="story-cue-range-popover" hidden>
+        <div class="story-cue-range-title">Filter cues by timecode range</div>
+        <label>In <input class="story-cue-range-in" type="text" inputmode="numeric" placeholder="00:00:00:00"></label>
+        <label>Out <input class="story-cue-range-out" type="text" inputmode="numeric" placeholder="00:00:10:00"></label>
+        <div class="story-cue-range-actions">
+          <button class="story-cue-range-clear" type="button">Clear</button>
+          <button class="story-cue-range-cancel" type="button">Cancel</button>
+          <button class="story-cue-range-apply" type="button">Apply</button>
+        </div>
       </div>
       <div class="story-cue-finder-status"></div>
       <div class="story-cue-finder-table-head" aria-hidden="true"><span></span><span>No.</span><span>Timecode</span><span>Cue text</span><span>Used</span><span></span></div>
@@ -5873,6 +5950,9 @@ function showStoryCueModal(rowId){
   const rowsLayer = modal.querySelector('.story-cue-finder-rows');
   const status = modal.querySelector('.story-cue-finder-status');
   const selectedCount = modal.querySelector('.story-cue-finder-selected-count');
+  const rangePopover = modal.querySelector('.story-cue-range-popover');
+  const rangeIn = modal.querySelector('.story-cue-range-in');
+  const rangeOut = modal.querySelector('.story-cue-range-out');
   if (trackSelect) trackSelect.value = state.track;
 
   let currentFiltered = [];
@@ -5889,7 +5969,7 @@ function showStoryCueModal(rowId){
   const computeFiltered = () => {
     const q = storyCueFinderNorm(state.query);
     const used = storyCueFinderUsedMap(state.track);
-    const range = state.filter === 'all' ? null : storyCueFinderCurrentRange(state.filter);
+    const range = state.filter === 'range' ? state.customRange : (state.filter === 'all' ? null : storyCueFinderCurrentRange(state.filter));
     return readAll().filter(item => {
       if (state.unusedOnly && used.has(item.id)) return false;
       if (range && !storyCueFinderCueOverlaps(item.cue, range)) return false;
@@ -5909,7 +5989,7 @@ function showStoryCueModal(rowId){
     const token = renderToken;
     currentFiltered = computeFiltered();
     const used = storyCueFinderUsedMap(state.track);
-    const activeRange = state.filter === 'all' ? null : storyCueFinderCurrentRange(state.filter);
+    const activeRange = state.filter === 'range' ? state.customRange : (state.filter === 'all' ? null : storyCueFinderCurrentRange(state.filter));
     const rowH = state.rowHeight;
     const total = currentFiltered.length;
     spacer.style.height = `${Math.max(rowH, total * rowH)}px`;
@@ -5966,12 +6046,66 @@ function showStoryCueModal(rowId){
     if (ev.shiftKey && state.anchor >= 0) setSelectedRange(state.anchor, ix, ev.ctrlKey || ev.metaKey);
     else toggleItem(ix, true);
   };
+  const defaultRangeForPicker = () => {
+    const timelineRange = storyCueFinderCurrentRange('selection');
+    if (timelineRange) return timelineRange;
+    const cardRange = storyCueFinderCurrentRange('activeCard');
+    if (cardRange) return cardRange;
+    return storyCueFinderCurrentRange('near');
+  };
+  const hideRangePopover = () => { if (rangePopover) rangePopover.hidden = true; };
+  const showRangePopover = (anchorBtn=null) => {
+    if (!rangePopover) return;
+    const r = state.customRange || defaultRangeForPicker() || { start:0, end:10 };
+    if (rangeIn) rangeIn.value = fmtTC(r.start || 0, getFPS());
+    if (rangeOut) rangeOut.value = fmtTC(r.end || Math.max(10, Number(r.start || 0) + 10), getFPS());
+    rangePopover.hidden = false;
+    const ar = anchorBtn?.getBoundingClientRect?.();
+    if (ar){
+      rangePopover.style.left = Math.min(window.innerWidth - 330, Math.max(10, ar.left)) + 'px';
+      rangePopover.style.top = Math.min(window.innerHeight - 220, Math.max(10, ar.bottom + 8)) + 'px';
+    }
+    setTimeout(() => { try{ rangeIn?.focus({ preventScroll:true }); rangeIn?.select(); }catch(_e){} }, 0);
+  };
+  rangePopover?.querySelector?.('.story-cue-range-cancel')?.addEventListener('click', hideRangePopover);
+  rangePopover?.querySelector?.('.story-cue-range-clear')?.addEventListener('click', () => {
+    state.customRange = null;
+    state.filter = 'all';
+    hideRangePopover();
+    viewport.scrollTop = 0;
+    updateFilterButtons();
+    scheduleRender();
+  });
+  rangePopover?.querySelector?.('.story-cue-range-apply')?.addEventListener('click', () => {
+    const f = getFPS();
+    const s = parseDisplayedTcToSeconds(rangeIn?.value || '', f);
+    const e = parseDisplayedTcToSeconds(rangeOut?.value || '', f);
+    if (s == null || e == null){ alert('Invalid timecode. Use HH:MM:SS:FF.'); return; }
+    if (e <= s){ alert('Out timecode must be after In timecode.'); return; }
+    state.customRange = { start:Math.max(0, s), end:Math.max(0, e), label:`Select Range (${fmtTC(Math.max(0, s))} → ${fmtTC(Math.max(0, e))})` };
+    state.filter = 'range';
+    hideRangePopover();
+    viewport.scrollTop = 0;
+    updateFilterButtons();
+    scheduleRender();
+  });
 
   viewport?.addEventListener('scroll', () => { state.lastScrollTop = viewport.scrollTop || 0; renderRows(); }, { passive:true });
   searchInput?.addEventListener('input', () => { state.query = searchInput.value || ''; viewport.scrollTop = 0; scheduleRender(); });
   trackSelect?.addEventListener('change', () => { state.track = normalizeStoryTrack(trackSelect.value); state.selected.clear(); state.anchor = -1; viewport.scrollTop = 0; updateFilterButtons(); scheduleRender(); });
   unusedOnly?.addEventListener('change', () => { state.unusedOnly = !!unusedOnly.checked; viewport.scrollTop = 0; scheduleRender(); });
-  modal.querySelectorAll('.story-cue-filter').forEach(btn => btn.addEventListener('click', () => { state.filter = btn.dataset.filter || 'all'; viewport.scrollTop = 0; updateFilterButtons(); scheduleRender(); }));
+  modal.querySelectorAll('.story-cue-filter').forEach(btn => btn.addEventListener('click', () => {
+    const next = btn.dataset.filter || 'all';
+    if (next === 'range'){
+      showRangePopover(btn);
+      return;
+    }
+    state.filter = next;
+    hideRangePopover();
+    viewport.scrollTop = 0;
+    updateFilterButtons();
+    scheduleRender();
+  }));
   rowsLayer?.addEventListener('click', ev => {
     const { row, item, ix } = getItemFromEvent(ev);
     if (!row || !item) return;
@@ -6008,7 +6142,7 @@ function showStoryCueModal(rowId){
     if (ev.key === 'Enter'){
       const ids = currentFiltered.map(item => item.id).filter(id => state.selected.has(id));
       if (ids.length){
-        addCuePayloadToStory({ cueIds:ids, track:state.track, source:getCurrentStoryMediaLabel() }, rowId);
+        addCueSelectionToStory({ cueIds:ids, track:state.track, source:getCurrentStoryMediaLabel() }, rowId);
         hideStoryModal();
       }
     }
@@ -6021,7 +6155,7 @@ function showStoryCueModal(rowId){
     const selectedCues = cueIds.map(id => storyCueById(id, state.track)).filter(Boolean);
     const start = selectedCues.length ? Math.min(...selectedCues.map(c => Number(c.start || 0))) : null;
     const end = selectedCues.length ? Math.max(...selectedCues.map(c => Number(c.end || 0))) : null;
-    addCuePayloadToStory({ cueIds, track:state.track, start, end, source:getCurrentStoryMediaLabel() }, rowId);
+    addCueSelectionToStory({ cueIds, track:state.track, start, end, source:getCurrentStoryMediaLabel() }, rowId);
     hideStoryModal();
   };
   updateFilterButtons();
