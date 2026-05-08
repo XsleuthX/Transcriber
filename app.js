@@ -383,6 +383,7 @@ function syncDualScroll(){
 function renderBySubsMode(){
   if (isTxtMode && typeof renderTxtBySubsMode === 'function'){
     renderTxtBySubsMode();
+    try{ storyRetryPendingStoryRelinksAfterCueLoad?.({ render:isStoryMode }); }catch(_e){}
     return;
   }
   // Always keep transcriptEl bound to Sub A (entries) when dual.
@@ -397,6 +398,7 @@ function renderBySubsMode(){
     transcriptEl.dataset.panel = 'A';
     const bEl = document.getElementById('transcriptB');
     if (bEl) bEl.dataset.panel = 'B';    applyAllLocks();
+    try{ storyRetryPendingStoryRelinksAfterCueLoad?.({ render:isStoryMode }); }catch(_e){}
     return;
   }
 
@@ -424,6 +426,7 @@ function renderBySubsMode(){
   const bEl2 = document.getElementById('transcriptB');
   if (bEl2) bEl2.dataset.panel = 'B';
   applyAllLocks();
+  try{ storyRetryPendingStoryRelinksAfterCueLoad?.({ render:isStoryMode }); }catch(_e){}
 }
 
 // Insert virtual placeholder spacers in Dual Sub mode so rows align by matching timecodes.
@@ -1343,6 +1346,7 @@ async function importToAFromFile(f){
 
   window.currentBaseName = (f.name || 'captions').replace(/\.(srt|vtt)$/i,'');
   renderBySubsMode();
+  try{ storyRetryPendingStoryRelinksAfterCueLoad?.({ render:isStoryMode, commit:true }); }catch(_e){}
 }
 
 async function importToBFromFile(f){
@@ -1371,6 +1375,7 @@ async function importToBFromFile(f){
 
   initialEntriesB = entriesB.map((e) => ({ start:e.start, end:e.end, text:e.text }));
   renderBySubsMode();
+  try{ storyRetryPendingStoryRelinksAfterCueLoad?.({ render:isStoryMode, commit:true }); }catch(_e){}
 }
 
 // Wire inputs
@@ -3646,6 +3651,205 @@ function storyClipCueRefs(clip, preferredTrack=null){
   const track = normalizeStoryTrack(preferredTrack || clip.track || clip.subtitleTrack || 'A');
   return { track, cueRefs:[], altCueRefs:{ A:[], B:[] } };
 }
+function storyHasAnyTranscriptCues(){
+  try{ ensureCueIds(entries); ensureCueIds(entriesB); }catch(_e){}
+  return !!((Array.isArray(entries) && entries.length) || (Array.isArray(entriesB) && entriesB.length));
+}
+function storyTrackOrder(preferred='A'){
+  const first = normalizeStoryTrack(preferred || storyActiveSubTrack || subsMode || 'A');
+  return first === 'B' ? ['B','A'] : ['A','B'];
+}
+function storyValidCueRefsForTrack(refs=[], track='A'){
+  const list = storyEnsureCueIds(track) || [];
+  const ids = new Set(list.map(e => String(e?.id || '')).filter(Boolean));
+  return storyUniqueRefs((refs || []).map(x => String(x || '')).filter(id => ids.has(id)));
+}
+function storyImportedCardSnapshotText(card){
+  if (!card) return '';
+  const parts = [];
+  if (String(card.body || '').trim()) parts.push(String(card.body || ''));
+  if (String(card.bodyHtml || '').trim()) parts.push(storyPlainTextFromRichHtml(card.bodyHtml || ''));
+  if (!parts.length && String(card.text || '').trim()) parts.push(String(card.text || ''));
+  return parts.join('\n').replace(/\u00a0/g, ' ').trim();
+}
+function storyCardHasImportLiveHint(card){
+  if (!card) return false;
+  if (card.kind === 'cue' || card.kind === 'clip' || card.originalKind === 'cue' || card.originalKind === 'clip') return true;
+  if (card.clipId) return true;
+  const hasRefs = (Array.isArray(card.cueRefs) && card.cueRefs.length)
+    || (Array.isArray(card.sourceCueRefs) && card.sourceCueRefs.length)
+    || (card.altCueRefs && ((Array.isArray(card.altCueRefs.A) && card.altCueRefs.A.length) || (Array.isArray(card.altCueRefs.B) && card.altCueRefs.B.length)));
+  return !!hasRefs;
+}
+function storyImportedDirectRefCandidates(card, track='A'){
+  const refs = [];
+  const add = arr => { if (Array.isArray(arr)) arr.forEach(x => { const id = String(x || ''); if (id && !refs.includes(id)) refs.push(id); }); };
+  if (card?.altCueRefs && typeof card.altCueRefs === 'object') add(card.altCueRefs[normalizeStoryTrack(track)]);
+  add(card?.cueRefs);
+  add(card?.sourceCueRefs);
+  add(card?.cueIds);
+  return refs;
+}
+function storyTryDirectRelinkForCard(card){
+  for (const track of storyTrackOrder(card?.track || storyActiveSubTrack || subsMode || 'A')){
+    const candidates = storyImportedDirectRefCandidates(card, track);
+    if (!candidates.length) continue;
+    const valid = storyValidCueRefsForTrack(candidates, track);
+    if (valid.length){
+      const altCueRefs = { A:[], B:[] };
+      altCueRefs[track] = [...valid];
+      const other = track === 'A' ? 'B' : 'A';
+      const otherValid = storyValidCueRefsForTrack(storyImportedDirectRefCandidates(card, other), other);
+      if (otherValid.length) altCueRefs[other] = otherValid;
+      return { method:valid.length === candidates.length ? 'direct' : 'partial-direct', track, cueRefs:valid, altCueRefs };
+    }
+  }
+  return null;
+}
+function storyTryRangeRelinkForCard(card){
+  const start = Number(card?.start);
+  const end = Number(card?.end);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+  const bundle = storyCueRefBundleForRange(start, end, card?.track || storyActiveSubTrack || subsMode || 'A');
+  if (!bundle.cueRefs.length && !bundle.altCueRefs.A.length && !bundle.altCueRefs.B.length) return null;
+  return { method:'timecode', track:bundle.track, cueRefs:storyUniqueRefs(bundle.cueRefs || []), altCueRefs:{ A:storyUniqueRefs(bundle.altCueRefs.A || []), B:storyUniqueRefs(bundle.altCueRefs.B || []) } };
+}
+function storyTryTextRelinkForCard(card){
+  const raw = storyImportedCardSnapshotText(card);
+  const body = storyNormalizeTextForMatch(raw);
+  if (body.length < 8) return null;
+  const start = Number(card?.start);
+  const end = Number(card?.end);
+  const hasRange = Number.isFinite(start) && Number.isFinite(end) && end > start;
+  let best = null;
+  for (const track of storyTrackOrder(card?.track || storyActiveSubTrack || subsMode || 'A')){
+    const list = storyEnsureCueIds(track) || [];
+    const refs = [];
+    let matchedChars = 0;
+    list.forEach(cue => {
+      const cueText = storyNormalizeTextForMatch(cue?.text || '');
+      if (cueText.length < 2) return;
+      const exact = body.includes(cueText);
+      const reverse = body.length >= 12 && cueText.includes(body);
+      if (!exact && !reverse) return;
+      if (hasRange){
+        const overlap = storyCueOverlapScore(cue, start, end);
+        const dur = Math.max(0.001, Number(cue.end || 0) - Number(cue.start || 0));
+        // Text matching is allowed outside the saved range, but cues very far
+        // from the imported range score lower than cues that also overlap it.
+        if (overlap <= 0 && Math.abs(Number(cue.start || 0) - start) > 3 && Math.abs(Number(cue.end || 0) - end) > 3) return;
+        matchedChars += cueText.length * (overlap > 0 ? 1.25 : 0.65);
+      } else {
+        matchedChars += cueText.length;
+      }
+      refs.push(cue.id);
+    });
+    const unique = storyUniqueRefs(refs);
+    if (!unique.length) continue;
+    const coverage = matchedChars / Math.max(1, body.length);
+    const ok = unique.length >= 2 || coverage >= 0.28 || (unique.length === 1 && body.length <= 160);
+    if (!ok) continue;
+    const score = unique.length * 10 + coverage * 20 + (track === normalizeStoryTrack(card?.track || 'A') ? 1 : 0);
+    if (!best || score > best.score) best = { method:'text', track, cueRefs:unique, altCueRefs:{ A:track === 'A' ? unique : [], B:track === 'B' ? unique : [] }, score };
+  }
+  return best ? { method:best.method, track:best.track, cueRefs:best.cueRefs, altCueRefs:best.altCueRefs } : null;
+}
+function storyApplyRelinkResultToCard(card, result, opts={}){
+  if (!card || !result || !Array.isArray(result.cueRefs) || !result.cueRefs.length) return false;
+  const originalKind = card.originalKind || card.kind || '';
+  const shouldStayClip = originalKind === 'clip' || card.kind === 'clip' || !!card.clipId;
+  const snapshotText = storyImportedCardSnapshotText(card);
+  const snapshotHtml = String(card.bodyHtml || '').trim();
+  card.originalKind = originalKind || (shouldStayClip ? 'clip' : 'cue');
+  card.kind = shouldStayClip ? 'clip' : 'cue';
+  card.track = normalizeStoryTrack(result.track || card.track || 'A');
+  card.cueRefs = storyUniqueRefs(result.cueRefs || []);
+  card.sourceCueRefs = [...card.cueRefs];
+  const alt = result.altCueRefs || {};
+  card.altCueRefs = {
+    A:storyUniqueRefs(alt.A || (card.track === 'A' ? card.cueRefs : [])),
+    B:storyUniqueRefs(alt.B || (card.track === 'B' ? card.cueRefs : []))
+  };
+  if (!card.altCueRefs[card.track]?.length) card.altCueRefs[card.track] = [...card.cueRefs];
+  const r = storyCueRange(card.cueRefs, card.track);
+  if (r){ card.start = Number(r.start); card.end = Number(r.end); }
+  if (snapshotText || snapshotHtml){
+    card.body = snapshotText;
+    card.bodyHtml = storySanitizeRichHtml(snapshotHtml || storyPlainTextToRichHtml(snapshotText));
+    // Preserve the imported document text/formatting while still making the card
+    // live. Reconcile/delete/split logic uses the restored cue refs underneath.
+    card.bodyManual = opts.preserveSnapshotBody !== false;
+  } else {
+    card.body = '';
+    card.bodyHtml = '';
+    card.bodyManual = false;
+  }
+  card.relinkPending = false;
+  card.relinkStatus = result.method || 'linked';
+  return true;
+}
+function storyMarkCardAsGenericAfterRelink(card){
+  if (!card) return;
+  if (card.kind === 'caption') return;
+  const snapshotText = storyImportedCardSnapshotText(card);
+  const snapshotHtml = String(card.bodyHtml || '').trim();
+  card.originalKind = card.originalKind || card.kind || 'generic';
+  card.kind = 'generic';
+  card.cueRefs = [];
+  card.sourceCueRefs = [];
+  card.altCueRefs = { A:[], B:[] };
+  if (snapshotText || snapshotHtml){
+    card.body = snapshotText;
+    card.bodyHtml = storySanitizeRichHtml(snapshotHtml || storyPlainTextToRichHtml(snapshotText));
+    card.bodyManual = true;
+  }
+  card.relinkPending = false;
+  card.relinkStatus = 'generic';
+}
+function storyRelinkImportedStoryCard(card, opts={}){
+  if (!card || card.kind === 'caption') return { skipped:true };
+  if (!storyHasAnyTranscriptCues()){
+    card.relinkPending = true;
+    card.relinkStatus = 'pending-transcript';
+    return { pending:true };
+  }
+  const liveHint = storyCardHasImportLiveHint(card);
+  const direct = storyTryDirectRelinkForCard(card);
+  const text = storyTryTextRelinkForCard(card);
+  const range = storyTryRangeRelinkForCard(card);
+  // For true cue/clip imports, the saved In/Out range is a reliable fallback.
+  // For generic document rows, require direct refs or text evidence so a manual
+  // timecoded note does not accidentally turn into a live transcript card.
+  const result = direct || text || (liveHint ? range : null);
+  if (result && result.cueRefs?.length){
+    storyApplyRelinkResultToCard(card, result, { preserveSnapshotBody: opts.preserveSnapshotBody !== false });
+    return { linked:true, method:result.method };
+  }
+  storyMarkCardAsGenericAfterRelink(card);
+  return { generic:true };
+}
+function storyRelinkImportedStoryRows(rows=storyRows, opts={}){
+  const stats = { linked:0, generic:0, pending:0, skipped:0 };
+  (rows || []).forEach(row => (row.cards || []).forEach(card => {
+    if (!opts.force && !card?.relinkPending) return;
+    const res = storyRelinkImportedStoryCard(card, opts);
+    if (res.linked) stats.linked += 1;
+    else if (res.generic) stats.generic += 1;
+    else if (res.pending) stats.pending += 1;
+    else stats.skipped += 1;
+  }));
+  return stats;
+}
+function storyRetryPendingStoryRelinksAfterCueLoad(opts={}){
+  if (typeof storyRows === 'undefined' || !Array.isArray(storyRows) || !storyRows.length) return null;
+  const pending = storyRows.some(row => (row.cards || []).some(card => card?.relinkPending));
+  if (!pending || !storyHasAnyTranscriptCues()) return null;
+  const stats = storyRelinkImportedStoryRows(storyRows, { force:false, preserveSnapshotBody:true });
+  if (opts.render && isStoryMode) renderStoryAssembly();
+  if (opts.commit && (stats.linked || stats.generic)) storyCommitSharedState?.(true);
+  return stats;
+}
+
 function escapeStoryAttr(v){ return escapeHtml(String(v ?? '')).replace(/"/g, '&quot;'); }
 function storyNormalizeTextStyle(style={}){
   const src = (style && typeof style === 'object') ? style : {};
@@ -3929,7 +4133,7 @@ function normalizeImportedStoryCard(c={}, opts={}){
   if (!body && rawBodyHtml) body = storyPlainTextFromRichHtml(rawBodyHtml);
   const hasSnapshotBody = !!String(rawBodyHtml || body || '').trim();
   return {
-    id:String(c?.id || makeStoryCardId()), kind:String(c?.kind || 'generic'), title:String(c?.title || ''),
+    id:String(c?.id || makeStoryCardId()), kind:String(c?.kind || 'generic'), originalKind:String(c?.originalKind || c?.kind || ''), title:String(c?.title || ''),
     labelGroup:String(c?.labelGroup || 'shot'), label:String(c?.label || ''), source:String(c?.source || ''),
     start:start == null ? null : Number(start), end:end == null ? null : Number(end),
     cueRefs, sourceCueRefs, altCueRefs, track, clipId:String(c?.clipId || ''),
@@ -3938,6 +4142,7 @@ function normalizeImportedStoryCard(c={}, opts={}){
     // not been loaded yet, Story Cards still display their exported cue text.
     bodyManual: (opts?.forceSnapshotBody && hasSnapshotBody) ? true : !!c?.bodyManual,
     notes:String(c?.notes || ''), notesOpen:!!c?.notesOpen, editMode:!!c?.editMode,
+    relinkPending:!!opts?.pendingRelink || !!c?.relinkPending, relinkStatus:String(c?.relinkStatus || (opts?.pendingRelink ? 'pending-import' : '')),
     bodyWidth:String(c?.bodyWidth || ''), bodyHeight:String(c?.bodyHeight || ''),
     textStyle:storyNormalizeTextStyle(c?.textStyle || {})
   };
@@ -3991,19 +4196,23 @@ async function importStoryJsonFile(){
   if (!picked) return;
   let parsed;
   try{ parsed = JSON.parse(picked.text); }catch(_e){ throw new Error('Invalid JSON file.'); }
-  const rows = normalizeImportedStoryRows(parsed, { forceSnapshotBody:true });
+  const rows = normalizeImportedStoryRows(parsed, { forceSnapshotBody:true, pendingRelink:true });
   const cardCount = rows.reduce((n,r)=>n+(r.cards?.length||0),0);
   if (!rows.length || !cardCount) throw new Error('No Story Mode rows/cards found in this JSON file.');
   const replace = !storyRows.length || confirm(`Import ${cardCount} Story Card(s) from ${picked.name || 'JSON'}?
 
 OK = Replace current Story Mode
 Cancel = Append to current Story Mode`);
+  const relinkStats = storyRelinkImportedStoryRows(rows, { force:true, preserveSnapshotBody:true });
   if (replace) storyRows = rows;
   else storyRows.push(...rows);
   ensureStorySeed();
   renderStoryAssembly();
   storyCommitSharedState(true);
-  setStatusSafe?.(`Imported ${cardCount} Story Card(s) from JSON.`);
+  const relinkMsg = relinkStats.pending
+    ? ` ${relinkStats.pending} card(s) are pending transcript relink.`
+    : ` ${relinkStats.linked} card(s) linked to live cues; ${relinkStats.generic} kept as generic.`;
+  setStatusSafe?.(`Imported ${cardCount} Story Card(s) from JSON.${relinkMsg}`);
 }
 function hideStoryMode(){
   if (storyModeEl) storyModeEl.style.display = 'none';
@@ -4114,7 +4323,7 @@ function ensureStoryMode(){
   assembly?.addEventListener('click', onStoryClick);
   assembly?.addEventListener('contextmenu', onStoryContextMenu);
   assembly?.addEventListener('focusin', onStoryFocusIn);
-  assembly?.addEventListener('focusout', () => setTimeout(storyApplyDeferredRemoteRows, 250));
+  assembly?.addEventListener('focusout', ev => storyOnStoryFocusOut(ev));
   assembly?.addEventListener('keyup', onStoryKeyup);
   assembly?.addEventListener('keydown', onStoryKeydown);
   assembly?.addEventListener('pointerdown', ev => {
@@ -4338,7 +4547,7 @@ function storyInstallSelectionToolbarHandlers(){
     if (toolbar?.contains(ev.target)) return;
     if (ev.target?.closest?.('.story-card-body[contenteditable="true"]')) return;
     setTimeout(storyHideSelectionToolbar, 0);
-    if (!ev.target?.closest?.('#storyMode .story-card')) setTimeout(storyApplyDeferredRemoteRows, 350);
+    if (!ev.target?.closest?.('#storyMode .story-card')) storyScheduleDeferredRowsApply(180, { force:true });
   }, true);
 }
 function storySyncRichBodyToCard(editable, { commit=true, reconcile=true } = {}){
@@ -4700,6 +4909,7 @@ function storyRefreshClipCardCueLinks(card){
 function storyNormalizeCardsBeforeRender(){
   storyRows.forEach(row => (row.cards || []).forEach(card => {
     card.textStyle = storyNormalizeTextStyle(card.textStyle || {});
+    if (card.relinkPending) storyRelinkImportedStoryCard(card, { preserveSnapshotBody:true });
     if (card.kind === 'clip') storyRefreshClipCardCueLinks(card);
     if ((card.kind === 'cue' || card.kind === 'clip') && (!Array.isArray(card.sourceCueRefs) || !card.sourceCueRefs.length) && Array.isArray(card.cueRefs)){
       card.sourceCueRefs = [...card.cueRefs];
@@ -4762,23 +4972,60 @@ function storyQueueRemoteRows(rows){
   storyScheduleDeferredRowsApply();
   return true;
 }
-function storyScheduleDeferredRowsApply(delay=900){
+function storyHasActiveStoryEditFocus(){
+  if (!isStoryMode || !storyModeEl) return false;
+  const active = document.activeElement;
+  return !!(active && active.closest && active.closest('#storyMode .story-card'));
+}
+function storySyncVisibleStoryEditors({ commit=false } = {}){
+  if (!storyModeEl) return;
+  try{ storySyncAllRichBodiesToCards({ commit, reconcile:false }); }catch(_e){}
+  storyModeEl.querySelectorAll?.('.story-card').forEach(cardEl => {
+    const rowEl = cardEl.closest('.story-row');
+    const { row, card } = storyFindCard(rowEl?.dataset?.rowId, cardEl.dataset.cardId);
+    if (!row || !card) return;
+    const title = cardEl.querySelector('.story-card-title');
+    const notes = cardEl.querySelector('.story-card-notes');
+    if (title) card.title = title.value || '';
+    if (notes) card.notes = notes.value || '';
+  });
+}
+function storyOnStoryFocusOut(ev){
+  // When focus leaves a Story Card, apply any queued remote Story rows quickly.
+  // A text selection can remain inside a blurred contenteditable, so do not use
+  // the selection-only guard here; otherwise remote changes can stay queued forever.
+  const next = ev?.relatedTarget || null;
+  if (next && next.closest && (next.closest('#storyMode .story-card') || next.closest('#storyFloatToolbar'))) return;
+  setTimeout(() => {
+    if (storyHasActiveStoryEditFocus()) return;
+    storySyncVisibleStoryEditors({ commit:false });
+    storyScheduleDeferredRowsApply(40, { force:true });
+  }, 180);
+}
+function storyScheduleDeferredRowsApply(delay=900, opts={}){
   if (COLLAB_STORY_DEFERRED_TIMER) clearTimeout(COLLAB_STORY_DEFERRED_TIMER);
   COLLAB_STORY_DEFERRED_TIMER = setTimeout(() => {
     COLLAB_STORY_DEFERRED_TIMER = null;
-    storyApplyDeferredRemoteRows();
+    storyApplyDeferredRemoteRows(opts);
   }, delay);
 }
-function storyApplyDeferredRemoteRows(){
+function storyApplyDeferredRemoteRows(opts={}){
   if (!COLLAB_STORY_DEFERRED_ROWS) return false;
-  if (storyIsEditingOrSelecting()){
+  const force = !!opts.force;
+  if (!force && storyIsEditingOrSelecting()){
     storyScheduleDeferredRowsApply(1200);
+    return false;
+  }
+  if (force && storyHasActiveStoryEditFocus()){
+    storyScheduleDeferredRowsApply(600, { force:true });
     return false;
   }
   const rows = COLLAB_STORY_DEFERRED_ROWS;
   COLLAB_STORY_DEFERRED_ROWS = null;
+  storySyncVisibleStoryEditors({ commit:false });
   applySharedStoryRows(rows, { remoteUpdate:true });
   try{ COLLAB_LAST_HASH = hashSessionState(buildShareSessionState()); }catch(_e){}
+  try{ setCollabSyncStatus?.('updated'); }catch(_e){}
   return true;
 }
 function scheduleApplyStoryCollabAwareness(){
