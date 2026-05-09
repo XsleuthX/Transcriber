@@ -826,13 +826,23 @@ function selectRow(index, {scroll=true} = {}) {
 
 
 function flushEditsFromDOM() {
-  [...transcriptEl.children].forEach(row => {
-    const i = +row.dataset.index;
-    const t = row.querySelector('.text');
-    if (entries[i] && t) {
-      entries[i].text = t.textContent;  // capture latest edits
-    }
-  });
+  const flushPanel = (panelEl, fallbackTrack='A') => {
+    if (!panelEl) return;
+    const track = normalizeStoryTrack(panelEl.dataset?.panel || fallbackTrack || 'A');
+    const list = track === 'B' ? entriesB : entries;
+    [...panelEl.children].forEach(row => {
+      const i = +row.dataset.index;
+      const t = row.querySelector('.text');
+      if (Number.isFinite(i) && list[i] && t) {
+        list[i].text = t.textContent || '';
+      }
+    });
+  };
+  // In single Sub B mode, transcriptEl is reused for B.  The older version
+  // always wrote transcriptEl back into entries (Sub A), which could make Sub B
+  // appear to disappear or cross-write after switching View modes.
+  flushPanel(transcriptEl, transcriptEl?.dataset?.panel || (subsMode === 'B' ? 'B' : 'A'));
+  if (subsMode === 'DUAL') flushPanel(document.getElementById('transcriptB'), 'B');
 }
 
 /* ---------- Render transcript ---------- */
@@ -1230,6 +1240,50 @@ function setActiveRow(container, idx, track){
   if (track === 'B') lastActiveIdxB = idx; else lastActiveIdxA = idx;
 }
 
+
+let lastTxtActiveIdxA = -1;
+let lastTxtActiveIdxB = -1;
+
+function setActiveTxtRow(track, idx){
+  track = normalizeTxtTrack(track);
+  const box = getTxtBoxForTrack(track);
+  if (!box) return null;
+  const last = track === 'B' ? lastTxtActiveIdxB : lastTxtActiveIdxA;
+  if (last !== idx){
+    if (last >= 0) box.querySelector(`.txt-cue[data-index="${last}"]`)?.classList.remove('active','txt-playhead-active');
+    box.querySelectorAll('.txt-cue.active,.txt-cue.txt-playhead-active').forEach(el => {
+      if (Number(el.dataset.index || -1) !== idx) el.classList.remove('active','txt-playhead-active');
+    });
+    const row = idx >= 0 ? box.querySelector(`.txt-cue[data-index="${idx}"][data-track="${track}"]`) || box.querySelector(`.txt-cue[data-index="${idx}"]`) : null;
+    if (row) row.classList.add('active','txt-playhead-active');
+    if (track === 'B') lastTxtActiveIdxB = idx; else lastTxtActiveIdxA = idx;
+    return row;
+  }
+  const row = idx >= 0 ? (box.querySelector(`.txt-cue[data-index="${idx}"][data-track="${track}"]`) || box.querySelector(`.txt-cue[data-index="${idx}"]`)) : null;
+  if (row) row.classList.add('active','txt-playhead-active');
+  return row;
+}
+
+function updateTxtActiveFromPlayhead(t, now=nowMs()){
+  if (!isTxtMode) return;
+  const skipScroll = (manualSelectIndex >= 0 && now < manualHoldUntil) || now <= suppressAutoScrollUntil;
+  if (subsMode === 'DUAL'){
+    const idxA = getActiveIndex(t, 'A');
+    const idxB = getActiveIndex(t, 'B');
+    const rowA = setActiveTxtRow('A', idxA);
+    const rowB = setActiveTxtRow('B', idxB);
+    if (!skipScroll){
+      if (rowA) scrollRowToCenter(getScrollContainerFor(getTxtBoxForTrack('A')), rowA);
+      if (rowB) scrollRowToCenter(getScrollContainerFor(getTxtBoxForTrack('B')), rowB);
+    }
+    return;
+  }
+  const track = getTxtSingleTrack();
+  const idx = getActiveIndex(t, track);
+  const row = setActiveTxtRow(track, idx);
+  if (!skipScroll && row) scrollRowToCenter(getScrollContainerFor(getTxtBoxForTrack(track)), row);
+}
+
 function handleMediaTimeUpdate(t){
   t = Math.max(0, Number(t) || 0);
   const now = nowMs();
@@ -1243,7 +1297,7 @@ function handleMediaTimeUpdate(t){
 
   if (isTimelineMode){ try{ updateTimelinePlayhead(t); }catch(_e){} return; }
   if (isStoryMode){ try{ updateStoryPlaybackActiveState(t); }catch(_e){} return; }
-  if (isTxtMode) return;
+  if (isTxtMode){ try{ updateTxtActiveFromPlayhead(t, now); }catch(_e){} return; }
 
   // If user manually selected a row recently, don't auto-scroll over them
   if (manualSelectIndex >= 0 && now < manualHoldUntil) return;
@@ -1634,8 +1688,11 @@ function ensureStyleControls(){
       }
       .ui-dark-input, .ui-dark-select{ width:100%; min-width:0; max-width:100%; }
       .ui-dark-color{ padding:0; height:35px; width:44px; max-width:100%; justify-self:start; }
-      #transcriptFindBar{ display:flex; gap:8px; align-items:center; padding:8px; border-bottom:1px solid rgba(255,255,255,.07); }
-      #transcriptFindBar input[type="text"]{ min-width:180px }
+      #transcriptFindBar{ display:flex; gap:8px; align-items:center; padding:8px; border-bottom:1px solid rgba(255,255,255,.07); flex-wrap:wrap; min-width:0; }
+      #transcriptFindBar input[type="text"]{ min-width:120px; flex:1 1 150px; max-width:240px; }
+      #transcriptFindBar .fr-option{ display:flex; align-items:center; gap:6px; white-space:nowrap; flex:0 0 auto; }
+      #transcriptFindBar #frDo{ flex:0 0 auto; white-space:nowrap; }
+      #transcriptFindBar #frCount{ flex:0 0 auto; min-width:76px; }
       .text,.txt-line{ font-size:var(--cue-font-size, 14px); font-family:var(--cue-font-family, inherit); color:var(--cue-color, var(--ink)); }
       .btn{ background:#1f2a3a; color:#e9edf1; border:1px solid #2a3647; padding:6px 10px; border-radius:6px; cursor:pointer }
       .btn:hover{ background:#263243 }
@@ -1747,10 +1804,10 @@ function ensureFindReplaceBar(){
       parent.insertBefore(bar, transcriptEl);
     }
     bar.innerHTML = `
-      <input id="frFind" class="ui-dark-input" type="text" placeholder="Find text…">
+      <input id="frFind" class="ui-dark-input" type="text" placeholder="Find Text…">
       <input id="frReplace" class="ui-dark-input" type="text" placeholder="Replace with…">
-      <span class="muted"><label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="frCase"> Case </label></span class>
-      <span class="muted"><label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="frWhole"> Whole word </label></span class>
+      <label class="muted fr-option"><input type="checkbox" id="frCase"> Case</label>
+      <label class="muted fr-option"><input type="checkbox" id="frWhole"> Whole Word</label>
       <button class="btn" id="frDo">Replace All</button>
       <span id="frCount" class="muted"></span>
     `;
@@ -2097,11 +2154,18 @@ function getTxtBoxForTrack(track='A'){
   if (subsMode === 'DUAL') return t === 'B' ? txtBoxBEl : txtBoxAEl;
   return txtBoxEl;
 }
+function isTxtEditorActuallyVisible(box){
+  if (!box || !document.body.contains(box)) return false;
+  if (box.closest('[hidden]')) return false;
+  const cs = window.getComputedStyle ? getComputedStyle(box) : null;
+  if (cs && (cs.display === 'none' || cs.visibility === 'hidden')) return false;
+  return !!(box.offsetParent || box.getClientRects().length);
+}
 function getTxtVisibleBoxes(){
   const out = [];
-  if (txtBoxEl && txtBoxEl.style.display !== 'none') out.push(txtBoxEl);
-  if (txtBoxAEl && txtBoxAEl.style.display !== 'none') out.push(txtBoxAEl);
-  if (txtBoxBEl && txtBoxBEl.style.display !== 'none') out.push(txtBoxBEl);
+  if (isTxtEditorActuallyVisible(txtBoxEl)) out.push(txtBoxEl);
+  if (isTxtEditorActuallyVisible(txtBoxAEl)) out.push(txtBoxAEl);
+  if (isTxtEditorActuallyVisible(txtBoxBEl)) out.push(txtBoxBEl);
   return out;
 }
 function getTxtSelectionInfo(){
@@ -2692,11 +2756,17 @@ function ensureTxtDualWrap(){
     txtDualWrapEl.hidden = true;
     txtDualWrapEl.innerHTML = `
       <div class="dual-col txt-dual-col">
-        <div class="dual-bar"><div class="dual-title">Transcript A (Original)</div></div>
+        <div class="dual-bar">
+          <div class="dual-title">Transcript A (Original)</div>
+          <div class="dual-actions"><button class="btn btn-sm" id="btnTxtImportA" type="button">Import SRT/VTT</button></div>
+        </div>
         <div id="txtBoxA" class="txt-script-editor txt-script-editor-dual" role="list" aria-label="Sub A Transcript Mode script editor"></div>
       </div>
       <div class="dual-col txt-dual-col">
-        <div class="dual-bar"><div class="dual-title">Transcript B (Translation)</div></div>
+        <div class="dual-bar">
+          <div class="dual-title">Transcript B (Translation)</div>
+          <div class="dual-actions"><button class="btn btn-sm" id="btnTxtImportB" type="button">Import SRT/VTT</button></div>
+        </div>
         <div id="txtBoxB" class="txt-script-editor txt-script-editor-dual" role="list" aria-label="Sub B Transcript Mode script editor"></div>
       </div>
     `;
@@ -2707,6 +2777,16 @@ function ensureTxtDualWrap(){
   }
   txtBoxAEl = document.getElementById('txtBoxA');
   txtBoxBEl = document.getElementById('txtBoxB');
+  const txtImportA = document.getElementById('btnTxtImportA');
+  const txtImportB = document.getElementById('btnTxtImportB');
+  if (txtImportA && !txtImportA.__bound){
+    txtImportA.__bound = true;
+    txtImportA.addEventListener('click', () => (document.getElementById('srtInputA') || document.getElementById('srtInput'))?.click());
+  }
+  if (txtImportB && !txtImportB.__bound){
+    txtImportB.__bound = true;
+    txtImportB.addEventListener('click', () => document.getElementById('srtInputB')?.click());
+  }
   [txtBoxAEl, txtBoxBEl].forEach(box => {
     if (box && !box.__txtScrollBound){
       box.__txtScrollBound = true;
@@ -2927,8 +3007,13 @@ function getTxtLineIndexAtSelection(){
 }
 
 function syncTxtBoxToEntries(){
+  // Only TXT-mode editors should write back into entries. Hidden/stale TXT boxes
+  // from prior view switches must not overwrite Sub A/Sub B, especially after
+  // importing Sub B or filling it via Align-To-SRT.
+  const activeTxtEditor = document.activeElement?.closest?.('.txt-script-editor');
+  if (!isTxtMode && !activeTxtEditor) return;
   const boxes = getTxtVisibleBoxes();
-  if (!boxes.length && txtBoxEl) boxes.push(txtBoxEl);
+  if (!boxes.length && isTxtMode && txtBoxEl) boxes.push(txtBoxEl);
   for (const box of boxes){
     box.querySelectorAll('.txt-cue').forEach(row => {
       const i = Number(row.dataset.index || -1);
@@ -3363,8 +3448,8 @@ function ensureViewModeBar(){
     const st = document.createElement('style');
     st.id = 'viewModeStyle';
     st.textContent = `
-      .seg-toggle { display:inline-flex; background:#0e1116; border:1px solid rgba(255,255,255,.08); border-radius:10px; overflow:hidden }
-      .seg-toggle .seg{ background:transparent; color:#e9edf1; border:0; padding:8px 12px; cursor:pointer; font-size:13px }
+      .seg-toggle { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); background:#0e1116; border:1px solid rgba(255,255,255,.08); border-radius:10px; overflow:hidden; width:100%; }
+      .seg-toggle .seg{ background:transparent; color:#e9edf1; border:0; padding:8px 12px; cursor:pointer; font-size:13px; white-space:nowrap; }
       .seg-toggle .seg.active{ background:#1a2230 }
       .txt-tools{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
       .txt-tools .btn{ height:34px; }
@@ -3495,6 +3580,8 @@ let storyContextCueTarget = null;
 let storyActiveSubTrack = 'A';
 let storyActiveCardCtx = null;
 let storyDraggingRowId = '';
+let storyDraggingCardId = '';
+let storyDraggingCardSourceRowId = '';
 let storySavedRichSelection = null;
 let storySelectionToolbarBound = false;
 const STORY_LABELS = {
@@ -3840,6 +3927,53 @@ function storyRelinkImportedStoryRows(rows=storyRows, opts={}){
   }));
   return stats;
 }
+function storyLinkCardToLiveCueRefs(card){
+  if (!card || card.kind === 'caption') return { skipped:true };
+  if (!storyHasAnyTranscriptCues()){
+    card.relinkPending = true;
+    card.relinkStatus = 'pending-transcript';
+    return { pending:true };
+  }
+  // Manual Link Cues should be more proactive than import relinking:
+  // it can use direct refs, visible text, or the card's In/Out range even
+  // for generic Story Cards.  If no reliable match is found, keep the card
+  // unchanged instead of turning it into a generic/blank card.
+  const result = storyTryDirectRelinkForCard(card) || storyTryTextRelinkForCard(card) || storyTryRangeRelinkForCard(card);
+  if (result && result.cueRefs?.length){
+    const wasLive = Array.isArray(card.cueRefs) && card.cueRefs.length;
+    // Manual Link Cues should turn the Story Card back into a live transcript
+    // view.  Do not preserve the visible Story body as a manual snapshot here,
+    // otherwise switching Sub A/Sub B keeps showing the old saved text instead
+    // of re-rendering the matching cues from the selected subtitle track.
+    storyApplyRelinkResultToCard(card, result, { preserveSnapshotBody:false });
+    card.bodyManual = false;
+    card.relinkStatus = result.method || 'linked';
+    return { linked:true, updated:!wasLive, method:result.method || 'linked' };
+  }
+  card.relinkStatus = card.cueRefs?.length ? 'linked' : 'no-match';
+  return { noMatch:true };
+}
+function linkStoryCardsToLiveCues(){
+  if (VIEW_ONLY_SESSION) return;
+  try{ storySyncAllRichBodiesToCards({ commit:false, reconcile:false }); }catch(_e){}
+  const stats = { linked:0, pending:0, noMatch:0, skipped:0 };
+  (storyRows || []).forEach(row => (row.cards || []).forEach(card => {
+    const res = storyLinkCardToLiveCueRefs(card);
+    if (res.linked) stats.linked += 1;
+    else if (res.pending) stats.pending += 1;
+    else if (res.noMatch) stats.noMatch += 1;
+    else stats.skipped += 1;
+  }));
+  renderStoryAssembly();
+  storyCommitSharedState(true);
+  const msg = stats.pending
+    ? `Link Cues: ${stats.linked} card(s) linked. ${stats.pending} pending because no transcript cues are loaded yet.`
+    : `Link Cues: ${stats.linked} card(s) linked to live transcript cues; ${stats.noMatch} card(s) had no reliable cue match.`;
+  try{ setStatusSafe?.(msg); }catch(_e){}
+  if (!stats.linked && stats.noMatch){
+    alert(msg + '\n\nTip: set each card In/Out timecode or keep cue text close to the transcript text, then run Link Cues again.');
+  }
+}
 function storyRetryPendingStoryRelinksAfterCueLoad(opts={}){
   if (typeof storyRows === 'undefined' || !Array.isArray(storyRows) || !storyRows.length) return null;
   const pending = storyRows.some(row => (row.cards || []).some(card => card?.relinkPending));
@@ -3971,6 +4105,22 @@ function createStoryRow(){
   return { id:makeStoryRowId(), cards:[], notes:'', status:'draft' };
 }
 function ensureStorySeed(){ if (!storyRows.length) storyRows.push(createStoryRow()); }
+function clearStoryAssembly(){
+  if (VIEW_ONLY_SESSION) return;
+  const count = (storyRows || []).reduce((n, row) => n + ((row && Array.isArray(row.cards)) ? row.cards.length : 0), 0);
+  const rowCount = Array.isArray(storyRows) ? storyRows.length : 0;
+  const msg = count || rowCount ? `Clear all ${count} Story Card(s) and ${rowCount} row(s) from the Story Assembly?` : 'Clear the Story Assembly?';
+  if (!confirm(msg + '\n\nThis cannot be undone unless another collaborator still has the previous state.')) return;
+  storyRows = [];
+  storyActiveCardCtx = null;
+  storyDraggingRowId = '';
+  storyDraggingCardId = '';
+  storyDraggingCardSourceRowId = '';
+  ensureStorySeed();
+  renderStoryAssembly();
+  storyCommitSharedState(true);
+  try{ setStatusSafe?.('Story Assembly cleared.'); }catch(_e){}
+}
 function storyCommitSharedState(force=false){
   if (!COLLAB_SESSION_ID || VIEW_ONLY_SESSION || COLLAB_APPLYING) return;
   if (COLLAB_STORY_STATE_TIMER) clearTimeout(COLLAB_STORY_STATE_TIMER);
@@ -4251,15 +4401,30 @@ function ensureStoryMode(){
         <div class="story-title">Story Mode</div>
         <div class="story-sub">Build the assembly vertically. Each row is a sequence beat. Story Cards always stack top-to-bottom.</div>
       </div>
-      <div class="story-actions">
-        <label class="story-sub-top">SUBS <select id="storySubModeTop" class="subs-mode"><option value="A">Sub A</option><option value="B">Sub B</option></select></label>
-        <button class="btn btn-outline" id="storyAddFromSelection" type="button">Add Selection</button>
-        <button class="btn btn-outline" id="storyAddRow" type="button">Add Row</button>
-        <button class="btn btn-gold" id="storyExportTimeline" type="button">Export to Timeline</button>
-        <button class="btn btn-outline" id="storyExportGoogleDoc" type="button">Export to Google Doc</button>
-        <button class="btn btn-outline" id="storyImportGoogleDoc" type="button">Fetch from Google Doc</button>
-        <button class="btn btn-outline" id="storyImportJson" type="button">Import JSON</button>
-        <button class="btn btn-outline" id="storyExportJson" type="button">Export JSON</button>
+      <div class="story-actions story-actions-two-row">
+        <div class="story-action-row story-action-row-primary">
+          <label class="story-sub-top">Subs A/B <select id="storySubModeTop" class="subs-mode"><option value="A">Sub A</option><option value="B">Sub B</option></select></label>
+          <button class="btn btn-outline" id="storyLinkCues" type="button">Link Cues</button>
+          <button class="btn btn-outline" id="storyAddRow" type="button">Add Row</button>
+          <button class="btn btn-outline" id="storyClearStory" type="button">Clear Story</button>
+        </div>
+        <div class="story-action-row story-action-row-secondary">
+          <div class="story-action-menu">
+            <button class="btn btn-gold story-menu-trigger" id="storyGoogleDocMenuBtn" type="button" aria-haspopup="true" aria-expanded="false">Link to Google Doc ▾</button>
+            <div class="story-action-menu-pop" role="menu" aria-label="Google Doc actions">
+              <button id="storyImportGoogleDoc" type="button" role="menuitem">Fetch From Google Doc</button>
+              <button id="storyExportGoogleDoc" type="button" role="menuitem">Export to Google Doc</button>
+            </div>
+          </div>
+          <button class="btn btn-gold" id="storyExportTimeline" type="button">Export to Timeline</button>
+          <div class="story-action-menu">
+            <button class="btn btn-outline story-menu-trigger" id="storyJsonMenuBtn" type="button" aria-haspopup="true" aria-expanded="false">JSON ▾</button>
+            <div class="story-action-menu-pop" role="menu" aria-label="JSON actions">
+              <button id="storyImportJson" type="button" role="menuitem">Import JSON</button>
+              <button id="storyExportJson" type="button" role="menuitem">Export JSON</button>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
     <div class="story-help">Tip: select transcript cues, Ctrl+C, then paste here. Cue cards stay live-linked to In / Out timecodes and editable text.</div>
@@ -4288,7 +4453,8 @@ function ensureStoryMode(){
   `;
   parent.appendChild(storyModeEl);
   storyModeEl.querySelector('#storyAddRow')?.addEventListener('click', () => { if (VIEW_ONLY_SESSION) return; storyRows.push(createStoryRow()); renderStoryAssembly(); storyCommitSharedState(true); });
-  storyModeEl.querySelector('#storyAddFromSelection')?.addEventListener('click', () => { addCurrentSelectionToStory(); });
+  storyModeEl.querySelector('#storyClearStory')?.addEventListener('click', () => { clearStoryAssembly(); });
+  storyModeEl.querySelector('#storyLinkCues')?.addEventListener('click', () => { linkStoryCardsToLiveCues(); });
   storyModeEl.querySelector('#storyExportTimeline')?.addEventListener('click', () => { exportStoryToTimeline(); });
   storyModeEl.querySelector('#storyExportGoogleDoc')?.addEventListener('click', () => { exportStoryToGoogleDocBackup().catch(err => alert('Google Doc export failed: ' + (err?.message || err))); });
   storyModeEl.querySelector('#storyImportGoogleDoc')?.addEventListener('click', () => { fetchStoryFromGoogleDocBackup().catch(err => alert('Google Doc fetch failed: ' + (err?.message || err))); });
@@ -4297,6 +4463,33 @@ function ensureStoryMode(){
   storyModeEl.querySelector('#storyExportJson')?.addEventListener('click', async () => {
     const payload = exportStoryJsonPayload();
     await saveTextFile((suggestBaseName?.() || 'story') + '_story_assembly.json', JSON.stringify(payload, null, 2), 'application/json;charset=utf-8');
+  });
+  storyModeEl.querySelectorAll('.story-action-menu').forEach(menu => {
+    const trigger = menu.querySelector('.story-menu-trigger');
+    trigger?.addEventListener('click', ev => {
+      ev.preventDefault();
+      const wasOpen = menu.classList.contains('is-open');
+      storyModeEl.querySelectorAll('.story-action-menu.is-open').forEach(m => {
+        if (m !== menu){ m.classList.remove('is-open'); m.querySelector('.story-menu-trigger')?.setAttribute('aria-expanded', 'false'); }
+      });
+      menu.classList.toggle('is-open', !wasOpen);
+      trigger.setAttribute('aria-expanded', String(!wasOpen));
+    });
+    menu.querySelectorAll('.story-action-menu-pop button').forEach(btn => {
+      btn.addEventListener('click', () => {
+        menu.classList.remove('is-open');
+        trigger?.setAttribute('aria-expanded', 'false');
+        try{ btn.blur(); }catch(_e){}
+      });
+    });
+  });
+  document.addEventListener('click', ev => {
+    if (!storyModeEl || storyModeEl.style.display === 'none') return;
+    if (ev.target?.closest?.('.story-action-menu')) return;
+    storyModeEl.querySelectorAll('.story-action-menu.is-open').forEach(menu => {
+      menu.classList.remove('is-open');
+      menu.querySelector('.story-menu-trigger')?.setAttribute('aria-expanded', 'false');
+    });
   });
   const toolbar = storyModeEl.querySelector('#storyFloatToolbar');
   toolbar?.addEventListener('mousedown', ev => {
@@ -4311,13 +4504,13 @@ function ensureStoryMode(){
   assembly?.addEventListener('paste', onStoryPaste);
   assembly?.addEventListener('dragstart', onStoryDragStart);
   assembly?.addEventListener('dragover', ev => {
-    const isRowDrag = storyIsRowDragEvent(ev);
-    if (isRowDrag){ ev.preventDefault(); storyMarkRowDropTarget(ev); return; }
+    if (storyIsRowDragEvent(ev)){ ev.preventDefault(); storyMarkRowDropTarget(ev); return; }
+    if (storyIsCardDragEvent(ev)){ ev.preventDefault(); storyMarkCardDropTarget(ev); return; }
     ev.preventDefault(); assembly.classList.add('is-drop');
   });
   assembly?.addEventListener('dragleave', ev => { if (!ev.relatedTarget || !assembly.contains(ev.relatedTarget)){ assembly.classList.remove('is-drop'); storyClearRowDropTargets(); } });
   assembly?.addEventListener('drop', ev => { assembly.classList.remove('is-drop'); storyClearRowDropTargets(); onStoryDrop(ev); });
-  assembly?.addEventListener('dragend', () => { storyDraggingRowId = ''; storyClearRowDropTargets(); });
+  assembly?.addEventListener('dragend', () => { storyDraggingRowId = ''; storyDraggingCardId = ''; storyDraggingCardSourceRowId = ''; storyClearRowDropTargets(); });
   assembly?.addEventListener('input', onStoryInput);
   assembly?.addEventListener('change', onStoryChange);
   assembly?.addEventListener('click', onStoryClick);
@@ -4744,19 +4937,53 @@ function onStoryToolbarChange(ev){
 function storyIsRowDragEvent(ev){
   try{ return !!storyDraggingRowId || Array.from(ev.dataTransfer?.types || []).includes('application/x-transcriber-story-row'); }catch(_e){ return !!storyDraggingRowId; }
 }
+function storyIsCardDragEvent(ev){
+  try{ return !!storyDraggingCardId || Array.from(ev.dataTransfer?.types || []).includes('application/x-transcriber-story-card'); }catch(_e){ return !!storyDraggingCardId; }
+}
 function storyClearRowDropTargets(){
-  storyModeEl?.querySelectorAll?.('.story-row.is-row-drop-target,.story-row.is-row-dragging').forEach(el => el.classList.remove('is-row-drop-target','is-row-dragging'));
+  storyModeEl?.querySelectorAll?.('.story-row.is-row-drop-target,.story-row.is-row-drop-before,.story-row.is-row-drop-after,.story-row.is-row-dragging,.story-row.is-card-drop-target,.story-card.is-card-drop-before,.story-card.is-card-drop-after,.story-card.is-card-dragging').forEach(el => el.classList.remove('is-row-drop-target','is-row-drop-before','is-row-drop-after','is-row-dragging','is-card-drop-target','is-card-drop-before','is-card-drop-after','is-card-dragging'));
 }
 function storyMarkRowDropTarget(ev){
-  storyModeEl?.querySelectorAll?.('.story-row.is-row-drop-target').forEach(el => el.classList.remove('is-row-drop-target'));
+  storyModeEl?.querySelectorAll?.('.story-row.is-row-drop-target,.story-row.is-row-drop-before,.story-row.is-row-drop-after').forEach(el => el.classList.remove('is-row-drop-target','is-row-drop-before','is-row-drop-after'));
   const rowEl = ev.target?.closest?.('.story-row');
-  if (rowEl && rowEl.dataset.rowId !== storyDraggingRowId) rowEl.classList.add('is-row-drop-target');
+  if (!rowEl || rowEl.dataset.rowId === storyDraggingRowId) return;
+  const rect = rowEl.getBoundingClientRect();
+  const after = ev.clientY > rect.top + rect.height / 2;
+  rowEl.classList.add('is-row-drop-target', after ? 'is-row-drop-after' : 'is-row-drop-before');
+}
+function storyMarkCardDropTarget(ev){
+  storyModeEl?.querySelectorAll?.('.story-row.is-card-drop-target,.story-card.is-card-drop-before,.story-card.is-card-drop-after').forEach(el => el.classList.remove('is-card-drop-target','is-card-drop-before','is-card-drop-after'));
+  const cardEl = ev.target?.closest?.('.story-card');
+  if (cardEl && cardEl.dataset.cardId !== storyDraggingCardId){
+    const rect = cardEl.getBoundingClientRect();
+    const after = ev.clientY > rect.top + rect.height / 2;
+    cardEl.classList.add(after ? 'is-card-drop-after' : 'is-card-drop-before');
+    return;
+  }
+  const rowEl = ev.target?.closest?.('.story-row');
+  if (rowEl) rowEl.classList.add('is-card-drop-target');
 }
 function onStoryDragStart(ev){
+  const cardHandle = ev.target?.closest?.('.story-card-drag-handle[data-story-card-drag]');
+  if (cardHandle && !VIEW_ONLY_SESSION){
+    const cardEl = cardHandle.closest('.story-card');
+    const rowEl = cardHandle.closest('.story-row');
+    if (!cardEl || !rowEl) return;
+    if (isStoryCardRemoteLocked(cardEl.dataset.cardId)) { ev.preventDefault(); return; }
+    storyDraggingCardId = cardEl.dataset.cardId || '';
+    storyDraggingCardSourceRowId = rowEl.dataset.rowId || '';
+    cardEl.classList.add('is-card-dragging');
+    const payload = { rowId: storyDraggingCardSourceRowId, cardId: storyDraggingCardId };
+    ev.dataTransfer?.setData?.('application/x-transcriber-story-card', JSON.stringify(payload));
+    ev.dataTransfer?.setData?.('text/plain', storyDraggingCardId);
+    if (ev.dataTransfer) ev.dataTransfer.effectAllowed = 'move';
+    return;
+  }
   const handle = ev.target?.closest?.('.story-row-num[data-story-row-drag]');
   if (!handle || VIEW_ONLY_SESSION) return;
   const rowEl = handle.closest('.story-row');
   if (!rowEl) return;
+  if (storyRowHasRemoteLock(getStoryRow(rowEl.dataset.rowId))) { ev.preventDefault(); return; }
   storyDraggingRowId = rowEl.dataset.rowId || '';
   rowEl.classList.add('is-row-dragging');
   ev.dataTransfer?.setData?.('application/x-transcriber-story-row', storyDraggingRowId);
@@ -4781,6 +5008,32 @@ function storyMoveRowBeforeOrAfter(sourceId, targetId, ev){
   storyCommitSharedState(true);
   return true;
 }
+function storyMoveCardToDrop(sourceRowId, cardId, targetRowId, ev){
+  if (!cardId || !targetRowId) return false;
+  const sourceRow = getStoryRow(sourceRowId) || storyRows.find(r => (r.cards || []).some(c => c.id === cardId));
+  const targetRow = getStoryRow(targetRowId);
+  if (!sourceRow || !targetRow) return false;
+  if (storyRowHasRemoteLock(targetRow) || storyRowHasRemoteLock(sourceRow)) return false;
+  const sourceIndex = (sourceRow.cards || []).findIndex(c => c.id === cardId);
+  if (sourceIndex < 0) return false;
+  const [card] = sourceRow.cards.splice(sourceIndex, 1);
+  if (!Array.isArray(targetRow.cards)) targetRow.cards = [];
+  let insertAt = targetRow.cards.length;
+  const targetCardEl = ev?.target?.closest?.('.story-card');
+  const targetCardId = targetCardEl?.dataset?.cardId || '';
+  if (targetCardId && targetCardId !== cardId){
+    const idx = targetRow.cards.findIndex(c => c.id === targetCardId);
+    if (idx >= 0){
+      const rect = targetCardEl.getBoundingClientRect();
+      insertAt = idx + (ev.clientY > rect.top + rect.height / 2 ? 1 : 0);
+    }
+  }
+  targetRow.cards.splice(Math.max(0, Math.min(insertAt, targetRow.cards.length)), 0, card);
+  storyActiveCardCtx = { rowId: targetRow.id, cardId: card.id };
+  renderStoryAssembly();
+  storyCommitSharedState(true);
+  return true;
+}
 function onStoryPaste(ev){
   const clip = ev.clipboardData || window.clipboardData;
   const custom = clip?.getData?.('application/x-transcriber-cues');
@@ -4793,6 +5046,16 @@ function onStoryPaste(ev){
 }
 function onStoryDrop(ev){
   ev.preventDefault();
+  const cardRaw = ev.dataTransfer?.getData?.('application/x-transcriber-story-card') || '';
+  const cardPayload = cardRaw ? (() => { try{ return JSON.parse(cardRaw); }catch(_e){ return null; } })() : null;
+  const cardId = cardPayload?.cardId || storyDraggingCardId;
+  if (cardId){
+    const targetRow = ev.target?.closest?.('.story-row')?.dataset?.rowId || '';
+    const sourceRow = cardPayload?.rowId || storyDraggingCardSourceRowId;
+    storyDraggingCardId = '';
+    storyDraggingCardSourceRowId = '';
+    if (storyMoveCardToDrop(sourceRow, cardId, targetRow, ev)) return;
+  }
   const rowDrag = ev.dataTransfer?.getData?.('application/x-transcriber-story-row') || storyDraggingRowId;
   if (rowDrag){
     const targetRow = ev.target?.closest?.('.story-row')?.dataset?.rowId || '';
@@ -5318,6 +5581,7 @@ function renderStoryCard(row, card){
     <article class="story-card ${isLive ? 'is-live' : 'is-generic'} ${card.notesOpen ? 'notes-open' : ''} ${remoteLock ? 'story-remote-locked' : ''}" data-card-id="${escapeStoryAttr(card.id)}" ${lockedTitle ? `title="${lockedTitle}"` : ''}>
       <div class="story-card-top">
         <span class="story-live-dot" title="${isLive ? 'Live linked' : 'Manual / placeholder card'}"></span>
+        <span class="story-card-drag-handle" draggable="${storyLocked ? 'false' : 'true'}" data-story-card-drag="1" title="Drag this Story Card into any row">⋮⋮</span>
         <div class="story-card-labels">${card.kind === 'caption' ? `<span class="story-caption-pill">${escapeHtml(card.label || card.title || 'Lower Third')}</span>` : `<select class="story-label-group" data-card-field="labelGroup"${disabledAttr}>${groupOptions}</select><select class="story-label" data-card-field="label" style="--label-color:${escapeHtml(labelColor)}"${disabledAttr}>${labelOptions}</select>`}</div>
         <div class="story-card-move"><button data-story-action="move-card-up" title="Move card up" type="button"${disabledAttr}>↑</button><button data-story-action="move-card-down" title="Move card down" type="button"${disabledAttr}>↓</button></div><button class="story-card-delete" data-story-action="delete-card" title="Delete card" type="button"${disabledAttr}>×</button>
       </div>
@@ -6423,60 +6687,138 @@ function storyReplaceCardCuesWithAligned(row, card, parsed, offset=0){
 function storyFormatBackupTime(sec){
   try{ return formatTimecodeFromSeconds(Number(sec || 0), getFPS()); }catch(_e){ return String(Number(sec || 0).toFixed(3)); }
 }
-function storyPlainTextForBackup(){
-  ensureStorySeed();
+function storyBase64EncodeUnicode(value){
+  const text = typeof value === 'string' ? value : JSON.stringify(value || {});
+  try{ return btoa(unescape(encodeURIComponent(text))); }catch(_e){ return btoa(text); }
+}
+function storyBase64DecodeUnicode(value){
+  const raw = String(value || '').replace(/\s+/g, '');
+  try{ return decodeURIComponent(escape(atob(raw))); }catch(_e){ return atob(raw); }
+}
+function storyGoogleDocExportPayload(){
+  try{ storySyncAllRichBodiesToCards({ commit:false, reconcile:false }); }catch(_e){}
+  const payload = exportStoryJsonPayload();
+  payload.type = 'transcriber_story_google_doc';
+  payload.googleDocVersion = 3;
+  payload.project = suggestBaseName?.() || window.currentBaseName || getCurrentStoryMediaLabel() || 'story';
+  payload.fps = getFPS();
+  payload.media = payload.media || getCurrentStoryMediaLabel();
+  payload.exportedAt = new Date().toISOString();
+  payload.restoreHint = 'Fetch From Google Doc reads the Transcriber Backup tab first, then relinks cues to the current transcript. The Story Assembly tab is the clean collaboration view.';
+  return payload;
+}
+function storyGoogleDocCardVisibleText(card, rowIndex, cardIndex, opts={}){
+  const includeNotes = opts.includeNotes !== false;
+  const includeLabels = opts.includeLabels !== false;
+  const clean = cleanStoryCardForShare(card);
+  const range = storyExportRangeForCard(card) || { start:clean.start, end:clean.end };
+  const inTc = range?.start != null ? fmtTC(range.start) : (clean.inTc || '');
+  const outTc = range?.end != null ? fmtTC(range.end) : (clean.outTc || '');
+  const labels = includeLabels ? [clean.labelGroup, clean.label].map(x => String(x || '').trim()).filter(Boolean) : [];
+  const bodyText = String(clean.body || storyPlainTextFromRichHtml(clean.bodyHtml || '') || '').trim();
+  const notes = String(clean.notes || '').trim();
+  const title = String(clean.title || clean.source || `Story Card ${rowIndex + 1}`).trim();
   const lines = [];
-  lines.push('TRANSCRIBER STORY BACKUP');
-  lines.push('VERSION: 1');
-  lines.push('PROJECT: ' + (suggestBaseName?.() || window.currentBaseName || getCurrentStoryMediaLabel() || 'story'));
-  lines.push('EXPORTED_AT: ' + new Date().toISOString());
-  lines.push('FPS: ' + getFPS());
-  lines.push('');
-  storyRows.forEach((row, rowIndex) => {
-    lines.push('--- STORY ROW ' + (rowIndex + 1) + ' ---');
-    if (row.notes) { lines.push('ROW_NOTES:'); lines.push(String(row.notes || '')); }
-    (row.cards || []).forEach((card, cardIndex) => {
-      const track = normalizeStoryTrack(card.track || storyActiveSubTrack || 'A');
-      const range = storyCardRange(card) || storyTimelineRangeForCard?.(card) || { start:card.start, end:card.end };
-      lines.push('CARD:');
-      lines.push('CARD_INDEX: ' + (cardIndex + 1));
-      lines.push('KIND: ' + (card.kind || 'generic'));
-      lines.push('TITLE: ' + (card.title || ''));
-      lines.push('SOURCE: ' + (card.source || getCurrentStoryMediaLabel() || ''));
-      lines.push('TRACK: ' + track);
-      if (range && range.start != null) lines.push('IN: ' + storyFormatBackupTime(range.start));
-      if (range && range.end != null) lines.push('OUT: ' + storyFormatBackupTime(range.end));
-      lines.push('LABEL_GROUP: ' + (card.labelGroup || ''));
-      lines.push('LABEL: ' + (card.label || ''));
-      lines.push('CUE_IDS: ' + ((storyEffectiveCueRefs(card) || card.cueRefs || []).join(',')));
-      if (card.notes) { lines.push('NOTES:'); lines.push(String(card.notes || '')); }
-      lines.push('TEXT:');
-      lines.push(storyCardToPlainLines(card));
-      lines.push('END_CARD');
-      lines.push('');
-    });
-    lines.push('END_ROW');
-    lines.push('');
-  });
+  lines.push(`┌────────────────────────────────────────────────────────────`);
+  lines.push(`│ ${rowIndex + 1}.${cardIndex + 1}  ${title}`);
+  lines.push(`│ ${labels.length ? labels.map(x => '[' + x + ']').join(' ') + '  ' : ''}IN ${inTc || '—'}   OUT ${outTc || '—'}`);
+  lines.push(`├─ Cue Text / Story Body`);
+  if (bodyText) bodyText.split(/\r?\n/).forEach(line => lines.push(`│ ${line}`));
+  else lines.push('│ ');
+  if (includeNotes && notes){
+    lines.push(`├─ Notes`);
+    notes.split(/\r?\n/).forEach(line => lines.push(`│ ${line}`));
+  }
+  if (opts.includeTechnical){
+    const refs = Array.isArray(clean.cueRefs) ? clean.cueRefs.join(',') : '';
+    lines.push(`├─ Technical cue refs: ${refs || 'none'}`);
+  }
+  lines.push(`└────────────────────────────────────────────────────────────`);
   return lines.join('\n');
 }
-async function exportStoryToGoogleDocBackup(){
-  const text = storyPlainTextForBackup();
-  const project = (suggestBaseName?.() || window.currentBaseName || 'story');
-  const title = `${project} - Story Backup - ${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}`;
-  setStatusSafe?.('Exporting Story backup to Google Doc…');
-  const res = await fetch(`${API_BASE}/api/google_doc_story/export`, {
-    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ title, text })
+
+function storyGoogleDocReviewTextForExport(payload, opts={}){
+  const includeNotes = opts.includeNotes !== false;
+  const includeLabels = opts.includeLabels !== false;
+  const project = payload.project || payload.media || 'Story Assembly';
+  const lines = [];
+  lines.push(`STORY ASSEMBLY — ${project}`);
+  lines.push(`Exported: ${payload.exportedAt || new Date().toISOString()}`);
+  lines.push('');
+  lines.push('This tab is the clean collaboration view. Edit/comment here freely. The app uses the “Transcriber Backup” tab for reliable Fetch From Google Doc restoration.');
+  lines.push('');
+  (storyRows || []).forEach((row, rowIndex) => {
+    lines.push(`ROW ${rowIndex + 1}`);
+    (row.cards || []).forEach((card, cardIndex) => {
+      lines.push(storyGoogleDocCardVisibleText(card, rowIndex, cardIndex, { includeTechnical:false, includeNotes, includeLabels }));
+      lines.push('');
+    });
   });
-  const data = await res.json().catch(()=>({}));
-  if (!res.ok || data?.ok === false) throw new Error(data?.detail || data?.error || `HTTP ${res.status}`);
-  const url = data.url || data.document_url || '';
-  setStatusSafe?.('Story backup exported to Google Doc.');
-  const msg = url ? `Story backup created:\n${url}` : 'Story backup created.';
-  if (url && confirm(msg + '\n\nOpen it now?')) window.open(url, '_blank', 'noopener');
-  else alert(msg);
+  if ((storyRows || []).length === 0) lines.push('(No Story Cards yet.)');
+  return lines.join('\n').replace(/\n{4,}/g, '\n\n\n');
 }
-function storyBackupSections(text){
+
+function storyGoogleDocPlainTextForExport(payload, opts={}){
+  const includeTechnical = !!opts.includeTechnical;
+  const includeNotes = opts.includeNotes !== false;
+  const includeLabels = opts.includeLabels !== false;
+  const project = payload.project || payload.media || 'Story Assembly';
+  const metaB64 = storyBase64EncodeUnicode(payload);
+  const lines = [];
+  lines.push('[[TRANSCRIBER_STORY_EXPORT_START]]');
+  lines.push('[[TRANSCRIBER_STORY_EXPORT_META_JSON_START]]');
+  lines.push(metaB64);
+  lines.push('[[TRANSCRIBER_STORY_EXPORT_META_JSON_END]]');
+  lines.push('');
+  lines.push(`STORY ASSEMBLY — ${project}`);
+  lines.push(`Exported: ${payload.exportedAt || new Date().toISOString()}`);
+  lines.push(`Format: Google Doc review table + machine-readable Story metadata`);
+  lines.push('');
+  lines.push('Tip: You can edit the visible rows for review. Keep the TRANSCRIBER markers if you want Fetch From Google Doc to restore the full assembly accurately.');
+  lines.push('');
+  lines.push('[[TRANSCRIBER_STORY_TABLE_START]]');
+  (storyRows || []).forEach((row, rowIndex) => {
+    lines.push('');
+    lines.push(`ROW ${rowIndex + 1}`);
+    (row.cards || []).forEach((card, cardIndex) => {
+      const clean = cleanStoryCardForShare(card);
+      lines.push(storyGoogleDocCardVisibleText(card, rowIndex, cardIndex, { includeTechnical, includeNotes, includeLabels }));
+      lines.push('[[TRANSCRIBER_CARD_META_JSON_START]]');
+      lines.push(storyBase64EncodeUnicode({ rowIndex, cardIndex, rowId:row.id, card:clean }));
+      lines.push('[[TRANSCRIBER_CARD_META_JSON_END]]');
+    });
+  });
+  lines.push('[[TRANSCRIBER_STORY_TABLE_END]]');
+  lines.push('[[TRANSCRIBER_STORY_EXPORT_END]]');
+  return lines.join('\n');
+}
+function storyPlainTextForBackup(){
+  ensureStorySeed();
+  return storyGoogleDocPlainTextForExport(storyGoogleDocExportPayload(), { includeTechnical:true });
+}
+function storyExtractGoogleDocMetaPayload(text){
+  const src = String(text || '').replace(/\r\n/g,'\n').replace(/\r/g,'\n');
+  const m = src.match(/\[\[TRANSCRIBER_STORY_EXPORT_META_JSON_START\]\]\s*([\s\S]*?)\s*\[\[TRANSCRIBER_STORY_EXPORT_META_JSON_END\]\]/i);
+  if (!m) return null;
+  try{ return JSON.parse(storyBase64DecodeUnicode(m[1])); }catch(err){ console.warn('Google Doc Story metadata parse failed', err); return null; }
+}
+function storyExtractGoogleDocCardMetaRows(text){
+  const src = String(text || '').replace(/\r\n/g,'\n').replace(/\r/g,'\n');
+  const matches = [...src.matchAll(/\[\[TRANSCRIBER_CARD_META_JSON_START\]\]\s*([\s\S]*?)\s*\[\[TRANSCRIBER_CARD_META_JSON_END\]\]/gi)];
+  if (!matches.length) return [];
+  const rows = [];
+  matches.forEach((m, fallbackIndex) => {
+    try{
+      const meta = JSON.parse(storyBase64DecodeUnicode(m[1]));
+      const rowIndex = Math.max(0, Number(meta.rowIndex ?? fallbackIndex) || 0);
+      while (rows.length <= rowIndex) rows.push(createStoryRow());
+      rows[rowIndex].cards = rows[rowIndex].cards || [];
+      rows[rowIndex].cards.push(normalizeImportedStoryCard(meta.card || {}, { forceSnapshotBody:true, pendingRelink:true }));
+    }catch(err){ console.warn('Google Doc card metadata parse failed', err); }
+  });
+  return rows.filter(r => (r.cards || []).length);
+}
+function storyLegacyBackupSections(text){
   const rows = [];
   const src = String(text || '').replace(/\r\n/g,'\n').replace(/\r/g,'\n');
   const rowParts = src.split(/^---\s*STORY\s+ROW\s+\d+\s*---\s*$/gmi).slice(1);
@@ -6505,36 +6847,182 @@ function storyBackupSections(text){
       const cueIds = getSingle('CUE_IDS').split(',').map(x=>x.trim()).filter(Boolean);
       let validCueRefs = cueIds.filter(id => !!storyCueById(id, track));
       if (!validCueRefs.length && start != null && end != null) validCueRefs = storyCueRefsForRange(start, end, track);
-      const card = {
-        id: makeStoryCardId(), kind, title:getSingle('TITLE'), source:getSingle('SOURCE') || getCurrentStoryMediaLabel(),
-        track, start, end, cueRefs: validCueRefs, sourceCueRefs:[...validCueRefs], labelGroup:getSingle('LABEL_GROUP') || 'shot', label:getSingle('LABEL') || '',
-        body:'', bodyManual:false, notes:getLong('NOTES', ['TEXT','END_CARD']), notesOpen:false,
-      };
       const textBody = getLong('TEXT', ['NOTES','END_CARD']);
-      if (!validCueRefs.length && textBody){ card.body = textBody; card.bodyManual = true; }
+      const card = normalizeImportedStoryCard({
+        kind, title:getSingle('TITLE'), source:getSingle('SOURCE') || getCurrentStoryMediaLabel(), track,
+        start, end, cueRefs:validCueRefs, sourceCueRefs:[...validCueRefs], labelGroup:getSingle('LABEL_GROUP') || 'shot', label:getSingle('LABEL') || '',
+        body:textBody, bodyHtml:storyPlainTextToRichHtml(textBody), bodyManual:!validCueRefs.length,
+        notes:getLong('NOTES', ['TEXT','END_CARD'])
+      }, { forceSnapshotBody:true, pendingRelink:true });
       row.cards.push(card);
     });
     if (row.cards.length) rows.push(row);
   });
   return rows;
 }
+function storyRowsFromGoogleDocText(text){
+  const meta = storyExtractGoogleDocMetaPayload(text);
+  if (meta){
+    const rows = normalizeImportedStoryRows(meta, { forceSnapshotBody:true, pendingRelink:true });
+    if (rows.length) return { rows, source:'metadata' };
+  }
+  const cardRows = storyExtractGoogleDocCardMetaRows(text);
+  if (cardRows.length) return { rows:cardRows, source:'card-metadata' };
+  const legacy = storyLegacyBackupSections(text);
+  if (legacy.length) return { rows:legacy, source:'legacy' };
+  return { rows:[], source:'none' };
+}
+function storyGoogleApiErrorMessage(data, res){
+  const raw = data?.detail || data?.error || data?.message || '';
+  let msg = '';
+  if (typeof raw === 'string') msg = raw;
+  else { try { msg = JSON.stringify(raw, null, 2); } catch { msg = String(raw); } }
+  if (!msg) msg = `HTTP ${res?.status || ''}`.trim();
+  if (/SERVICE_DISABLED|docs\.googleapis\.com|Google Docs API is disabled/i.test(msg)){
+    return msg + '\n\nThis is a Google Cloud project setup issue, not a Story Mode export-format issue. Enable the Google Docs API for the same Google Cloud project used by your OAuth Client ID, wait a few minutes, then reconnect Google and retry.';
+  }
+  return msg;
+}
+async function storyRefreshGoogleDocExportStatus(){
+  const statusEl = document.getElementById('storyGoogleDocStatus');
+  if (!statusEl) return;
+  try{
+    const res = await fetch(`${API_BASE}/api/youtube_export/status`);
+    const data = await res.json().catch(()=>({}));
+    if (!res.ok) throw new Error(data?.detail || data?.error || `HTTP ${res.status}`);
+    const docsOk = !!data.google_docs_connected;
+    const connected = !!data.connected;
+    if (connected && docsOk) statusEl.innerHTML = `✅ Google connected for Docs export.`;
+    else if (connected) statusEl.innerHTML = `⚠️ Google connected, but Google Docs scope is missing. Reconnect and accept Docs permission.`;
+    else statusEl.innerHTML = `Not connected. Use Connect/Reconnect, then try export again.`;
+  }catch(err){ statusEl.textContent = 'Connection status unavailable: ' + (err?.message || err); }
+}
+function ensureStoryGoogleDocExportModal(){
+  let modal = document.getElementById('storyGoogleDocExportModal');
+  if (modal) return modal;
+  modal = document.createElement('div');
+  modal.id = 'storyGoogleDocExportModal';
+  modal.className = 'story-google-doc-modal hidden';
+  modal.innerHTML = `
+    <div class="story-google-doc-panel">
+      <div class="story-google-doc-head">
+        <div><h3>Export Story Assembly to Google Doc</h3><p>Creates two Google Doc tabs: a clean table-style Story Assembly view and a Transcriber Backup tab for Fetch From Google Doc.</p></div>
+        <button class="btn btn-outline" type="button" data-story-gdoc-close>×</button>
+      </div>
+      <div class="story-google-doc-grid">
+        <section class="story-gdoc-section">
+          <h4>1. Google connection</h4>
+          <div id="storyGoogleDocStatus" class="story-gdoc-status">Checking…</div>
+          <button class="btn btn-outline" type="button" id="storyGoogleDocReconnect">Connect / Reconnect Google</button>
+          <div class="story-gdoc-api-note">If export returns <b>SERVICE_DISABLED</b>, enable the <b>Google Docs API</b> in the same Google Cloud project as your OAuth Client ID, then reconnect.</div>
+        </section>
+        <section class="story-gdoc-section">
+          <h4>2. Destination</h4>
+          <label>Google Doc URL <input id="storyGoogleDocUrl" type="url" placeholder="Leave blank to create a new Google Doc"></label>
+          <label>New document title <input id="storyGoogleDocTitle" type="text"></label>
+        </section>
+        <section class="story-gdoc-section">
+          <h4>3. Export mode</h4>
+          <label><input type="radio" name="storyGoogleDocMode" value="create" checked> Create new Google Doc</label>
+          <label><input type="radio" name="storyGoogleDocMode" value="replace_section"> Replace previous Transcriber export section</label>
+          <label><input type="radio" name="storyGoogleDocMode" value="append"> Append to bottom</label>
+          <label><input type="radio" name="storyGoogleDocMode" value="replace_all"> Clear document and replace all</label>
+        </section>
+        <section class="story-gdoc-section">
+          <h4>4. Include</h4>
+          <div class="story-gdoc-api-note">Export creates <b>Story Assembly</b> as a real Google Docs table for collaboration and <b>Transcriber Backup</b> for safe restore/fetch.</div>
+          <label><input type="checkbox" id="storyGoogleDocIncludeNotes" checked> Notes</label>
+          <label><input type="checkbox" id="storyGoogleDocIncludeLabels" checked> Labels / status</label>
+          <label><input type="checkbox" id="storyGoogleDocIncludeTechnical"> Technical cue refs</label>
+          <label><input type="checkbox" id="storyGoogleDocSafety" checked> Preserve content outside Transcriber export markers</label>
+        </section>
+      </div>
+      <div class="story-google-doc-preview" id="storyGoogleDocPreview"></div>
+      <div class="story-google-doc-foot">
+        <button class="btn btn-outline" type="button" data-story-gdoc-close>Cancel</button>
+        <button class="btn btn-gold" type="button" id="storyGoogleDocRunExport">Export Now</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+  modal.querySelectorAll('[data-story-gdoc-close]').forEach(btn => btn.addEventListener('click', () => modal.classList.add('hidden')));
+  modal.querySelector('#storyGoogleDocReconnect')?.addEventListener('click', () => {
+    if (typeof connectYouTubeExportAccount === 'function') connectYouTubeExportAccount();
+    else alert('Use the YouTube/Google export settings to connect your Google account first.');
+  });
+  const updatePreview = () => {
+    const count = (storyRows || []).reduce((n,r)=>n+(r.cards?.length||0),0);
+    const mode = modal.querySelector('input[name="storyGoogleDocMode"]:checked')?.value || 'create';
+    const url = modal.querySelector('#storyGoogleDocUrl')?.value?.trim() || '';
+    const pv = modal.querySelector('#storyGoogleDocPreview');
+    if (pv) pv.innerHTML = `<b>Preview</b><br>${count} Story Card(s) will be exported as a real Google Docs review table.<br>Mode: ${escapeHtml(mode.replace('_',' '))}${url ? `<br>Destination: ${escapeHtml(url)}` : '<br>Destination: new Google Doc'}<br><span class="muted">Fetch From Google Doc will read the embedded metadata first, then relink cues to the current transcript.</span>`;
+  };
+  modal.addEventListener('input', updatePreview);
+  modal.addEventListener('change', updatePreview);
+  modal.querySelector('#storyGoogleDocRunExport')?.addEventListener('click', () => storyRunGoogleDocExportFromModal().catch(err => alert('Google Doc export failed: ' + (err?.message || err))));
+  return modal;
+}
+function exportStoryToGoogleDocBackup(){
+  ensureStorySeed();
+  const modal = ensureStoryGoogleDocExportModal();
+  const title = `${suggestBaseName?.() || window.currentBaseName || 'story'} - Story Assembly`;
+  const titleEl = modal.querySelector('#storyGoogleDocTitle');
+  if (titleEl && !titleEl.value) titleEl.value = title;
+  modal.classList.remove('hidden');
+  storyRefreshGoogleDocExportStatus();
+  modal.dispatchEvent(new Event('change'));
+}
+async function storyRunGoogleDocExportFromModal(){
+  const modal = ensureStoryGoogleDocExportModal();
+  const payload = storyGoogleDocExportPayload();
+  const includeTechnical = !!modal.querySelector('#storyGoogleDocIncludeTechnical')?.checked;
+  const includeNotes = !!modal.querySelector('#storyGoogleDocIncludeNotes')?.checked;
+  const includeLabels = !!modal.querySelector('#storyGoogleDocIncludeLabels')?.checked;
+  const backupText = storyGoogleDocPlainTextForExport(payload, { includeTechnical:true, includeNotes:true, includeLabels:true });
+  const cleanText = storyGoogleDocReviewTextForExport(payload, { includeNotes, includeLabels });
+  const project = (suggestBaseName?.() || window.currentBaseName || 'story');
+  const title = modal.querySelector('#storyGoogleDocTitle')?.value?.trim() || `${project} - Story Assembly`;
+  const url = modal.querySelector('#storyGoogleDocUrl')?.value?.trim() || '';
+  const mode = modal.querySelector('input[name="storyGoogleDocMode"]:checked')?.value || 'create';
+  if (mode !== 'create' && !url) throw new Error('Paste a Google Doc URL, or choose Create new Google Doc.');
+  if (mode === 'replace_all' && !confirm('This will clear the target Google Doc and replace it with this Story Assembly. Continue?')) return;
+  setStatusSafe?.('Exporting Story assembly to Google Doc…');
+  const res = await fetch(`${API_BASE}/api/google_doc_story/export`, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ title, text:backupText, clean_text:cleanText, backup_text:backupText, url, mode, story_json:payload, format:'story_tabs_table_v4', use_tabs:true })
+  });
+  const data = await res.json().catch(()=>({}));
+  if (!res.ok || data?.ok === false) throw new Error(storyGoogleApiErrorMessage(data, res));
+  const outUrl = data.url || data.document_url || url || '';
+  const urlEl = modal.querySelector('#storyGoogleDocUrl');
+  if (urlEl && outUrl) urlEl.value = outUrl;
+  modal.classList.add('hidden');
+  setStatusSafe?.('Story assembly exported to Google Doc.');
+  if (outUrl && confirm(`Story assembly exported.\n\n${outUrl}\n\nOpen it now?`)) window.open(outUrl, '_blank', 'noopener');
+}
 async function fetchStoryFromGoogleDocBackup(){
   const url = prompt('Paste the Google Doc backup/review URL:');
   if (!url) return;
-  setStatusSafe?.('Fetching Story backup from Google Doc…');
+  setStatusSafe?.('Fetching Story assembly from Google Doc…');
   const res = await fetch(`${API_BASE}/api/google_doc_story/fetch`, {
     method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ url })
   });
   const data = await res.json().catch(()=>({}));
-  if (!res.ok || data?.ok === false) throw new Error(data?.detail || data?.error || `HTTP ${res.status}`);
-  const parsedRows = storyBackupSections(data.text || '');
-  if (!parsedRows.length) throw new Error('No Story Cards were found in this Google Doc backup.');
-  const replace = confirm(`Found ${parsedRows.reduce((n,r)=>n+(r.cards?.length||0),0)} Story Cards.\n\nOK = Replace current Story Mode\nCancel = Append to current Story Mode`);
+  if (!res.ok || data?.ok === false) throw new Error(storyGoogleApiErrorMessage(data, res));
+  const parsed = storyRowsFromGoogleDocText(data.text || '');
+  const parsedRows = parsed.rows || [];
+  if (!parsedRows.length) throw new Error('No Story Cards were found in this Google Doc. Keep the TRANSCRIBER markers, or export again using the new Story Google Doc format.');
+  const relinkStats = storyRelinkImportedStoryRows(parsedRows, { force:true, preserveSnapshotBody:true });
+  const cardCount = parsedRows.reduce((n,r)=>n+(r.cards?.length||0),0);
+  const replace = confirm(`Found ${cardCount} Story Card(s) from Google Doc (${parsed.source}).\n\nOK = Replace current Story Mode\nCancel = Append to current Story Mode`);
   if (replace) storyRows = parsedRows;
   else storyRows.push(...parsedRows);
+  ensureStorySeed();
   renderStoryAssembly();
   storyCommitSharedState(true);
-  setStatusSafe?.('Story backup loaded from Google Doc.');
+  const relinkMsg = relinkStats.pending
+    ? ` ${relinkStats.pending} card(s) are pending transcript relink.`
+    : ` ${relinkStats.linked} card(s) linked to live cues; ${relinkStats.generic} kept as generic.`;
+  setStatusSafe?.(`Story assembly loaded from Google Doc.${relinkMsg}`);
 }
 
 async function storySendCardForAlignToAudio(rowId, cardId){
@@ -8138,12 +8626,12 @@ async function refreshYouTubeExportStatus(){
     if (redirEl && data.redirect_uri) redirEl.textContent = data.redirect_uri;
     if (statusEl2){
       const docsOk = !!data.google_docs_connected;
-      const base = data.connected ? '✅ Connected to YouTube' : data.configured ? '⚠️ Credentials saved. Connect account next.' : 'Not configured.';
+      const base = data.connected ? '✅ Google account connected' : data.configured ? '⚠️ Credentials saved. Connect account next.' : 'Not configured.';
       const docsMsg = data.connected ? (docsOk ? ' · Google Docs backup enabled' : ' · ⚠️ Google Docs backup needs reconnect') : '';
       statusEl2.innerHTML = `${base}${docsMsg}<br><span class="muted">OAuth scopes: ${escapeHtml((data.scopes || []).join(', '))}</span>`;
     }
   }catch(err){
-    if (statusEl2) statusEl2.textContent = 'YouTube export status failed: ' + (err?.message || err);
+    if (statusEl2) statusEl2.textContent = 'Google/YouTube export status failed: ' + (err?.message || err);
   }
 }
 
@@ -8172,16 +8660,17 @@ async function connectYouTubeExportAccount(){
     const res = await fetch(`${API_BASE}/api/youtube_export/auth_url?force=1`);
     const data = await res.json().catch(()=>({}));
     if (!res.ok || !data.auth_url) throw new Error(data?.detail || data?.error || `HTTP ${res.status}`);
-    window.open(data.auth_url, 'youtubeExportOAuth', 'width=720,height=820');
+    window.open(data.auth_url, 'googleExportOAuth', 'width=720,height=820');
   }catch(err){
-    alert('YouTube connect failed: ' + (err?.message || err));
+    alert('Google connect failed: ' + (err?.message || err));
   }
 }
 
 window.addEventListener('message', (ev) => {
   if (ev?.data?.type === 'youtube-export-connected'){
     refreshYouTubeExportStatus();
-    setStatusSafe('YouTube account connected.');
+    if (typeof storyRefreshGoogleDocExportStatus === 'function') storyRefreshGoogleDocExportStatus();
+    setStatusSafe('Google account connected.');
   }
 });
 
@@ -11879,13 +12368,16 @@ function ensureLeftPanelControlSurface(){
       #txtBigBox:not([readonly]){ background:#0e1116; }
 
       #leftMiniDrawerHost{ display:flex; flex-direction:column; align-items:center; justify-content:center; gap:6px; min-height:0; width:100%; container-type:inline-size; }
-      .left-settings-shell{ display:flex; flex-direction:column; gap:7px; align-items:stretch; }
-      .left-settings-toggle{ height:34px; border-radius:999px; justify-content:center; letter-spacing:.01em; }
-      .left-settings-toggle::after{ content:'▾'; font-size:10px; opacity:.7; margin-left:6px; transform:translateY(-1px); }
+      .left-view-mode-shell,.left-settings-shell{ display:flex; flex-direction:column; gap:7px; align-items:stretch; width:100%; }
+      .left-view-mode-toggle,.left-settings-toggle{ height:34px; border-radius:999px; justify-content:center; letter-spacing:.01em; width:100%; }
+      .left-view-mode-toggle::after,.left-settings-toggle::after{ content:'▾'; font-size:10px; opacity:.7; margin-left:6px; transform:translateY(-1px); }
+      .left-view-mode-shell:not(.is-open) #leftViewModeBody{ display:none; }
+      .left-view-mode-shell:not(.is-open) .left-view-mode-toggle::after,.left-settings-shell:not(.is-open) .left-settings-toggle::after{ content:'▸'; }
+      .left-view-mode-shell.is-open #leftViewModeBody{ display:block; }
+      #leftViewModeBody{ padding:8px; border-radius:14px; border:1px solid rgba(255,255,255,.08); background:rgba(255,255,255,.035); box-sizing:border-box; }
+      .left-view-mode-shell.is-open .left-view-mode-toggle,.left-settings-shell.is-open .left-settings-toggle{ border-color:rgba(255,255,255,.16); background:rgba(255,255,255,.055); }
       .left-settings-shell:not(.is-open) #mediaSettingsDock{ display:none; }
-      .left-settings-shell:not(.is-open) .left-settings-toggle::after{ content:'▸'; }
       .left-settings-shell.is-open #mediaSettingsDock{ display:grid; }
-      .left-settings-shell.is-open .left-settings-toggle{ border-color:rgba(255,255,255,.16); background:rgba(255,255,255,.055); }
       #leftDrawerHost{ display:flex; flex-direction:column; align-items:stretch; gap:8px; }
       .left-drawer{ display:none; width:100%; box-sizing:border-box; padding:12px; border-radius:16px; background:linear-gradient(180deg, rgba(255,255,255,.055), rgba(255,255,255,.032)); border:1px solid rgba(255,255,255,.09); box-shadow:0 12px 30px rgba(0,0,0,.16); color:#e9edf1; }
       .left-drawer.is-open{ display:block; }
@@ -11928,8 +12420,9 @@ function ensureLeftPanelControlSurface(){
       #videoStyleBar .ui-dark-color{ justify-self:start; width:44px; max-width:100%; }
       .caption-max-row{ display:grid !important; grid-template-columns:78px minmax(0,1fr) !important; align-items:center; gap:10px; width:100%; font-size:12px; color:rgba(233,237,241,.74); }
       .caption-max-row input{ width:100%; min-width:0; box-sizing:border-box; text-align:center; }
-      #viewModeBar{ margin:0 !important; display:flex; flex-direction:column; align-items:stretch; gap:8px; }
-      #viewModeBar .seg-toggle{ width:100%; display:grid; grid-template-columns:1fr 1fr; }
+      #viewModeBar{ margin:0 !important; display:flex; flex-direction:column; align-items:stretch; gap:8px; width:100%; }
+      #viewModeBar .seg-toggle{ width:100%; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); }
+      #viewModeBar .seg-toggle .seg{ min-width:0; padding-inline:8px; }
       #viewModeBar .txt-tools{ flex-wrap:wrap; }
       #whisperBar{ display:none !important; }
       .left-whisper-hidden{ display:none !important; }
@@ -11956,11 +12449,14 @@ function ensureLeftPanelControlSurface(){
   surface.innerHTML = `
     <div class="left-status-backend" id="leftStatusBackend"></div>
     <div class="left-progress-strip" id="leftProgressStrip"></div>
+    <div class="left-view-mode-shell" id="leftViewModeShell">
+      <button class="btn btn-outline left-view-mode-toggle" id="leftViewModeToggle" type="button" aria-expanded="false">View Mode</button>
+      <div class="left-view-mode-body" id="leftViewModeBody"></div>
+    </div>
     <div class="left-settings-shell" id="leftSettingsShell">
       <button class="btn btn-outline left-settings-toggle" id="leftSettingsToggle" type="button" aria-expanded="false">Settings</button>
       <div class="left-dock" id="mediaSettingsDock" aria-label="Media settings">
         <button class="btn btn-outline left-dock-btn" data-left-drawer="source" type="button">Source TC</button>
-        <button class="btn btn-outline left-dock-btn" data-left-drawer="view" type="button">View Mode</button>
         <button class="btn btn-outline left-dock-btn" data-left-drawer="font" type="button">Font</button>
         <button class="btn btn-outline left-dock-btn" data-left-drawer="tips" type="button">Tips</button>
       </div>
@@ -12097,7 +12593,8 @@ function ensureLeftPanelControlSurface(){
   const tcOrigin = move('tcOriginBar', sourceBody);
   if (!tcMini && !tcOrigin){ sourceBody.innerHTML += '<div class="left-tool-note">Source TC controls are unavailable.</div>'; }
 
-  const viewBar = move('viewModeBar', viewBody);
+  const leftViewModeBody = document.getElementById('leftViewModeBody');
+  const viewBar = move('viewModeBar', leftViewModeBody || viewBody);
   if (viewBar) viewBar.classList.add('view-mode-embedded');
   const styleBar = move('videoStyleBar', fontBody);
   const captionFontColumn = styleBar?.querySelector?.('#captionFontColumn') || fontBody;
@@ -12214,6 +12711,18 @@ function ensureLeftPanelControlSurface(){
   const whisperBar = document.getElementById('whisperBar');
   if (whisperBar) whisperBar.classList.add('left-whisper-hidden');
 
+  const viewModeShell = document.getElementById('leftViewModeShell');
+  const viewModeToggle = document.getElementById('leftViewModeToggle');
+  const savedViewModeOpen = localStorage.getItem('leftPanelViewModeOpen') === '1';
+  const setViewModeOpen = (open) => {
+    if (!viewModeShell || !viewModeToggle) return;
+    viewModeShell.classList.toggle('is-open', !!open);
+    viewModeToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    localStorage.setItem('leftPanelViewModeOpen', open ? '1' : '0');
+  };
+  setViewModeOpen(savedViewModeOpen);
+  viewModeToggle?.addEventListener('click', () => setViewModeOpen(!viewModeShell.classList.contains('is-open')));
+
   const settingsShell = document.getElementById('leftSettingsShell');
   const settingsToggle = document.getElementById('leftSettingsToggle');
   const savedSettingsOpen = localStorage.getItem('leftPanelSettingsOpen') === '1';
@@ -12223,7 +12732,7 @@ function ensureLeftPanelControlSurface(){
     settingsToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
     localStorage.setItem('leftPanelSettingsOpen', open ? '1' : '0');
     if (!open){
-      ['source','view','font','tips'].forEach(n => {
+      ['source','font','tips'].forEach(n => {
         const d = document.querySelector(`.left-drawer[data-drawer="${n}"]`);
         if (d) d.classList.remove('is-open');
         const b = document.querySelector(`[data-left-drawer="${n}"]`);
@@ -12243,7 +12752,7 @@ function ensureLeftPanelControlSurface(){
   });
 
   function openLeftDrawer(name){
-    if (['source','view','font','tips'].includes(name || '')) setSettingsOpen(true);
+    if (['source','font','tips'].includes(name || '')) setSettingsOpen(true);
     surface.querySelectorAll('.left-dock-btn').forEach(b => b.classList.toggle('is-active', !!name && b.getAttribute('data-left-drawer') === name));
     surface.querySelectorAll('.left-drawer').forEach(d => d.classList.toggle('is-open', !!name && d.dataset.drawer === name));
     if (name) localStorage.setItem('leftPanelOpenDrawer', name); else localStorage.removeItem('leftPanelOpenDrawer');
@@ -12253,6 +12762,7 @@ function ensureLeftPanelControlSurface(){
   window.openLeftPanelDrawer = openLeftDrawer;
   let saved = localStorage.getItem('leftPanelOpenDrawer');
   if (saved === 'captions') saved = 'font';
+  if (saved === 'view') saved = '';
   if (saved) openLeftDrawer(saved);
 }
 
