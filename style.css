@@ -3577,7 +3577,7 @@ body.theme-light .mobile-floating-drawer-close{
 .story-card-stack{display:flex;flex-direction:column;flex-wrap:nowrap;gap:10px;align-content:stretch;}
 .story-card{position:relative;width:100%;min-width:0;max-width:none;border:1px solid rgba(255,255,255,.10);border-radius:14px;background:linear-gradient(180deg, rgba(18,21,26,.92), rgba(12,14,18,.92));padding:10px;display:flex;flex-direction:column;gap:8px;box-shadow:0 8px 20px rgba(0,0,0,.22);}
 .story-card.is-live{border-color:rgba(215,180,106,.28);}
-.story-card-top{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;gap:8px;align-items:center;}
+.story-card-top{display:grid;grid-template-columns:auto auto minmax(0,1fr) auto auto;gap:8px;align-items:center;}
 .story-card-title{width:100%;min-width:0;border:1px solid rgba(255,255,255,.10);border-radius:10px;background:rgba(0,0,0,.18);color:var(--ink);padding:8px 10px;outline:none;font-size:14px;}
 .story-live-dot{width:9px;height:9px;border-radius:999px;background:#6aa8ff;box-shadow:0 0 0 3px rgba(106,168,255,.12);}
 .story-card.is-live .story-live-dot{background:var(--gold);box-shadow:0 0 0 3px rgba(215,180,106,.16);}
@@ -4995,4 +4995,214 @@ body.theme-light .story-cue-range-actions .story-cue-range-apply{
   background:#f6f1e6;
   color:#7b5615;
   border-color:#b8892f;
+}
+
+/* Story Mode Google Doc export modal */
+.story-google-doc-modal{
+  position:fixed; inset:0; z-index:10080; display:flex; align-items:center; justify-content:center;
+  background:rgba(15,23,42,.48); backdrop-filter:blur(8px); padding:20px;
+}
+.story-google-doc-modal.hidden{ display:none !important; }
+.story-google-doc-panel{
+  width:min(920px, 96vw); max-height:88vh; overflow:auto; background:#fff; color:#202124;
+  border:1px solid rgba(15,23,42,.14); border-radius:18px; box-shadow:0 24px 80px rgba(15,23,42,.32);
+}
+.story-google-doc-head{
+  display:flex; align-items:flex-start; justify-content:space-between; gap:16px; padding:18px 20px 12px;
+  border-bottom:1px solid #dadce0; position:sticky; top:0; background:#fff; z-index:2;
+}
+.story-google-doc-head h3{ margin:0 0 4px; font-size:18px; font-weight:750; color:#202124; }
+.story-google-doc-head p{ margin:0; color:#5f6368; font-size:13px; }
+.story-google-doc-grid{ display:grid; grid-template-columns:1fr 1fr; gap:14px; padding:16px 20px; }
+.story-gdoc-section{ border:1px solid #dadce0; border-radius:12px; padding:13px; background:#fff; display:flex; flex-direction:column; gap:9px; }
+.story-gdoc-section h4{ margin:0 0 2px; font-size:13px; font-weight:750; color:#3c4043; }
+.story-gdoc-section label{ display:flex; flex-direction:column; gap:5px; font-size:12px; color:#3c4043; }
+.story-gdoc-section label:has(input[type="radio"]), .story-gdoc-section label:has(input[type="checkbox"]){ flex-direction:row; align-items:center; gap:8px; }
+.story-gdoc-section input[type="url"], .story-gdoc-section input[type="text"]{
+  height:34px; border:1px solid #dadce0; border-radius:8px; padding:0 10px; color:#202124; background:#fff; font-size:13px;
+}
+.story-gdoc-section input[type="url"]:focus, .story-gdoc-section input[type="text"]:focus{ outline:none; border-color:#1a73e8; box-shadow:0 0 0 2px rgba(26,115,232,.12); }
+.story-gdoc-status{ border-radius:10px; background:#f8fafd; border:1px solid #e8eaed; padding:9px 10px; color:#3c4043; font-size:12px; }
+.story-google-doc-preview{ margin:0 20px 14px; padding:12px 14px; border:1px solid #dadce0; border-radius:12px; background:#f8fafd; color:#3c4043; font-size:13px; line-height:1.45; }
+.story-google-doc-foot{ display:flex; justify-content:flex-end; gap:10px; padding:14px 20px 18px; border-top:1px solid #dadce0; background:#fff; position:sticky; bottom:0; }
+@media (max-width: 760px){ .story-google-doc-grid{ grid-template-columns:1fr; } .story-google-doc-panel{ width:98vw; } }
+.story-gdoc-api-note{
+  border-radius:10px;
+  background:#fff8e1;
+  border:1px solid #fbbc04;
+  color:#5f4300;
+  padding:8px 10px;
+  font-size:12px;
+  line-height:1.4;
+}
+
+/* Patch: Story Mode button layout in two rows */
+#storyMode .story-actions-two-row{
+  display:flex;
+  flex-direction:column;
+  align-items:flex-end;
+  gap:7px;
+}
+#storyMode .story-action-row{
+  display:flex;
+  align-items:center;
+  justify-content:flex-end;
+  gap:8px;
+  flex-wrap:wrap;
+}
+#storyMode .story-action-row .btn,
+#storyMode .story-sub-top{
+  min-height:34px;
+}
+@media (max-width: 860px){
+  #storyMode .story-actions-two-row,
+  #storyMode .story-action-row{
+    align-items:flex-start;
+    justify-content:flex-start;
+  }
+}
+
+/* Patch: compact Story Mode secondary actions as dropdown menus */
+#storyMode .story-action-menu{
+  position:relative;
+  display:inline-flex;
+  align-items:center;
+}
+#storyMode .story-menu-trigger{
+  white-space:nowrap;
+  min-width:0;
+}
+#storyMode .story-action-menu-pop{
+  position:absolute;
+  top:calc(100% + 6px);
+  right:0;
+  z-index:80;
+  min-width:190px;
+  display:none;
+  flex-direction:column;
+  gap:4px;
+  padding:6px;
+  border:1px solid var(--line);
+  border-radius:12px;
+  background:var(--bg-elev);
+  box-shadow:0 14px 34px rgba(0,0,0,.28);
+}
+#storyMode .story-action-menu.is-open .story-action-menu-pop,
+#storyMode .story-action-menu:focus-within .story-action-menu-pop{
+  display:flex;
+}
+#storyMode .story-action-menu-pop button{
+  appearance:none;
+  border:0;
+  border-radius:9px;
+  background:transparent;
+  color:var(--ink);
+  text-align:left;
+  padding:8px 10px;
+  cursor:pointer;
+  font-size:13px;
+  line-height:1.2;
+}
+#storyMode .story-action-menu-pop button:hover,
+#storyMode .story-action-menu-pop button:focus{
+  background:rgba(215,180,106,.15);
+  outline:none;
+}
+body.theme-light #storyMode .story-action-menu-pop{
+  background:#fff;
+  border-color:#dfe1e5;
+  box-shadow:0 10px 30px rgba(60,64,67,.22);
+}
+body.theme-light #storyMode .story-action-menu-pop button:hover,
+body.theme-light #storyMode .story-action-menu-pop button:focus{
+  background:#fff7df;
+}
+
+/* Patch: Story clear button + row/card drag placement indicators */
+#storyMode #storyClearStory{color:#8a1c11!important;border-color:#f3b8b1!important;background:#fff7f6!important;}
+#storyMode #storyClearStory:hover{background:#fce8e6!important;border-color:#d93025!important;}
+.story-card-drag-handle{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  width:20px;
+  min-width:20px;
+  height:24px;
+  border-radius:6px;
+  color:var(--ink-dim);
+  cursor:grab;
+  user-select:none;
+  font-size:14px;
+  line-height:1;
+}
+.story-card-drag-handle:active{cursor:grabbing;}
+.story-card-drag-handle:hover{background:rgba(255,255,255,.08);color:var(--ink);}
+.story-card.is-card-dragging{opacity:.55!important;}
+#storyMode .story-card-drag-handle{color:#5f6368!important;cursor:grab!important;}
+#storyMode .story-card-drag-handle:hover{background:#f1f3f4!important;color:#202124!important;}
+#storyMode .story-row.is-row-drop-before,
+#storyMode .story-row.is-row-drop-after,
+#storyMode .story-row.is-card-drop-target,
+#storyMode .story-card.is-card-drop-before,
+#storyMode .story-card.is-card-drop-after{position:relative;}
+#storyMode .story-row.is-row-drop-before::before,
+#storyMode .story-row.is-row-drop-after::after,
+#storyMode .story-card.is-card-drop-before::before,
+#storyMode .story-card.is-card-drop-after::after{
+  content:'';
+  position:absolute;
+  left:-2px;
+  right:-2px;
+  height:0;
+  border-top:3px solid #1a73e8;
+  box-shadow:0 0 0 1px rgba(26,115,232,.15);
+  z-index:8;
+  pointer-events:none;
+}
+#storyMode .story-row.is-row-drop-before::before{top:-3px;}
+#storyMode .story-row.is-row-drop-after::after{bottom:-3px;}
+#storyMode .story-card.is-card-drop-before::before{top:-5px;}
+#storyMode .story-card.is-card-drop-after::after{bottom:-5px;}
+#storyMode .story-row.is-card-drop-target{
+  outline:2px dashed #1a73e8!important;
+  outline-offset:-5px;
+  background:#f8fbff!important;
+}
+#storyMode .story-row.is-row-drop-target{box-shadow:none!important;}
+
+/* ---------- Transcript Mode playhead + compact Find/Replace patch ---------- */
+.txt-script-editor .txt-cue.txt-playhead-active,
+.txt-script-editor .txt-cue.active{
+  background:rgba(215,180,106,.14);
+  border-color:rgba(215,180,106,.45);
+  box-shadow:inset 3px 0 0 rgba(215,180,106,.9);
+}
+.txt-script-editor .txt-cue.txt-playhead-active .txt-time,
+.txt-script-editor .txt-cue.active .txt-time{
+  background:rgba(215,180,106,.28);
+  color:var(--ink);
+}
+#transcriptFindBar{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  align-items:center;
+  min-width:0;
+}
+#transcriptFindBar input[type="text"]{
+  flex:1 1 150px;
+  min-width:120px !important;
+  max-width:240px;
+}
+#transcriptFindBar .fr-option,
+#transcriptFindBar #frDo,
+#transcriptFindBar #frCount{
+  flex:0 0 auto;
+  white-space:nowrap;
+}
+body.theme-light .txt-script-editor .txt-cue.txt-playhead-active,
+body.theme-light .txt-script-editor .txt-cue.active{
+  background:#fff7e3;
+  border-color:#d7b46a;
+  box-shadow:inset 3px 0 0 #c18b24;
 }
