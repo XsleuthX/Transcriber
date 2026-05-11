@@ -637,6 +637,8 @@ function renderTranscriptB(targetEl=null){
   bEl.scrollTop = st; // restore 
   try{ applyCollabCueAwareness(); }catch(_e){}
 
+  // Live-connect Story Cards (track-B mutations). Digest-gated; cheap.
+  try{ scheduleStoryReconcile?.(); }catch(_e){}
 }
 
 function focusNoScroll(el) {
@@ -1040,6 +1042,10 @@ function renderTranscript(){
 
   if (isTxtMode) { try { updateTxtBox(); } catch {} }
 
+  // Live-connect Story Cards: any path that re-renders the transcript may
+  // have mutated cue ids/positions (subtitle context-menu delete/add, drag
+  // reorder, etc.). Digest gate inside the reconciler keeps this cheap.
+  try{ scheduleStoryReconcile?.(); }catch(_e){}
 }
 
 function performReorder(srcIndex, targetIndex, pos){
@@ -1353,6 +1359,46 @@ fileInput.addEventListener('change', () => {
   lastLoadedVideoFile = f || null;
   if (!f) return;
   activateLocalMedia(f);
+  // Auto-add this file to the Media Pool so it becomes a first-class asset
+  // (visible in tray, transcript bound to it, ready for Multi-Timeline).
+  // Without this step, classic-Import files were orphaned from the pool —
+  // their cache_id couldn't be looked up by media_pool_key during render.
+  // Identity: <name>:<size> (per Q2: no content hash for now).
+  try{
+    if (typeof mediaPoolUpsertAsset === 'function'){
+      const localId = `${f.name}:${f.size}`;
+      const existing = (typeof __mediaPoolAssets !== 'undefined' && Array.isArray(__mediaPoolAssets))
+        ? __mediaPoolAssets.find(a => (a.source_type || '') === 'local' && (a.asset_id === localId || a.local_id === localId))
+        : null;
+      if (existing){
+        // Reuse the existing pool entry but refresh the File handle (a new
+        // File object means a fresh object_url is needed for playback).
+        __mediaPoolLocalFiles?.set?.(existing.media_pool_key, f);
+        existing.size = f.size;
+        existing.name = f.name;
+        try{ if (existing.object_url) URL.revokeObjectURL(existing.object_url); }catch(_e){}
+        existing.object_url = URL.createObjectURL(f);
+        if (currentMediaSource){ currentMediaSource.mediaPoolKey = existing.media_pool_key || ''; }
+        mediaPoolPersistAssets?.();
+        try{ renderMediaPoolTray?.(); }catch(_e){}
+      } else {
+        mediaPoolUpsertAsset({ source_type:'local', asset_id:localId, local_id:localId, title:f.name, file:f });
+        // The upsert creates the key as `local:<asset_id>`. Bind currentMediaSource
+        // to it so Transcribe's cache_id propagation (Fix 2) can find the asset.
+        const newKey = `local:${localId}`;
+        if (currentMediaSource){ currentMediaSource.mediaPoolKey = newKey; }
+      }
+      // Activate as the current pool asset so transcripts/comments bind to it.
+      try{
+        if (typeof mediaPoolSetCurrentAsset === 'function'){
+          const target = (typeof __mediaPoolAssets !== 'undefined' && Array.isArray(__mediaPoolAssets))
+            ? __mediaPoolAssets.find(a => a.media_pool_key === currentMediaSource?.mediaPoolKey) : null;
+          if (target) mediaPoolSetCurrentAsset(target);
+        }
+      }catch(_e){}
+    }
+  }catch(_e){ /* non-fatal: pool registration is a convenience */ }
+
   // Auto-apply source TC when enabled (best-effort via filename; user can override in Source TC panel).
   const uiToggle = document.getElementById('toggleSourceTc');
   if (uiToggle && uiToggle.checked) {
@@ -2236,6 +2282,11 @@ function notifyTxtCueEdit(index, { structural=false, track='A' } = {}){
   try{ sendCollabTxtTyping(); }catch(_e){}
   try{ maybeSendCollabStateOverWebSocket?.({ force: !!structural }); }catch(_e){}
   try{ applyTxtCollabAwareness(); }catch(_e){}
+  // Live-connect Story Cards: any structural change to cue ids/positions
+  // (split, merge, delete, reorder, insert) may cascade into card splits or
+  // generic-conversion. The digest gate inside the reconciler keeps text-only
+  // edits cheap (no card mutation when only text changed).
+  try{ scheduleStoryReconcile?.({ delay: structural ? 80 : 240 }); }catch(_e){}
 }
 function allowedTxtSplitFrame(cue, caretOffset, fullText){
   const f = getFPS();
@@ -3598,8 +3649,60 @@ const STORY_CAPTION_TYPES = ['Name Super','Lower Third','Title Caption','Source 
 function makeStoryRowId(){ return 'story_row_' + Date.now().toString(36) + '_' + (__storyRowSeq++); }
 function makeStoryCardId(){ return 'story_card_' + Date.now().toString(36) + '_' + (__storyCardSeq++); }
 function normalizeStoryTrack(track){ return track === 'B' ? 'B' : 'A'; }
-function storyListForTrack(track){ return normalizeStoryTrack(track) === 'B' ? entriesB : entries; }
+let __storyRelinkSourceKey = '';
+function storySourceKeyForCard(card){
+  if (!card) return '';
+  if (card.media_pool_key || card.mediaPoolKey) return String(card.media_pool_key || card.mediaPoolKey || '');
+  try{
+    const asset = storyAssetForCard(card);
+    if (asset && typeof mediaPoolAssetKey === 'function') return mediaPoolAssetKey(asset);
+  }catch(_e){}
+  const type = String(card.source_type || card.sourceType || '').toLowerCase();
+  const id = String(card.asset_id || card.assetId || '');
+  return (type && id) ? `${type}:${id}` : '';
+}
+function storyTranscriptSnapshotForKey(key){
+  const k = String(key || '');
+  if (!k) return null;
+  try{
+    if (__mediaPoolCurrentKey && k === __mediaPoolCurrentKey){
+      // Make sure recent in-DOM cue edits are reflected before matching.
+      try{ mediaPoolSaveCurrentTranscript?.(); }catch(_e){}
+      return { transcriptA:entries || [], transcriptB:entriesB || [] };
+    }
+    const st = (__mediaPoolAssetStates && __mediaPoolAssetStates[k]) ? __mediaPoolAssetStates[k] : null;
+    if (st) return st;
+  }catch(_e){}
+  return null;
+}
+function storyListForTrack(track){
+  const t = normalizeStoryTrack(track);
+  if (__storyRelinkSourceKey){
+    const snap = storyTranscriptSnapshotForKey(__storyRelinkSourceKey);
+    if (snap){
+      const list = t === 'B' ? (snap.transcriptB || []) : (snap.transcriptA || []);
+      if (Array.isArray(list)) return list;
+    }
+  }
+  return t === 'B' ? entriesB : entries;
+}
 function storyEnsureCueIds(track='A'){
+  if (__storyRelinkSourceKey){
+    const snap = storyTranscriptSnapshotForKey(__storyRelinkSourceKey);
+    if (snap){
+      const listA = Array.isArray(snap.transcriptA) ? snap.transcriptA : [];
+      const listB = Array.isArray(snap.transcriptB) ? snap.transcriptB : [];
+      ensureCueIds(listA);
+      ensureCueIds(listB);
+      // Persist generated cue ids back into the source asset state so future
+      // card refs remain stable even when that asset is not currently active.
+      try{
+        const st = __mediaPoolAssetStates?.[__storyRelinkSourceKey];
+        if (st){ st.transcriptA = listA; st.transcriptB = listB; mediaPoolPersistAssetStates?.(); }
+      }catch(_e){}
+      return normalizeStoryTrack(track) === 'B' ? listB : listA;
+    }
+  }
   ensureCueIds(entries);
   ensureCueIds(entriesB);
   return storyListForTrack(track);
@@ -3739,7 +3842,18 @@ function storyClipCueRefs(clip, preferredTrack=null){
   return { track, cueRefs:[], altCueRefs:{ A:[], B:[] } };
 }
 function storyHasAnyTranscriptCues(){
-  try{ ensureCueIds(entries); ensureCueIds(entriesB); }catch(_e){}
+  try{
+    if (__storyRelinkSourceKey){
+      const snap = storyTranscriptSnapshotForKey(__storyRelinkSourceKey);
+      if (snap){
+        const a = Array.isArray(snap.transcriptA) ? snap.transcriptA : [];
+        const b = Array.isArray(snap.transcriptB) ? snap.transcriptB : [];
+        ensureCueIds(a); ensureCueIds(b);
+        return !!(a.length || b.length);
+      }
+    }
+    ensureCueIds(entries); ensureCueIds(entriesB);
+  }catch(_e){}
   return !!((Array.isArray(entries) && entries.length) || (Array.isArray(entriesB) && entriesB.length));
 }
 function storyTrackOrder(preferred='A'){
@@ -3859,7 +3973,7 @@ function storyApplyRelinkResultToCard(card, result, opts={}){
   };
   if (!card.altCueRefs[card.track]?.length) card.altCueRefs[card.track] = [...card.cueRefs];
   const r = storyCueRange(card.cueRefs, card.track);
-  if (r){ card.start = Number(r.start); card.end = Number(r.end); }
+  if (r){ card.start = Number(r.start); card.end = Number(r.end); card.source_in = Number(r.start); card.source_out = Number(r.end); }
   if (snapshotText || snapshotHtml){
     card.body = snapshotText;
     card.bodyHtml = storySanitizeRichHtml(snapshotHtml || storyPlainTextToRichHtml(snapshotText));
@@ -3929,29 +4043,48 @@ function storyRelinkImportedStoryRows(rows=storyRows, opts={}){
 }
 function storyLinkCardToLiveCueRefs(card){
   if (!card || card.kind === 'caption') return { skipped:true };
-  if (!storyHasAnyTranscriptCues()){
-    card.relinkPending = true;
-    card.relinkStatus = 'pending-transcript';
-    return { pending:true };
+  const sourceKey = storySourceKeyForCard(card) || (__mediaPoolCurrentKey || '');
+  const previousKey = __storyRelinkSourceKey;
+  __storyRelinkSourceKey = sourceKey;
+  try{
+    const snap = sourceKey ? storyTranscriptSnapshotForKey(sourceKey) : null;
+    const hasSourceTranscript = snap
+      ? ((Array.isArray(snap.transcriptA) && snap.transcriptA.length) || (Array.isArray(snap.transcriptB) && snap.transcriptB.length))
+      : storyHasAnyTranscriptCues();
+    if (!hasSourceTranscript){
+      card.relinkPending = true;
+      card.relinkStatus = sourceKey ? 'pending-source-transcript' : 'pending-transcript';
+      return { pending:true, sourceKey };
+    }
+
+    // Manual Link Cues is now source-aware: every card links against the
+    // transcript that belongs to its own source_type / asset_id / media_pool_key,
+    // not whatever transcript happens to be visible on screen.
+    const result = storyTryDirectRelinkForCard(card) || storyTryTextRelinkForCard(card) || storyTryRangeRelinkForCard(card);
+    if (result && result.cueRefs?.length){
+      const wasLive = Array.isArray(card.cueRefs) && card.cueRefs.length;
+      storyApplyRelinkResultToCard(card, result, { preserveSnapshotBody:false });
+      if (sourceKey){
+        const asset = storyAssetForCard(card) || ((typeof getMediaPoolAssets === 'function') ? getMediaPoolAssets().find(a => typeof mediaPoolAssetKey === 'function' && mediaPoolAssetKey(a) === sourceKey) : null);
+        if (asset) storyApplySourceRef(card, {
+          source_type:storySourceTypeForAsset(asset),
+          asset_id:storyAssetIdForAsset(asset),
+          asset_name:storyAssetTitle(asset),
+          media_pool_key:sourceKey,
+          source:`${mediaPoolSourceLabel ? mediaPoolSourceLabel(asset) : storySourceTypeForAsset(asset)} / ${storyAssetTitle(asset)}`
+        });
+      }
+      card.source_in = Number.isFinite(Number(card.start)) ? Number(card.start) : card.source_in;
+      card.source_out = Number.isFinite(Number(card.end)) ? Number(card.end) : card.source_out;
+      card.bodyManual = false;
+      card.relinkStatus = result.method || 'linked';
+      return { linked:true, updated:!wasLive, method:result.method || 'linked', sourceKey };
+    }
+    card.relinkStatus = card.cueRefs?.length ? 'linked' : 'no-match';
+    return { noMatch:true, sourceKey };
+  }finally{
+    __storyRelinkSourceKey = previousKey;
   }
-  // Manual Link Cues should be more proactive than import relinking:
-  // it can use direct refs, visible text, or the card's In/Out range even
-  // for generic Story Cards.  If no reliable match is found, keep the card
-  // unchanged instead of turning it into a generic/blank card.
-  const result = storyTryDirectRelinkForCard(card) || storyTryTextRelinkForCard(card) || storyTryRangeRelinkForCard(card);
-  if (result && result.cueRefs?.length){
-    const wasLive = Array.isArray(card.cueRefs) && card.cueRefs.length;
-    // Manual Link Cues should turn the Story Card back into a live transcript
-    // view.  Do not preserve the visible Story body as a manual snapshot here,
-    // otherwise switching Sub A/Sub B keeps showing the old saved text instead
-    // of re-rendering the matching cues from the selected subtitle track.
-    storyApplyRelinkResultToCard(card, result, { preserveSnapshotBody:false });
-    card.bodyManual = false;
-    card.relinkStatus = result.method || 'linked';
-    return { linked:true, updated:!wasLive, method:result.method || 'linked' };
-  }
-  card.relinkStatus = card.cueRefs?.length ? 'linked' : 'no-match';
-  return { noMatch:true };
 }
 function linkStoryCardsToLiveCues(){
   if (VIEW_ONLY_SESSION) return;
@@ -3967,8 +4100,8 @@ function linkStoryCardsToLiveCues(){
   renderStoryAssembly();
   storyCommitSharedState(true);
   const msg = stats.pending
-    ? `Link Cues: ${stats.linked} card(s) linked. ${stats.pending} pending because no transcript cues are loaded yet.`
-    : `Link Cues: ${stats.linked} card(s) linked to live transcript cues; ${stats.noMatch} card(s) had no reliable cue match.`;
+    ? `Link Cues: ${stats.linked} card(s) linked. ${stats.pending} pending because the matching source asset has no transcript cues loaded yet.`
+    : `Link Cues: ${stats.linked} card(s) linked to each card’s source transcript; ${stats.noMatch} card(s) had no reliable cue match.`;
   try{ setStatusSafe?.(msg); }catch(_e){}
   if (!stats.linked && stats.noMatch){
     alert(msg + '\n\nTip: set each card In/Out timecode or keep cue text close to the transcript text, then run Link Cues again.');
@@ -3983,6 +4116,239 @@ function storyRetryPendingStoryRelinksAfterCueLoad(opts={}){
   if (opts.commit && (stats.linked || stats.generic)) storyCommitSharedState?.(true);
   return stats;
 }
+
+/* ============================================================================
+   Story Card live-cue reconciler
+   ----------------------------------------------------------------------------
+   Keeps cue/clip Story Cards in sync with the live transcript on every change:
+
+     * deleted cue → drop the dead ref; if it was the card's only ref, the card
+       turns generic (Q4c — keeps the body text and source label, just stops
+       behaving like a transcript-bound card)
+     * merged cues (storyReplaceCueRefsEverywhere already replaces ids, so two
+       refs may collapse to one) → de-dup
+     * gap in cueRefs (refs span non-adjacent runs of cues in the transcript;
+       happens when the user splits the middle of a card's range) → split the
+       card into multiple cards on the same row, each owning one contiguous
+       run (Q4a)
+     * surviving refs change start/end → recompute card.start, card.end,
+       card.source_in, card.source_out
+
+   Designed to be cheap (digest-gated) and idempotent: calling it twice in a
+   row does no work the second time. The same function services every entry
+   point — TXT mode edits, transcript-edit context menu, import flows,
+   asset-switch transcript loads, and a 1.2 s safety-net timer.
+   ========================================================================== */
+
+let __storyReconcileScheduled = false;
+let __storyReconcileLastDigests = new Map(); // sourceKey → digest string
+let __storyReconcileTimer = 0;
+
+// Cheap digest of one transcript: ids + start/end/text counts. We don't need
+// cryptographic strength — only "did anything that affects card resolution
+// change since last reconcile?". Length+sum of starts+text-length-sum is
+// enough to catch every edit type.
+function __storyReconcileDigest(list){
+  const arr = Array.isArray(list) ? list : [];
+  let n = arr.length, sumStart = 0, sumLen = 0, idHash = 0;
+  for (let i = 0; i < n; i++){
+    const c = arr[i] || {};
+    sumStart += Number(c.start) || 0;
+    sumLen += String(c.text || '').length;
+    const id = String(c.id || '');
+    for (let k = 0; k < id.length; k++) idHash = (idHash * 31 + id.charCodeAt(k)) | 0;
+  }
+  return `${n}|${sumStart.toFixed(3)}|${sumLen}|${idHash}`;
+}
+
+function __storyReconcileDigestAllSources(){
+  // Collect digests for every source key referenced by any card, plus the
+  // currently-active asset (since edits land in entries/entriesB before they
+  // get persisted into __mediaPoolAssetStates).
+  const keys = new Set();
+  if (typeof __mediaPoolCurrentKey !== 'undefined' && __mediaPoolCurrentKey) keys.add(__mediaPoolCurrentKey);
+  (storyRows || []).forEach(row => (row.cards || []).forEach(card => {
+    const k = storySourceKeyForCard(card);
+    if (k) keys.add(k);
+  }));
+  const out = new Map();
+  keys.forEach(k => {
+    const snap = storyTranscriptSnapshotForKey(k);
+    if (!snap) return;
+    out.set(k, `${__storyReconcileDigest(snap.transcriptA)}#${__storyReconcileDigest(snap.transcriptB)}`);
+  });
+  return out;
+}
+
+// Returns true if any digest differs from the last reconcile pass.
+function __storyReconcileDirty(){
+  const cur = __storyReconcileDigestAllSources();
+  if (cur.size !== __storyReconcileLastDigests.size) return { dirty:true, next:cur };
+  for (const [k, v] of cur){
+    if (__storyReconcileLastDigests.get(k) !== v) return { dirty:true, next:cur };
+  }
+  return { dirty:false, next:cur };
+}
+
+// Resolve a single card's cueRefs against the *card's own asset's* transcript,
+// returning either { method:'group', groups:[[id,...], ...], track } when the
+// card's refs split into 1+ contiguous runs, or { method:'generic' } when no
+// surviving refs remain.
+function storyReconcileResolveCard(card){
+  if (!card || card.kind === 'caption') return { method:'skip' };
+  if (!Array.isArray(card.cueRefs) || !card.cueRefs.length) return { method:'skip' };
+
+  const sourceKey = storySourceKeyForCard(card);
+  const previousKey = __storyRelinkSourceKey;
+  __storyRelinkSourceKey = sourceKey || '';
+  let track = normalizeStoryTrack(card.track || 'A');
+  let list = [];
+  try{ list = storyEnsureCueIds(track) || []; }
+  finally{ __storyRelinkSourceKey = previousKey; }
+
+  // Build id → index map for O(1) lookup.
+  const idIndex = new Map();
+  list.forEach((c, ix) => { if (c?.id) idIndex.set(String(c.id), ix); });
+
+  // Resolve each ref to a position in `list`. Drop refs that no longer exist.
+  // Preserve original ref order so caller can detect split intent — refs
+  // saved out of natural order would be unusual but possible.
+  const resolved = [];
+  card.cueRefs.forEach(rid => {
+    const ix = idIndex.get(String(rid));
+    if (ix != null) resolved.push({ id:String(rid), ix });
+  });
+
+  if (!resolved.length) return { method:'generic' };
+
+  // De-dup (handles merge collapse: two refs now pointing to the same cue).
+  const seen = new Set();
+  const unique = [];
+  resolved.forEach(r => { if (!seen.has(r.id)){ seen.add(r.id); unique.push(r); } });
+
+  // Walk in transcript-order to find contiguous runs; gaps mean split.
+  unique.sort((a,b) => a.ix - b.ix);
+  const groups = [];
+  let cur = [];
+  let lastIx = -2;
+  unique.forEach(r => {
+    if (r.ix === lastIx + 1 || cur.length === 0) cur.push(r.id);
+    else { groups.push(cur); cur = [r.id]; }
+    lastIx = r.ix;
+  });
+  if (cur.length) groups.push(cur);
+
+  return { method:'group', groups, track };
+}
+
+function storyReconcileLiveCueLinks(opts={}){
+  // Cheap escape: if no story rows or no cue-bearing cards, nothing to do.
+  if (!Array.isArray(storyRows) || !storyRows.length) return { changed:0, generic:0, split:0 };
+  const dirtyCheck = __storyReconcileDirty();
+  if (!opts.force && !dirtyCheck.dirty) return { changed:0, generic:0, split:0 };
+  __storyReconcileLastDigests = dirtyCheck.next;
+
+  let changed = 0, generic = 0, split = 0;
+
+  storyRows.forEach(row => {
+    if (!row || !Array.isArray(row.cards)) return;
+    // Snapshot the cards array before iterating because we may insert split
+    // cards mid-iteration; iterate by id-snapshot to avoid re-visiting splits.
+    const cardIds = row.cards.map(c => c?.id).filter(Boolean);
+    cardIds.forEach(cid => {
+      const card = row.cards.find(c => c?.id === cid);
+      if (!card) return;
+      const result = storyReconcileResolveCard(card);
+      if (result.method === 'skip') return;
+
+      if (result.method === 'generic'){
+        // All cueRefs vanished — turn the card generic but preserve body/source.
+        if (card.kind === 'generic') return; // already generic
+        storyMarkCardAsGenericAfterRelink(card);
+        generic++;
+        changed++;
+        return;
+      }
+
+      if (result.method === 'group' && Array.isArray(result.groups) && result.groups.length){
+        // No-op short-circuit: refs unchanged AND the card already represents
+        // exactly one group. Only recompute start/end if those drifted.
+        if (result.groups.length === 1){
+          const newRefs = result.groups[0];
+          const sameRefs = newRefs.length === card.cueRefs.length
+            && newRefs.every((id, i) => id === card.cueRefs[i]);
+          if (sameRefs){
+            // Refs unchanged; cue start/end may still have moved.
+            const previousKey = __storyRelinkSourceKey;
+            __storyRelinkSourceKey = storySourceKeyForCard(card) || '';
+            try{
+              const r = storyCueRange(card.cueRefs, result.track);
+              if (r){
+                const newStart = Number(r.start);
+                const newEnd = Number(r.end);
+                if (Math.abs((card.start ?? -1) - newStart) > 0.001 || Math.abs((card.end ?? -1) - newEnd) > 0.001){
+                  card.start = newStart; card.end = newEnd;
+                  card.source_in = newStart; card.source_out = newEnd;
+                  changed++;
+                }
+              }
+            }finally{ __storyRelinkSourceKey = previousKey; }
+            return;
+          }
+          // Refs changed — apply the new single group.
+          const previousKey = __storyRelinkSourceKey;
+          __storyRelinkSourceKey = storySourceKeyForCard(card) || '';
+          try{
+            storyApplyCueGroupsToCard(row, card, [newRefs], result.track);
+          }finally{ __storyRelinkSourceKey = previousKey; }
+          changed++;
+          return;
+        }
+
+        // Multiple groups → split. storyApplyCueGroupsToCard inserts the
+        // additional cards right after the original; the new cards inherit
+        // label/notes/source identity from the original.
+        const previousKey = __storyRelinkSourceKey;
+        __storyRelinkSourceKey = storySourceKeyForCard(card) || '';
+        try{
+          storyApplyCueGroupsToCard(row, card, result.groups, result.track);
+        }finally{ __storyRelinkSourceKey = previousKey; }
+        split += (result.groups.length - 1);
+        changed++;
+      }
+    });
+  });
+
+  if (changed){
+    if (isStoryMode) try{ renderStoryAssembly?.(); }catch(_e){}
+    try{ storyCommitSharedState?.(true); }catch(_e){}
+  }
+  return { changed, generic, split };
+}
+
+// Debounced entry point: call from any transcript-mutating code path.
+function scheduleStoryReconcile(opts={}){
+  if (typeof storyRows === 'undefined' || !Array.isArray(storyRows) || !storyRows.length) return;
+  if (__storyReconcileScheduled) return;
+  __storyReconcileScheduled = true;
+  if (__storyReconcileTimer){ clearTimeout(__storyReconcileTimer); __storyReconcileTimer = 0; }
+  __storyReconcileTimer = setTimeout(() => {
+    __storyReconcileScheduled = false;
+    __storyReconcileTimer = 0;
+    try{ storyReconcileLiveCueLinks(opts); }catch(err){ console.warn('Story reconcile failed', err); }
+  }, opts.delay || 220);
+}
+
+// Safety-net: in case some code path mutates the transcript without going
+// through notifyTxtCueEdit or any of the wired hooks, an idle reconcile every
+// few seconds catches drift. Cheap because the digest gate short-circuits.
+let __storyReconcileSafetyNetStarted = false;
+function ensureStoryReconcileSafetyNet(){
+  if (__storyReconcileSafetyNetStarted) return;
+  __storyReconcileSafetyNetStarted = true;
+  setInterval(() => { if (isStoryMode) scheduleStoryReconcile(); }, 3000);
+}
+try{ ensureStoryReconcileSafetyNet(); }catch(_e){}
 
 function escapeStoryAttr(v){ return escapeHtml(String(v ?? '')).replace(/"/g, '&quot;'); }
 function storyNormalizeTextStyle(style={}){
@@ -4073,11 +4439,17 @@ function exportStoryJsonPayload(){
   try{ storySyncAllRichBodiesToCards({ commit:false, reconcile:false }); }catch(_e){}
   return {
     type:'transcriber_story_assembly',
-    version:2,
+    version:3,
     exportedAt:new Date().toISOString(),
     media:getCurrentStoryMediaLabel(),
     activeSubTrack:normalizeStoryTrack(storyActiveSubTrack || subsMode || 'A'),
-    storyRows:storyRows.map(cleanStoryRowForShare)
+    mediaPool: (typeof mediaPoolExportProjectSnapshot === 'function') ? mediaPoolExportProjectSnapshot() : null,
+    storyRows:storyRows.map(cleanStoryRowForShare),
+    // Multi-Timeline Mode (Phase 1): persist the EDL document so projects
+    // round-trip through file save/load. Empty/default for legacy projects.
+    multiTimeline: (typeof cleanMultiTimelineDocumentForShare === 'function' && typeof ensureMultiTimelineDocument === 'function')
+      ? cleanMultiTimelineDocumentForShare(ensureMultiTimelineDocument())
+      : null
   };
 }
 function storyApplyTextStyleToCardEl(cardEl, card){
@@ -4091,6 +4463,108 @@ function getCurrentStoryMediaLabel(){
   const src = currentMediaSource || {};
   const fileName = src.file?.name || src.filename || src.metadata?.filename || src.metadata?.name || src.metadata?.title || src.url || window.currentBaseName || lastLoadedVideoFile?.name || 'Current media';
   return String(fileName || 'Current media').split(/[\\/]/).pop();
+}
+
+
+// Source-link helpers for Story Cards.  These keep Story Mode tied to the
+// active Media Pool asset without making Generic Cards mandatory-linked.
+function storySourceTypeForAsset(asset){
+  return String(asset?.source_type || asset?.sourceType || currentMediaSource?.type || '').toLowerCase() || '';
+}
+function storyAssetTitle(asset){
+  return String(asset?.title || asset?.name || asset?.metadata?.title || asset?.metadata?.name || asset?.filename || asset?.url || 'Unlinked').split(/[\\/]/).pop();
+}
+function storyAssetIdForAsset(asset){
+  return String(asset?.asset_id || asset?.id || asset?.source_id || asset?.local_id || asset?.youtube_id || asset?.drive_id || asset?.file_id || currentMediaSource?.assetId || '');
+}
+function storyCurrentSourceRef(){
+  try{
+    const active = (typeof getMediaPoolAssets === 'function' ? getMediaPoolAssets() : []).find(a => typeof mediaPoolAssetKey === 'function' && mediaPoolAssetKey(a) === __mediaPoolCurrentKey) || null;
+    if (active){
+      const key = mediaPoolAssetKey(active);
+      return {
+        source_type: storySourceTypeForAsset(active),
+        asset_id: storyAssetIdForAsset(active),
+        asset_name: storyAssetTitle(active),
+        media_pool_key: key,
+        source: `${mediaPoolSourceLabel ? mediaPoolSourceLabel(active) : storySourceTypeForAsset(active)} / ${storyAssetTitle(active)}`
+      };
+    }
+  }catch(_e){}
+  const src = currentMediaSource || {};
+  const type = String(src.type || src.source_type || '').toLowerCase();
+  const id = String(src.assetId || src.asset_id || src.cacheId || src.mediaPoolKey || '');
+  const name = getCurrentStoryMediaLabel();
+  return { source_type:type, asset_id:id, asset_name:name, media_pool_key:src.mediaPoolKey || '', source:name };
+}
+function storyApplySourceRef(card, ref){
+  if (!card || !ref) return card;
+  card.source_type = ref.source_type || card.source_type || '';
+  card.asset_id = ref.asset_id || card.asset_id || '';
+  card.asset_name = ref.asset_name || card.asset_name || '';
+  card.media_pool_key = ref.media_pool_key || card.media_pool_key || '';
+  card.source = ref.source || card.source || card.asset_name || '';
+  return card;
+}
+function storySourceRefFromCard(card){
+  return {
+    source_type:String(card?.source_type || card?.sourceType || '').toLowerCase(),
+    asset_id:String(card?.asset_id || card?.assetId || ''),
+    asset_name:String(card?.asset_name || card?.assetName || card?.source || ''),
+    media_pool_key:String(card?.media_pool_key || card?.mediaPoolKey || ''),
+    source:String(card?.source || card?.asset_name || '')
+  };
+}
+function storyAssetForCard(card){
+  const ref = storySourceRefFromCard(card);
+  const assets = (typeof getMediaPoolAssets === 'function') ? getMediaPoolAssets() : [];
+  if (ref.media_pool_key){
+    const hit = assets.find(a => typeof mediaPoolAssetKey === 'function' && mediaPoolAssetKey(a) === ref.media_pool_key);
+    if (hit) return hit;
+  }
+  if (ref.asset_id){
+    const hit = assets.find(a => String(a.asset_id || a.id || a.source_id || a.local_id || a.youtube_id || a.drive_id || a.file_id || '') === ref.asset_id && (!ref.source_type || storySourceTypeForAsset(a) === ref.source_type));
+    if (hit) return hit;
+  }
+  return null;
+}
+function storySourceOptionsHtml(card){
+  const assets = (typeof getMediaPoolAssets === 'function') ? getMediaPoolAssets() : [];
+  const currentKey = String(card?.media_pool_key || '');
+  const opts = [`<option value="">Unlinked</option>`];
+  assets.forEach(a => {
+    const key = (typeof mediaPoolAssetKey === 'function') ? mediaPoolAssetKey(a) : (a.media_pool_key || '');
+    if (!key) return;
+    const label = `${mediaPoolSourceLabel ? mediaPoolSourceLabel(a) : storySourceTypeForAsset(a)} / ${storyAssetTitle(a)}`;
+    opts.push(`<option value="${escapeStoryAttr(key)}" ${key === currentKey ? 'selected' : ''}>${escapeHtml(label)}</option>`);
+  });
+  return opts.join('');
+}
+async function storyActivateAssetForCard(card){
+  const asset = storyAssetForCard(card);
+  if (!asset) return false;
+  const key = mediaPoolAssetKey(asset);
+  if (__mediaPoolCurrentKey === key) return true;
+  const type = storySourceTypeForAsset(asset);
+  if (type === 'iconik') await activateIconikPreview(asset, { keepModalOpen:true });
+  else if (type === 'local') activateLocalMediaPoolAsset(asset);
+  else if (type === 'youtube') activateYouTubeMediaPoolAsset(asset);
+  else if (type === 'drive' || type === 'google_drive') activateGoogleDriveMediaPoolAsset(asset);
+  else return false;
+  return true;
+}
+async function storySeekLinkedCard(card, { play=false, preview=false } = {}){
+  if (!card) return;
+  await storyActivateAssetForCard(card);
+  // mediaPoolSetCurrentAsset restores the card asset's own transcript/subtitles.
+  const range = storyCardPlaybackRange(card);
+  if (!range) return;
+  if (preview && Number(range.end) > Number(range.start)){
+    storyPreviewCardRange(card);
+    return;
+  }
+  seekMediaTo(Math.max(0, Number(range.start || 0)) + 0.001, { play:!!play });
+  try{ handleMediaTimeUpdate(Number(range.start || 0)); }catch(_e){}
 }
 function setTranscriptWorkAreaHidden(hidden){
   const panel = document.querySelector('.transcript-panel');
@@ -4172,7 +4646,7 @@ function cleanStoryCardForShare(card){
   const bodyText = storySnapshotCardPlainText(card) || storyPlainTextFromRichHtml(bodyHtml || '');
   return {
     id:String(card?.id || makeStoryCardId()), kind:String(card?.kind || 'generic'), title:String(card?.title || ''),
-    labelGroup:String(card?.labelGroup || 'shot'), label:String(card?.label || ''), source:String(card?.source || ''),
+    labelGroup:String(card?.labelGroup || 'shot'), label:String(card?.label || ''), source:String(card?.source || ''), source_type:String(card?.source_type || card?.sourceType || ''), asset_id:String(card?.asset_id || card?.assetId || ''), asset_name:String(card?.asset_name || card?.assetName || ''), media_pool_key:String(card?.media_pool_key || card?.mediaPoolKey || ''), source_in:card?.source_in ?? card?.sourceIn ?? null, source_out:card?.source_out ?? card?.sourceOut ?? null,
     start:range ? range.start : (card?.start == null ? null : Number(card.start)),
     end:range ? range.end : (card?.end == null ? null : Number(card.end)),
     inTc:range ? fmtTC(range.start) : '', outTc:range ? fmtTC(range.end) : '',
@@ -4282,9 +4756,11 @@ function normalizeImportedStoryCard(c={}, opts={}){
   rawBodyHtml = storySanitizeRichHtml(rawBodyHtml || '');
   if (!body && rawBodyHtml) body = storyPlainTextFromRichHtml(rawBodyHtml);
   const hasSnapshotBody = !!String(rawBodyHtml || body || '').trim();
+  const sourceIn = storyParseImportedTime(c?.source_in ?? c?.sourceIn ?? c?.sourceInTc ?? c?.source_in_tc ?? start);
+  const sourceOut = storyParseImportedTime(c?.source_out ?? c?.sourceOut ?? c?.sourceOutTc ?? c?.source_out_tc ?? end);
   return {
     id:String(c?.id || makeStoryCardId()), kind:String(c?.kind || 'generic'), originalKind:String(c?.originalKind || c?.kind || ''), title:String(c?.title || ''),
-    labelGroup:String(c?.labelGroup || 'shot'), label:String(c?.label || ''), source:String(c?.source || ''),
+    labelGroup:String(c?.labelGroup || 'shot'), label:String(c?.label || ''), source:String(c?.source || ''), source_type:String(c?.source_type || c?.sourceType || ''), asset_id:String(c?.asset_id || c?.assetId || ''), asset_name:String(c?.asset_name || c?.assetName || ''), media_pool_key:String(c?.media_pool_key || c?.mediaPoolKey || ''), source_in:sourceIn == null ? null : Number(sourceIn), source_out:sourceOut == null ? null : Number(sourceOut),
     start:start == null ? null : Number(start), end:end == null ? null : Number(end),
     cueRefs, sourceCueRefs, altCueRefs, track, clipId:String(c?.clipId || ''),
     body:String(body || ''), bodyHtml:rawBodyHtml || storyPlainTextToRichHtml(body || ''),
@@ -4346,6 +4822,7 @@ async function importStoryJsonFile(){
   if (!picked) return;
   let parsed;
   try{ parsed = JSON.parse(picked.text); }catch(_e){ throw new Error('Invalid JSON file.'); }
+  const mpStats = mediaPoolImportProjectSnapshot?.(parsed.mediaPool || parsed.media_pool || parsed.projectMediaPool || parsed.project_media_pool || null);
   const rows = normalizeImportedStoryRows(parsed, { forceSnapshotBody:true, pendingRelink:true });
   const cardCount = rows.reduce((n,r)=>n+(r.cards?.length||0),0);
   if (!rows.length || !cardCount) throw new Error('No Story Mode rows/cards found in this JSON file.');
@@ -4356,13 +4833,35 @@ Cancel = Append to current Story Mode`);
   const relinkStats = storyRelinkImportedStoryRows(rows, { force:true, preserveSnapshotBody:true });
   if (replace) storyRows = rows;
   else storyRows.push(...rows);
+  // Phase 1: restore the Multi-Timeline EDL if the file carries one. Use
+  // replace-vs-merge semantics that mirror the Story Rows decision above so
+  // the user gets one consistent behavior across the project.
+  const incomingMtl = parsed.multiTimeline || parsed.multi_timeline || null;
+  if (incomingMtl && typeof applyMultiTimelineDocument === 'function'){
+    const incomingHasClips = Array.isArray(incomingMtl.clips) && incomingMtl.clips.length > 0;
+    const currentHasClips = Array.isArray(multiTimeline?.clips) && multiTimeline.clips.length > 0;
+    // If we're replacing the project, take the incoming doc as-is. If we're
+    // appending and the incoming doc has clips, take it too (this is Phase 1;
+    // a real "append clips to existing tracks" merge will be designed when
+    // editing primitives ship in Phase 2).
+    if (replace || incomingHasClips || !currentHasClips){
+      applyMultiTimelineDocument(incomingMtl);
+    }
+  }
   ensureStorySeed();
   renderStoryAssembly();
   storyCommitSharedState(true);
+  // After import, kick off a forced reconcile so any cards already live can
+  // settle into their final cue layout (in case the cue ordering in
+  // mediaPoolAssetStates has shifted since the JSON was originally exported).
+  try{ scheduleStoryReconcile?.({ force:true, delay:60 }); }catch(_e){}
   const relinkMsg = relinkStats.pending
     ? ` ${relinkStats.pending} card(s) are pending transcript relink.`
     : ` ${relinkStats.linked} card(s) linked to live cues; ${relinkStats.generic} kept as generic.`;
-  setStatusSafe?.(`Imported ${cardCount} Story Card(s) from JSON.${relinkMsg}`);
+  const mpMsg = mpStats && (mpStats.assets || mpStats.states) ? ` Media Pool restored: ${mpStats.assets || 0} asset(s), ${mpStats.states || 0} transcript/comment state(s).` : '';
+  const mtlMsg = incomingMtl && Array.isArray(incomingMtl.clips) && incomingMtl.clips.length
+    ? ` Multi-Timeline restored: ${incomingMtl.clips.length} clip(s).` : '';
+  setStatusSafe?.(`Imported ${cardCount} Story Card(s) from JSON.${relinkMsg}${mpMsg}${mtlMsg}`);
 }
 function hideStoryMode(){
   if (storyModeEl) storyModeEl.style.display = 'none';
@@ -4416,7 +4915,13 @@ function ensureStoryMode(){
               <button id="storyExportGoogleDoc" type="button" role="menuitem">Export to Google Doc</button>
             </div>
           </div>
-          <button class="btn btn-gold" id="storyExportTimeline" type="button">Export to Timeline</button>
+          <div class="story-action-menu">
+            <button class="btn btn-gold story-menu-trigger" id="storyExportTimelineMenuBtn" type="button" aria-haspopup="true" aria-expanded="false">Export to Timeline ▾</button>
+            <div class="story-action-menu-pop" role="menu" aria-label="Export to Timeline">
+              <button id="storyExportTimeline"      type="button" role="menuitem">Export to Source Timeline</button>
+              <button id="storyExportMultiTimeline" type="button" role="menuitem">Export to Multi-Timeline</button>
+            </div>
+          </div>
           <div class="story-action-menu">
             <button class="btn btn-outline story-menu-trigger" id="storyJsonMenuBtn" type="button" aria-haspopup="true" aria-expanded="false">JSON ▾</button>
             <div class="story-action-menu-pop" role="menu" aria-label="JSON actions">
@@ -4456,6 +4961,7 @@ function ensureStoryMode(){
   storyModeEl.querySelector('#storyClearStory')?.addEventListener('click', () => { clearStoryAssembly(); });
   storyModeEl.querySelector('#storyLinkCues')?.addEventListener('click', () => { linkStoryCardsToLiveCues(); });
   storyModeEl.querySelector('#storyExportTimeline')?.addEventListener('click', () => { exportStoryToTimeline(); });
+  storyModeEl.querySelector('#storyExportMultiTimeline')?.addEventListener('click', () => { exportStoryToMultiTimeline(); });
   storyModeEl.querySelector('#storyExportGoogleDoc')?.addEventListener('click', () => { exportStoryToGoogleDocBackup().catch(err => alert('Google Doc export failed: ' + (err?.message || err))); });
   storyModeEl.querySelector('#storyImportGoogleDoc')?.addEventListener('click', () => { fetchStoryFromGoogleDocBackup().catch(err => alert('Google Doc fetch failed: ' + (err?.message || err))); });
   storyModeEl.querySelector('#storySubModeTop')?.addEventListener('change', (ev) => setStoryTimelineSubMode(ev.target.value));
@@ -4532,13 +5038,24 @@ function getStoryTargetRowIdFromEvent(ev){ return ev.target?.closest?.('.story-r
 function getStoryRow(rowId){ return storyRows.find(r => r.id === rowId) || null; }
 function storyDefaultRowId(){ ensureStorySeed(); return storyRows[storyRows.length - 1].id; }
 function createGenericStoryCard(overrides={}){
-  return { id:makeStoryCardId(), kind:'generic', title:'Generic Clip / Assignment', labelGroup:'shot', label:'B-roll', source:'', start:null, end:null, cueRefs:[], track:'A', body:'', notes:'', notesOpen:false, textStyle:storyNormalizeTextStyle(overrides.textStyle || {}), ...overrides };
+  const ref = storyCurrentSourceRef();
+  const base = { id:makeStoryCardId(), kind:'generic', title:'Generic Clip / Assignment', labelGroup:'shot', label:'B-roll', source:'', source_type:'', asset_id:'', asset_name:'', media_pool_key:'', start:null, end:null, cueRefs:[], track:'A', body:'', notes:'', notesOpen:false, textStyle:storyNormalizeTextStyle(overrides.textStyle || {}) };
+  // Generic cards are placeholders by default.  Only auto-link when caller
+  // explicitly asks for currentSource, otherwise the source dropdown remains Unlinked.
+  const out = { ...base, ...overrides };
+  if (overrides.currentSource) storyApplySourceRef(out, ref);
+  delete out.currentSource;
+  return out;
 }
 function createCueStoryCard(payload={}){
   const track = normalizeStoryTrack(payload.track || 'A');
   const cueRefs = (payload.cueIds || payload.cueRefs || []).filter(Boolean);
-  const source = payload.source || getCurrentStoryMediaLabel();
-  return { id:makeStoryCardId(), kind:'cue', title:`${source}`, labelGroup:'shot', label:'Main Shot', track, cueRefs, sourceCueRefs:[...cueRefs], body:'', start:payload.start ?? null, end:payload.end ?? null, notes:'', notesOpen:false, textStyle:storyNormalizeTextStyle(payload.textStyle || {}) };
+  const ref = payload.source_type || payload.asset_id || payload.media_pool_key ? {
+    source_type:payload.source_type || payload.sourceType || '', asset_id:payload.asset_id || payload.assetId || '', asset_name:payload.asset_name || payload.assetName || '', media_pool_key:payload.media_pool_key || payload.mediaPoolKey || '', source:payload.source || ''
+  } : storyCurrentSourceRef();
+  const source = payload.source || ref.source || getCurrentStoryMediaLabel();
+  const card = { id:makeStoryCardId(), kind:'cue', title:`${source}`, labelGroup:'shot', label:'Main Shot', track, cueRefs, sourceCueRefs:[...cueRefs], body:'', start:payload.start ?? null, end:payload.end ?? null, source_type:'', asset_id:'', asset_name:'', media_pool_key:'', source, notes:'', notesOpen:false, textStyle:storyNormalizeTextStyle(payload.textStyle || {}) };
+  return storyApplySourceRef(card, ref);
 }
 function createClipStoryCard(clip){
   const source = getCurrentStoryMediaLabel();
@@ -4550,10 +5067,14 @@ function createClipStoryCard(clip){
   const label = (typeof getTimelineClipDisplayName === 'function') ? getTimelineClipDisplayName(clip, 0) : (clip?.label || 'Timeline Clip');
   const start = storyClipStart(clip);
   const end = storyClipEnd(clip);
-  return { id:makeStoryCardId(), kind:'clip', title:(label || source), labelGroup:'shot', label:'Main Shot', source, clipId:String(clip?.id || ''), track, cueRefs, sourceCueRefs:[...cueRefs], altCueRefs:{ A:storyUniqueRefs(altCueRefs.A || []), B:storyUniqueRefs(altCueRefs.B || []) }, start:Number.isFinite(start) ? start : null, end:Number.isFinite(end) ? end : null, body:cueRefs.length ? '' : (label || ''), bodyManual:false, notes:'', notesOpen:false, textStyle:storyNormalizeTextStyle({}) };
+  {
+    const ref = storyCurrentSourceRef();
+    const card = { id:makeStoryCardId(), kind:'clip', title:(label || source), labelGroup:'shot', label:'Main Shot', source, clipId:String(clip?.id || ''), track, cueRefs, sourceCueRefs:[...cueRefs], altCueRefs:{ A:storyUniqueRefs(altCueRefs.A || []), B:storyUniqueRefs(altCueRefs.B || []) }, source_type:'', asset_id:'', asset_name:'', media_pool_key:'', start:Number.isFinite(start) ? start : null, end:Number.isFinite(end) ? end : null, body:cueRefs.length ? '' : (label || ''), bodyManual:false, notes:'', notesOpen:false, textStyle:storyNormalizeTextStyle({}) };
+    return storyApplySourceRef(card, ref);
+  }
 }
 function createCaptionStoryCard(type='Lower Third', text=''){
-  return { id:makeStoryCardId(), kind:'caption', title:type, labelGroup:'caption', label:type, source:'', start:null, end:null, cueRefs:[], track:'A', body:text || '', notes:'', notesOpen:false, textStyle:storyNormalizeTextStyle({}) };
+  return { id:makeStoryCardId(), kind:'caption', title:type, labelGroup:'caption', label:type, source:'', source_type:'', asset_id:'', asset_name:'', media_pool_key:'', start:null, end:null, cueRefs:[], track:'A', body:text || '', notes:'', notesOpen:false, textStyle:storyNormalizeTextStyle({}) };
 }
 function addStoryCardToRow(rowId, card){
   const row = getStoryRow(rowId) || storyRows.at(-1) || (storyRows.push(createStoryRow()), storyRows.at(-1));
@@ -5548,6 +6069,13 @@ function applyStoryCollabAwareness(){
   }
 }
 function renderStoryCard(row, card){
+  // Source-aware Story Card rendering: cards linked to inactive Media Pool
+  // assets must resolve cueRefs against that asset's saved transcript, not
+  // the currently mounted transcript.
+  const __prevStoryRenderSourceKey = __storyRelinkSourceKey;
+  const __renderSourceKey = storySourceKeyForCard(card);
+  if (__renderSourceKey) __storyRelinkSourceKey = __renderSourceKey;
+  try {
   const isCue = card.kind === 'cue';
   const isClip = card.kind === 'clip';
   const isLive = isCue || isClip;
@@ -5569,13 +6097,14 @@ function renderStoryCard(row, card){
   const disabledAttr = storyLocked ? ' disabled' : '';
   const editableAttr = storyLocked ? 'false' : 'true';
   const lockedTitle = remoteLock ? `${escapeStoryAttr(remoteLock.user_label || collabUserName(remoteLock.user_id))} is editing this Story Card` : '';
+  const linkedSourceLabel = card.media_pool_key || card.asset_id || card.source_type ? (card.source || `${card.source_type || 'Source'} / ${card.asset_name || card.asset_id || ''}`) : '';
   const foot = isCue
     ? `${escapeHtml(card.source || getCurrentStoryMediaLabel())} · Live CueRefs: ${effectiveRefs.length} · Track ${escapeHtml(effectiveTrack)}`
     : isClip
       ? `${escapeHtml(card.source || getCurrentStoryMediaLabel())} · Live Timeline Clip${clip ? '' : ' missing'}${effectiveRefs.length ? ` · ${effectiveRefs.length} linked cue(s) · Track ${escapeHtml(effectiveTrack)}` : ''}`
       : card.kind === 'caption'
-        ? 'Caption / lower third card'
-        : 'Generic editorial card';
+        ? `Caption / lower third card${linkedSourceLabel ? ' · ' + escapeHtml(linkedSourceLabel) : ''}`
+        : `Generic editorial card${linkedSourceLabel ? ' · ' + escapeHtml(linkedSourceLabel) : ''}`;
   const timeTitle = (card.kind === 'generic' || card.kind === 'caption') ? 'Click to edit In / Out' : 'Click to preview this range';
   return `
     <article class="story-card ${isLive ? 'is-live' : 'is-generic'} ${card.notesOpen ? 'notes-open' : ''} ${remoteLock ? 'story-remote-locked' : ''}" data-card-id="${escapeStoryAttr(card.id)}" ${lockedTitle ? `title="${lockedTitle}"` : ''}>
@@ -5588,6 +6117,7 @@ function renderStoryCard(row, card){
       <div class="story-card-name-row">
         <input class="story-card-title" data-card-field="title" value="${escapeStoryAttr(card.title || '')}" placeholder="Clip / card name"${disabledAttr}>
       </div>
+      ${(card.kind === 'generic' || card.kind === 'caption') ? `<div class="story-card-source-row"><label>Source</label><select class="story-source-select" data-card-field="sourceAssetKey"${disabledAttr}>${storySourceOptionsHtml(card)}</select></div>` : ''}
       <div class="story-card-meta">
         <button class="story-timecode" data-story-action="seek-card" title="${escapeStoryAttr(timeTitle)}" type="button">${escapeHtml(tc)}</button>
       </div>
@@ -5600,6 +6130,10 @@ function renderStoryCard(row, card){
       </div>
       <div class="story-card-foot">${foot}</div>
     </article>`;
+
+  } finally {
+    __storyRelinkSourceKey = __prevStoryRenderSourceKey;
+  }
 }
 
 function storyNormalizeTextForMatch(text){
@@ -5838,6 +6372,15 @@ function onStoryChange(ev){
     card.label = (STORY_LABELS[card.labelGroup] || STORY_LABELS.shot)[0];
     renderStoryAssembly();
   } else if (field === 'label') card.label = ev.target.value;
+  else if (field === 'sourceAssetKey'){
+    const key = String(ev.target.value || '');
+    if (!key){ card.source_type=''; card.asset_id=''; card.asset_name=''; card.media_pool_key=''; card.source=''; }
+    else {
+      const asset = (typeof getMediaPoolAssets === 'function' ? getMediaPoolAssets() : []).find(a => typeof mediaPoolAssetKey === 'function' && mediaPoolAssetKey(a) === key);
+      if (asset) storyApplySourceRef(card, { source_type:storySourceTypeForAsset(asset), asset_id:storyAssetIdForAsset(asset), asset_name:storyAssetTitle(asset), media_pool_key:key, source:`${mediaPoolSourceLabel ? mediaPoolSourceLabel(asset) : storySourceTypeForAsset(asset)} / ${storyAssetTitle(asset)}` });
+    }
+    renderStoryAssembly();
+  }
   storyCommitSharedState();
 }
 
@@ -5892,14 +6435,15 @@ function storyCardPlaybackRange(card){
     if (range && Number.isFinite(Number(range.start)) && Number.isFinite(Number(range.end))) return range;
   }
   const clip = card.kind === 'clip' ? storyClipById(card.clipId) : null;
-  const start = clip ? storyClipStart(clip) : card.start;
-  const end = clip ? storyClipEnd(clip) : card.end;
+  const start = clip ? storyClipStart(clip) : (card.source_in ?? card.sourceIn ?? card.start);
+  const end = clip ? storyClipEnd(clip) : (card.source_out ?? card.sourceOut ?? card.end);
   if (start != null && end != null && Number.isFinite(Number(start)) && Number.isFinite(Number(end)) && Number(end) > Number(start)){
     return { start:Number(start), end:Number(end) };
   }
   return null;
 }
-function storyPreviewCardRange(card){
+async function storyPreviewCardRange(card){
+  await storyActivateAssetForCard(card);
   const range = storyCardPlaybackRange(card);
   if (!range) return;
   try{ if (typeof STORY_PREVIEW_STOPPER === 'function') STORY_PREVIEW_STOPPER(); }catch(_e){}
@@ -6024,7 +6568,7 @@ function onStoryClick(ev){
       window.__storyLastContextY = ev.clientY;
       const cueId = storyCueIdFromTextareaLine(bodyEl, card);
       const cue = cueId ? storyCueById(cueId, storyEffectiveTrack(card)) : null;
-      if (cue) seekMediaTo(Math.max(0, Number(cue.start || 0)) + 0.001, { play:false });
+      if (cue) storyActivateAssetForCard(card).finally(() => seekMediaTo(Math.max(0, Number(cue.start || 0)) + 0.001, { play:false }));
     }
     if (bodyEl.__storySelectingText) setTimeout(() => { bodyEl.__storySelectingText = false; }, 80);
   }
@@ -6057,8 +6601,8 @@ function onStoryClick(ev){
   if (action === 'toggle-card-notes' && cardEl){ const card = row.cards.find(c => c.id === cardEl.dataset.cardId); if (card){ card.notesOpen = !card.notesOpen; renderStoryAssembly(); storyCommitSharedState(); } return; }
   if (action === 'seek-card' && cardEl){
     const card = row.cards.find(c => c.id === cardEl.dataset.cardId);
-    if (storyCanEditCardTimecode(card)) showStoryCardTimePopover(ev, row.id, card.id);
-    else storyPreviewCardRange(card);
+    if (storyCanEditCardTimecode(card)) { storyActivateAssetForCard(card).finally(() => showStoryCardTimePopover(ev, row.id, card.id)); }
+    else storySeekLinkedCard(card, { preview:true });
     return;
   }
 }
@@ -6161,7 +6705,11 @@ function showStoryCueModal(rowId){
     anchor: -1,
     customRange: null,
     lastScrollTop: 0,
-    rowHeight: 72
+    rowHeight: 72,
+    // Search-as-navigate (vs. filter): match indices in currentFiltered, plus
+    // the current cursor position within those matches.
+    searchMatches: [],
+    searchCursor: -1,
   };
   modal.innerHTML = `
     <div class="story-modal-card story-cue-finder-card">
@@ -6231,15 +6779,26 @@ function showStoryCueModal(rowId){
     item.cue?.text || ''
   ].join(' '));
   const computeFiltered = () => {
-    const q = storyCueFinderNorm(state.query);
+    // Note: search query no longer affects this list. Search is navigate-and-
+    // highlight (see recomputeSearchMatches below) so users keep surrounding
+    // context rather than seeing the list shrink.
     const used = storyCueFinderUsedMap(state.track);
     const range = state.filter === 'range' ? state.customRange : (state.filter === 'all' ? null : storyCueFinderCurrentRange(state.filter));
     return readAll().filter(item => {
       if (state.unusedOnly && used.has(item.id)) return false;
       if (range && !storyCueFinderCueOverlaps(item.cue, range)) return false;
-      if (!q) return true;
-      return cueSearchHaystack(item).includes(q);
+      return true;
     });
+  };
+  const recomputeSearchMatches = () => {
+    const q = storyCueFinderNorm(state.query);
+    if (!q){ state.searchMatches = []; state.searchCursor = -1; return; }
+    state.searchMatches = currentFiltered
+      .map((item, ix) => cueSearchHaystack(item).includes(q) ? ix : -1)
+      .filter(ix => ix >= 0);
+    if (state.searchCursor < 0 || state.searchCursor >= state.searchMatches.length){
+      state.searchCursor = state.searchMatches.length ? 0 : -1;
+    }
   };
   const updateFilterButtons = () => {
     modal.querySelectorAll('.story-cue-filter').forEach(btn => btn.classList.toggle('is-active', btn.dataset.filter === state.filter));
@@ -6252,6 +6811,7 @@ function showStoryCueModal(rowId){
     renderToken += 1;
     const token = renderToken;
     currentFiltered = computeFiltered();
+    recomputeSearchMatches();
     const used = storyCueFinderUsedMap(state.track);
     const activeRange = state.filter === 'range' ? state.customRange : (state.filter === 'all' ? null : storyCueFinderCurrentRange(state.filter));
     const rowH = state.rowHeight;
@@ -6262,13 +6822,24 @@ function showStoryCueModal(rowId){
     const startIx = Math.max(0, Math.floor(scrollTop / rowH) - 8);
     const endIx = Math.min(total, Math.ceil((scrollTop + viewportHeight) / rowH) + 8);
     const visible = currentFiltered.slice(startIx, endIx);
+    // Build a Set of match-positions and track which one is "current" so the
+    // visible rows can paint the right highlights. The current match is also
+    // scrolled into view by ensureCurrentMatchVisible() after render.
+    const matchSet = new Set(state.searchMatches);
+    const currentMatchIx = state.searchCursor >= 0 ? state.searchMatches[state.searchCursor] : -1;
     rowsLayer.innerHTML = visible.map((item, localIx) => {
       const filteredIx = startIx + localIx;
       const cue = item.cue || {};
       const selected = state.selected.has(item.id);
+      const isMatch = matchSet.has(filteredIx);
+      const isCurrentMatch = filteredIx === currentMatchIx;
       const usedRows = used.get(item.id) || [];
       const usedLabel = usedRows.length ? `Row ${usedRows.slice(0, 3).join(', ')}${usedRows.length > 3 ? '…' : ''}` : '';
-      return `<div class="story-cue-finder-row${selected ? ' is-selected' : ''}" style="transform:translateY(${filteredIx * rowH}px)" data-filter-index="${filteredIx}" data-cue-id="${escapeStoryAttr(item.id)}" role="option" aria-selected="${selected ? 'true' : 'false'}">
+      const rowClasses = ['story-cue-finder-row'];
+      if (selected) rowClasses.push('is-selected');
+      if (isMatch) rowClasses.push('is-search-match');
+      if (isCurrentMatch) rowClasses.push('is-search-current');
+      return `<div class="${rowClasses.join(' ')}" style="transform:translateY(${filteredIx * rowH}px)" data-filter-index="${filteredIx}" data-cue-id="${escapeStoryAttr(item.id)}" role="option" aria-selected="${selected ? 'true' : 'false'}">
         <label class="story-cue-finder-select"><input type="checkbox" ${selected ? 'checked' : ''} aria-label="Select cue ${item.no}"></label>
         <button class="story-cue-finder-no" type="button" title="Seek to cue ${item.no}">${item.no}</button>
         <button class="story-cue-finder-time" type="button" title="Seek to ${fmtTC(cue.start || 0)}">${fmtTC(cue.start || 0)} → ${fmtTC(cue.end || 0)}</button>
@@ -6276,9 +6847,14 @@ function showStoryCueModal(rowId){
         <div class="story-cue-finder-used">${usedLabel ? `<button type="button" class="story-cue-used-jump" title="Already used in ${escapeStoryAttr(usedLabel)}">${escapeHtml(usedLabel)}</button>` : '<span class="story-cue-unused-pill">Unused</span>'}</div>
         <div class="story-cue-finder-row-actions"><button class="story-cue-preview-one" type="button" title="Preview this cue">▶</button><button class="story-cue-add-one" type="button" title="Add this cue">Add</button></div>
       </div>`;
-    }).join('') || `<div class="story-cue-finder-empty" style="top:0">No cues match this search/filter.</div>`;
+    }).join('') || `<div class="story-cue-finder-empty" style="top:0">No cues match this filter.</div>`;
     const filterLabel = activeRange?.label || (state.filter === 'all' ? 'All cues' : 'No matching range available');
-    status.textContent = `${total} cue(s) · Track ${state.track} · ${filterLabel}${state.unusedOnly ? ' · Unused only' : ''}`;
+    const matchText = state.query
+      ? (state.searchMatches.length
+          ? ` · match ${state.searchCursor + 1} of ${state.searchMatches.length}`
+          : ` · 0 matches for "${state.query}"`)
+      : '';
+    status.textContent = `${total} cue(s) · Track ${state.track} · ${filterLabel}${state.unusedOnly ? ' · Unused only' : ''}${matchText}`;
     if (token === renderToken) updateFooter();
   };
   const scheduleRender = () => requestAnimationFrame(renderRows);
@@ -6297,18 +6873,79 @@ function showStoryCueModal(rowId){
     }
     scheduleRender();
   };
-  const toggleItem = (ix, additive=true) => {
+  // Plain click → replace selection with this cue, set anchor.
+  // Cmd/Ctrl-click → toggle this cue without clearing others, set anchor here.
+  // Shift-click → range from anchor to here (replaces); Cmd+Shift extends.
+  // If there's no anchor yet (first interaction), Shift-click degrades to a
+  // plain click rather than selecting "everything from row 0 to here".
+  const selectByClick = (ev, ix) => {
+    if (ix < 0) return;
     const id = currentFiltered[ix]?.id;
     if (!id) return;
-    if (!additive) state.selected.clear();
-    if (state.selected.has(id)) state.selected.delete(id); else state.selected.add(id);
+    const additive = ev.ctrlKey || ev.metaKey;
+    if (ev.shiftKey && state.anchor >= 0 && state.anchor < currentFiltered.length){
+      setSelectedRange(state.anchor, ix, additive);
+      // Anchor stays put so successive Shift-clicks keep extending from the
+      // same anchor point — Finder/Premiere behavior, what users expect.
+      return;
+    }
+    if (additive){
+      if (state.selected.has(id)) state.selected.delete(id);
+      else state.selected.add(id);
+    } else {
+      state.selected.clear();
+      state.selected.add(id);
+    }
     state.anchor = ix;
     scheduleRender();
   };
-  const selectByClick = (ev, ix) => {
-    if (ix < 0) return;
-    if (ev.shiftKey && state.anchor >= 0) setSelectedRange(state.anchor, ix, ev.ctrlKey || ev.metaKey);
-    else toggleItem(ix, true);
+  // Seek to a specific filtered-row index, scroll it into view, and pulse the
+  // current-match highlight. Does NOT change selection (search/seek is
+  // navigation, not commitment — the user picks with checkboxes / Add).
+  const ensureFilteredRowVisible = (filteredIx) => {
+    if (filteredIx < 0) return;
+    const rowH = state.rowHeight;
+    const top = filteredIx * rowH;
+    const visTop = viewport.scrollTop;
+    const visBot = visTop + viewport.clientHeight;
+    if (top < visTop + 8) viewport.scrollTop = Math.max(0, top - 24);
+    else if (top + rowH > visBot - 8) viewport.scrollTop = top - viewport.clientHeight + rowH + 24;
+  };
+  const seekToFilteredIndex = (filteredIx) => {
+    const item = currentFiltered[filteredIx];
+    if (!item) return;
+    const cue = item.cue || {};
+    if (Number.isFinite(Number(cue.start))){
+      try{ seekMediaTo(Math.max(0, Number(cue.start || 0)) + 0.001, { play:false }); }catch(_e){}
+    }
+    ensureFilteredRowVisible(filteredIx);
+  };
+  const goToSearchMatch = (cursor) => {
+    if (!state.searchMatches.length) return;
+    const n = state.searchMatches.length;
+    state.searchCursor = ((cursor % n) + n) % n;
+    scheduleRender();
+    // Render runs on RAF; the seek happens immediately so the player tracks
+    // the search regardless of render timing.
+    seekToFilteredIndex(state.searchMatches[state.searchCursor]);
+  };
+  const advanceSearchMatch = (delta=1) => {
+    if (!state.searchMatches.length) return;
+    goToSearchMatch(state.searchCursor + delta);
+  };
+  const onSearchInput = () => {
+    state.query = searchInput.value || '';
+    // Match list changes; reset cursor to first hit.
+    state.searchCursor = state.query ? 0 : -1;
+    scheduleRender();
+    // Seek immediately if there's at least one match. recomputeSearchMatches
+    // runs inside renderRows which is RAF'd, so we compute matches inline here
+    // for the seek to feel instant.
+    if (state.query){
+      const q = storyCueFinderNorm(state.query);
+      const ix = currentFiltered.findIndex(item => cueSearchHaystack(item).includes(q));
+      if (ix >= 0) seekToFilteredIndex(ix);
+    }
   };
   const defaultRangeForPicker = () => {
     const timelineRange = storyCueFinderCurrentRange('selection');
@@ -6355,7 +6992,25 @@ function showStoryCueModal(rowId){
   });
 
   viewport?.addEventListener('scroll', () => { state.lastScrollTop = viewport.scrollTop || 0; renderRows(); }, { passive:true });
-  searchInput?.addEventListener('input', () => { state.query = searchInput.value || ''; viewport.scrollTop = 0; scheduleRender(); });
+  searchInput?.addEventListener('input', onSearchInput);
+  searchInput?.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter'){
+      ev.preventDefault();
+      // Shift+Enter = previous match, Enter = next match. Wraps both ways.
+      advanceSearchMatch(ev.shiftKey ? -1 : 1);
+      return;
+    }
+    if (ev.key === 'Escape'){
+      // Clear search and return focus to the viewport so arrow-keys work.
+      ev.preventDefault();
+      searchInput.value = '';
+      onSearchInput();
+      try{ viewport?.focus({ preventScroll:true }); }catch(_e){}
+      return;
+    }
+    if (ev.key === 'ArrowDown' && state.searchMatches.length){ ev.preventDefault(); advanceSearchMatch(1); return; }
+    if (ev.key === 'ArrowUp'   && state.searchMatches.length){ ev.preventDefault(); advanceSearchMatch(-1); return; }
+  });
   trackSelect?.addEventListener('change', () => { state.track = normalizeStoryTrack(trackSelect.value); state.selected.clear(); state.anchor = -1; viewport.scrollTop = 0; updateFilterButtons(); scheduleRender(); });
   unusedOnly?.addEventListener('change', () => { state.unusedOnly = !!unusedOnly.checked; viewport.scrollTop = 0; scheduleRender(); });
   modal.querySelectorAll('.story-cue-filter').forEach(btn => btn.addEventListener('click', () => {
@@ -6722,6 +7377,8 @@ function storyGoogleDocCardVisibleText(card, rowIndex, cardIndex, opts={}){
   lines.push(`┌────────────────────────────────────────────────────────────`);
   lines.push(`│ ${rowIndex + 1}.${cardIndex + 1}  ${title}`);
   lines.push(`│ ${labels.length ? labels.map(x => '[' + x + ']').join(' ') + '  ' : ''}IN ${inTc || '—'}   OUT ${outTc || '—'}`);
+  const srcLabel = [clean.source_type || '', clean.asset_name || clean.asset_id || clean.media_pool_key || ''].map(x => String(x || '').trim()).filter(Boolean).join(' / ');
+  if (srcLabel) lines.push(`│ Source: ${srcLabel}`);
   lines.push(`├─ Cue Text / Story Body`);
   if (bodyText) bodyText.split(/\r?\n/).forEach(line => lines.push(`│ ${line}`));
   else lines.push('│ ');
@@ -7009,6 +7666,8 @@ async function fetchStoryFromGoogleDocBackup(){
   const data = await res.json().catch(()=>({}));
   if (!res.ok || data?.ok === false) throw new Error(storyGoogleApiErrorMessage(data, res));
   const parsed = storyRowsFromGoogleDocText(data.text || '');
+  const parsedMeta = storyExtractGoogleDocMetaPayload(data.text || '');
+  const mpStats = mediaPoolImportProjectSnapshot?.(parsedMeta?.mediaPool || parsedMeta?.media_pool || parsedMeta?.projectMediaPool || parsedMeta?.project_media_pool || null);
   const parsedRows = parsed.rows || [];
   if (!parsedRows.length) throw new Error('No Story Cards were found in this Google Doc. Keep the TRANSCRIBER markers, or export again using the new Story Google Doc format.');
   const relinkStats = storyRelinkImportedStoryRows(parsedRows, { force:true, preserveSnapshotBody:true });
@@ -7016,13 +7675,29 @@ async function fetchStoryFromGoogleDocBackup(){
   const replace = confirm(`Found ${cardCount} Story Card(s) from Google Doc (${parsed.source}).\n\nOK = Replace current Story Mode\nCancel = Append to current Story Mode`);
   if (replace) storyRows = parsedRows;
   else storyRows.push(...parsedRows);
+  // Phase 1: also restore the Multi-Timeline EDL when the Google Doc carries
+  // one. Same replace-vs-append logic as the local JSON import path.
+  const incomingMtl = parsedMeta?.multiTimeline || parsedMeta?.multi_timeline || null;
+  if (incomingMtl && typeof applyMultiTimelineDocument === 'function'){
+    const incomingHasClips = Array.isArray(incomingMtl.clips) && incomingMtl.clips.length > 0;
+    const currentHasClips = Array.isArray(multiTimeline?.clips) && multiTimeline.clips.length > 0;
+    if (replace || incomingHasClips || !currentHasClips){
+      applyMultiTimelineDocument(incomingMtl);
+    }
+  }
   ensureStorySeed();
   renderStoryAssembly();
   storyCommitSharedState(true);
+  // Forced reconcile after import to settle live-cue layout (see JSON-import
+  // path for the matching call).
+  try{ scheduleStoryReconcile?.({ force:true, delay:60 }); }catch(_e){}
   const relinkMsg = relinkStats.pending
     ? ` ${relinkStats.pending} card(s) are pending transcript relink.`
     : ` ${relinkStats.linked} card(s) linked to live cues; ${relinkStats.generic} kept as generic.`;
-  setStatusSafe?.(`Story assembly loaded from Google Doc.${relinkMsg}`);
+  const mpMsg = mpStats && (mpStats.assets || mpStats.states) ? ` Media Pool restored: ${mpStats.assets || 0} asset(s), ${mpStats.states || 0} transcript/comment state(s).` : '';
+  const mtlMsg = incomingMtl && Array.isArray(incomingMtl.clips) && incomingMtl.clips.length
+    ? ` Multi-Timeline restored: ${incomingMtl.clips.length} clip(s).` : '';
+  setStatusSafe?.(`Story assembly loaded from Google Doc.${relinkMsg}${mpMsg}${mtlMsg}`);
 }
 
 async function storySendCardForAlignToAudio(rowId, cardId){
@@ -8810,6 +9485,7 @@ function rearrangeTopToolbar(){
   const importVideo = document.getElementById('fileInput')?.closest('label');
   const importSrt = document.getElementById('srtInput')?.closest('label');
   const youtube = document.getElementById('btnYouTubeImport');
+  const iconik = document.getElementById('btnIconikImport');
   const drive = document.getElementById('btnGoogleDriveImport');
   const share = document.getElementById('btnShareSession');
   ensureExportDropdown();
@@ -8819,7 +9495,7 @@ function rearrangeTopToolbar(){
   const fps = document.getElementById('fpsSelect')?.closest('.fps');
   const guide = toolbar.querySelector('a[href*="README"], a[href$="README.html"]');
 
-  [importVideo, importSrt, youtube, drive, share, exportMenu, fps, guide].forEach(el => {
+  [importVideo, importSrt, youtube, iconik, drive, share, exportMenu, fps, guide].forEach(el => {
     if (el && toolbar.contains(el) && !nodes.includes(el)) nodes.push(el);
   });
 
@@ -10116,6 +10792,7 @@ function rememberLocalCacheFromBackend(data){
   const src = data?.source;
   if (!src || src.type !== 'local_cached' || !src.cache_id) return;
   const curFile = currentMediaSource?.file || lastLoadedVideoFile || fileInput?.files?.[0] || null;
+  const mediaPoolKey = currentMediaSource?.mediaPoolKey || '';
   currentMediaSource = {
     type: 'local',
     file: curFile,
@@ -10124,7 +10801,26 @@ function rememberLocalCacheFromBackend(data){
     audioPath: src.audio_path || '',
     filename: src.filename || curFile?.name || 'media',
     duration: Number(src.duration || 0) || 0,
+    mediaPoolKey,
   };
+  // Propagate the new cache_id back to the matching Media Pool asset so the
+  // wiring survives across mode switches (Story Mode → Multi-Timeline → render).
+  // Without this, the cache_id lives on currentMediaSource only and the
+  // render pipeline can't resolve the asset by media_pool_key.
+  try{
+    if (mediaPoolKey && Array.isArray(__mediaPoolAssets)){
+      const asset = __mediaPoolAssets.find(a => a.media_pool_key === mediaPoolKey);
+      if (asset){
+        asset.cache_id = String(src.cache_id);
+        asset.cacheId = asset.cache_id;
+        asset.cached = true;
+        asset.metadata = Object.assign({}, asset.metadata || {}, { cache_id: asset.cache_id });
+        mediaPoolPersistAssets?.();
+        try{ renderMediaPoolTray?.(); }catch(_e){}
+        try{ renderMediaPoolProjectList?.(); }catch(_e){}
+      }
+    }
+  }catch(_e){}
 }
 
 
@@ -10274,6 +10970,265 @@ async function analyzeLocalCachedAlignWithBackend(){
   return true;
 }
 
+
+/* ============================================================================
+   Iconik cached-source pipeline
+   ----------------------------------------------------------------------------
+   Mirrors the Local/Drive cache+transcribe+align flow. The cache_id is the
+   Iconik asset_id itself, so re-caching is a no-op (the server checks the
+   cache directory). The cache is what makes Iconik assets first-class
+   citizens for Transcribe / Align-To-Audio / Multi-Timeline render —
+   without it, Iconik is a streaming preview only.
+   ========================================================================== */
+
+function getCurrentIconikSource(){
+  return (currentMediaSource && currentMediaSource.type === 'iconik') ? currentMediaSource : null;
+}
+
+function getCurrentIconikCachedSource(){
+  // "Cached" only counts when the cache job has actually run and stamped a
+  // cache_id back onto currentMediaSource. The asset_id alone is not enough
+  // — it identifies the asset, not whether the bytes are on disk.
+  const src = getCurrentIconikSource();
+  if (!src) return null;
+  const cacheId = String(src.cacheId || '');
+  if (!cacheId) return null;
+  return { ...src, cacheId };
+}
+
+function rememberIconikCacheFromBackend(data){
+  // Persist cache_id on currentMediaSource AND on the matching Media Pool
+  // asset so future activations don't re-cache and the render pipeline can
+  // resolve media_pool_key → cache_id.
+  const src = data?.source;
+  if (!src || src.type !== 'iconik_cached') return;
+  const cacheId = String(src.cache_id || src.asset_id || '');
+  if (!cacheId) return;
+  if (currentMediaSource){
+    currentMediaSource.cacheId = cacheId;
+    currentMediaSource.cacheDir = src.cache_dir || '';
+    currentMediaSource.audioPath = src.audio_path || '';
+  }
+  try{
+    const targetKey = currentMediaSource?.mediaPoolKey || `iconik:${cacheId}`;
+    if (targetKey && Array.isArray(__mediaPoolAssets)){
+      const asset = __mediaPoolAssets.find(a => a.media_pool_key === targetKey);
+      if (asset){
+        asset.cache_id = cacheId;
+        asset.cacheId = cacheId;
+        asset.cached = true;
+        asset.metadata = Object.assign({}, asset.metadata || {}, { cache_id: cacheId });
+        mediaPoolPersistAssets?.();
+        try{ renderMediaPoolTray?.(); }catch(_e){}
+      }
+    }
+  }catch(_e){}
+}
+
+async function ensureIconikSourceCache(){
+  // No-op when the server already has a cached file for this Iconik asset.
+  // Otherwise: kick off the cache job and wait. Returns the cached source
+  // ref or null if there's no Iconik asset to cache.
+  const cached = getCurrentIconikCachedSource();
+  if (cached?.cacheId){
+    // Probe the cache stream — if the server lost the file (e.g. evicted),
+    // fall through to re-cache.
+    try{
+      const probe = await fetch(`${API_BASE}/api/iconik_cached_media/${encodeURIComponent(cached.cacheId)}`, { method:'HEAD' });
+      if (probe.ok || probe.status === 206) return cached;
+    }catch(_e){}
+  }
+  const src = getCurrentIconikSource();
+  if (!src?.assetId) return null;
+
+  progressStart('Caching Iconik media on the server…');
+  const res = await fetch(`${API_BASE}/api/iconik_cache_start`, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ asset_id: src.assetId }),
+  });
+  if (!res.ok){
+    const msg = await res.text().catch(()=> '');
+    throw new Error(`Iconik cache HTTP ${res.status} ${msg}`);
+  }
+  const startResp = await res.json().catch(()=>({}));
+  const jobId = startResp?.job_id;
+  if (!jobId) throw new Error('No job_id returned from Iconik cache job');
+  setActiveBackendJob(jobId, 'iconik_cache');
+  await pollJob(jobId);
+  const data = await fetchJobResult(jobId);
+  rememberIconikCacheFromBackend(data);
+  setStatusSafe('Iconik media cached. Starting next step…');
+
+  const next = getCurrentIconikCachedSource();
+  if (!next?.cacheId){
+    throw new Error('Iconik media was cached, but no cache_id was returned by backend.');
+  }
+  return next;
+}
+
+// Pre-warm an Iconik asset's cache from any card (Media Pool browser, Iconik
+// search results, project list) without activating it as the current player
+// source. Stamps the cache_id back onto the asset so the Media Pool reflects
+// "Cached" without a re-activation. Returns { cache_id }.
+async function startIconikCache(asset){
+  const assetId = String(asset?.asset_id || asset?.id || '');
+  if (!assetId) throw new Error('This Iconik asset has no asset ID.');
+  progressStart('Caching Iconik media on the server…');
+  let result;
+  try{
+    const res = await fetch(`${API_BASE}/api/iconik_cache_start`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ asset_id: assetId }),
+    });
+    if (!res.ok){
+      const msg = await res.text().catch(()=> '');
+      throw new Error(`Iconik cache HTTP ${res.status} ${msg}`);
+    }
+    const startResp = await res.json().catch(()=>({}));
+    const jobId = startResp?.job_id;
+    if (!jobId) throw new Error('No job_id returned from Iconik cache job');
+    setActiveBackendJob(jobId, 'iconik_cache');
+    await pollJob(jobId);
+    const data = await fetchJobResult(jobId);
+    const src = data?.source;
+    const cacheId = String(src?.cache_id || src?.asset_id || assetId);
+
+    // Stamp the cache_id onto the matching Media Pool asset (creating one if
+    // missing) so the Cached pill lights up immediately.
+    const key = String(asset.media_pool_key || `iconik:${assetId}`);
+    if (Array.isArray(__mediaPoolAssets)){
+      let target = __mediaPoolAssets.find(a => a.media_pool_key === key)
+                || __mediaPoolAssets.find(a => String(a.asset_id || a.id || '') === assetId
+                                            && String(a.source_type || 'iconik') === 'iconik');
+      if (!target){
+        // Asset not yet in pool — register it now so the cache has a home.
+        mediaPoolUpsertAsset({ ...asset, source_type:'iconik' });
+        target = __mediaPoolAssets.find(a => a.media_pool_key === key)
+              || __mediaPoolAssets.find(a => String(a.asset_id || a.id || '') === assetId
+                                          && String(a.source_type || 'iconik') === 'iconik');
+      }
+      if (target){
+        target.cache_id = cacheId;
+        target.cacheId = cacheId;
+        target.cached = true;
+        target.metadata = Object.assign({}, target.metadata || {}, { cache_id: cacheId });
+        mediaPoolPersistAssets?.();
+      }
+    }
+
+    // Mirror onto currentMediaSource if this is the active source.
+    if (currentMediaSource?.type === 'iconik' && String(currentMediaSource.assetId || '') === assetId){
+      currentMediaSource.cacheId = cacheId;
+    }
+
+    setStatusSafe(`Iconik cached: ${asset.title || asset.name || assetId}`);
+    result = { cache_id: cacheId };
+  } finally {
+    progressDone(false);
+    try{ renderMediaPoolTray?.(); }catch(_e){}
+    try{ renderMediaPoolProjectList?.(); }catch(_e){}
+    try{ renderIconikAssets?.(__iconikLastAssets || []); }catch(_e){}
+  }
+  return result;
+}
+
+async function transcribeIconikCachedWithBackend(){
+  const src = getCurrentIconikCachedSource();
+  if (!src?.cacheId) return false;
+  const { model, device, compute, language } = getWhisperSettings();
+  progressStart('Analyzing cached Iconik audio for transcription…');
+  const res = await fetch(`${API_BASE}/api/iconik_cached_transcribe_start`, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      cache_id: src.cacheId,
+      model, device, compute_type: compute, language,
+      word_timestamps: true,
+      vad_filter: true,
+    }),
+  });
+  const startResp = await res.json().catch(()=>({}));
+  if (!res.ok) throw new Error(startResp?.error || startResp?.message || `HTTP ${res.status}`);
+  const jobId = startResp?.job_id;
+  if (!jobId) throw new Error('No job_id returned');
+  setActiveBackendJob(jobId, 'iconik_cached_transcribe');
+  await pollJob(jobId);
+  const data = await fetchJobResult(jobId);
+  rememberIconikCacheFromBackend(data);
+
+  const srtText = data?.srt || '';
+  if (!srtText.trim()){ setStatus('No transcription returned'); return true; }
+  const parsed = parseSRT(srtText);
+  initialEntries = parsed.map((e, idx) => ({ start:e.start, end:e.end, text:e.text, index:idx }));
+  entries = parsed.map((e, idx) => ({
+    start:e.start, end:e.end, text:e.text,
+    orig:{ start:e.start, end:e.end, text:e.text }, origIndex: idx
+  }));
+  if (!entriesB?.length){
+    entriesB = parsed.map((e) => ({ start:e.start, end:e.end, text:'' }));
+    initialEntriesB = entriesB.map((e) => ({ start:e.start, end:e.end, text:e.text }));
+  }
+  renderTranscript();
+  if (isDualMode) renderTranscriptB();
+  progressDone(true);
+  const box = document.getElementById('alignSrtText');
+  if (box && !box.value.trim()) box.value = srtText;
+  const langInfo = formatBackendLanguageSummary(data);
+  statusEl.textContent = `Transcribed ${entries.length} captions from cached Iconik audio (model: ${data?.model || model}${langInfo ? ', ' + langInfo : ''})`;
+  setStatus('Ready');
+  return true;
+}
+
+async function analyzeIconikCachedAlignWithBackend(){
+  const src = getCurrentIconikCachedSource();
+  if (!src?.cacheId) return false;
+  const srtText = document.getElementById('alignSrtText')?.value || '';
+  if (!srtText.trim()){ alert('Paste SRT text to align first.'); return true; }
+  const { model, device, compute, language } = getWhisperSettings();
+  progressStart('Analyzing cached Iconik audio for alignment…');
+  const res = await fetch(`${API_BASE}/api/iconik_cached_align_start`, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      cache_id: src.cacheId,
+      text: srtText,
+      model, device, compute_type: compute, language,
+      word_timestamps: true,
+      vad_filter: true,
+    }),
+  });
+  const startResp = await res.json().catch(()=>({}));
+  if (!res.ok) throw new Error(startResp?.error || startResp?.message || `HTTP ${res.status}`);
+  const jobId = startResp?.job_id;
+  if (!jobId) throw new Error('No job_id returned');
+  setActiveBackendJob(jobId, 'iconik_cached_align');
+  await pollJob(jobId);
+  const data = await fetchJobResult(jobId);
+  rememberIconikCacheFromBackend(data);
+
+  const alignedSrt = data?.aligned_srt || '';
+  if (!alignedSrt.trim()){ setStatus('No aligned SRT returned'); return true; }
+  const parsed = parseSRT(alignedSrt);
+  initialEntries = parsed.map((e, idx) => ({ start:e.start, end:e.end, text:e.text, index:idx }));
+  entries = parsed.map((e, idx) => ({
+    start:e.start, end:e.end, text:e.text,
+    orig:{ start:e.start, end:e.end, text:e.text }, origIndex: idx
+  }));
+  if (!entriesB?.length){
+    entriesB = parsed.map((e) => ({ start:e.start, end:e.end, text:'' }));
+    initialEntriesB = entriesB.map((e) => ({ start:e.start, end:e.end, text:e.text }));
+  }
+  renderTranscript();
+  if (isDualMode) renderTranscriptB();
+  progressDone(true);
+  document.getElementById('alignSrtText').value = alignedSrt;
+  const low = (data?.stats?.low_confidence ?? 0);
+  const total = (data?.stats?.total ?? entries.length);
+  const langInfo = formatBackendLanguageSummary(data);
+  statusEl.textContent = `Aligned ${entries.length} captions from cached Iconik audio (low confidence: ${low}/${total}${langInfo ? ', ' + langInfo : ''})`;
+  setStatus('Ready');
+  return true;
+}
+
+
 async function transcribeWithBackend(){  try {
 
   if (getCurrentYouTubeSource()) {
@@ -10282,6 +11237,17 @@ async function transcribeWithBackend(){  try {
 
   if (getCurrentGoogleDriveSource()) {
     return await transcribeGoogleDriveCachedWithBackend();
+  }
+
+  // Iconik path: auto-cache then transcribe. The cache job downloads the
+  // signed URL bytes to disk and prepares a 16 kHz WAV, so the existing
+  // Whisper pipeline can run unchanged.
+  if (getCurrentIconikSource()){
+    await ensureIconikSourceCache();
+    if (getCurrentIconikCachedSource()) {
+      return await transcribeIconikCachedWithBackend();
+    }
+    return;
   }
 
   // Local media path: upload/extract once, remember cache_id, then transcribe from cached WAV.
@@ -10305,6 +11271,16 @@ async function analyzeAlignWithBackend(){  try {
 
   if (getCurrentGoogleDriveSource()) {
     return await analyzeGoogleDriveCachedAlignWithBackend();
+  }
+
+  // Iconik align: auto-cache then align. Same shape as transcribe; reuses
+  // the cached WAV produced by the cache job.
+  if (getCurrentIconikSource()){
+    await ensureIconikSourceCache();
+    if (getCurrentIconikCachedSource()) {
+      return await analyzeIconikCachedAlignWithBackend();
+    }
+    return;
   }
 
   // Local media path: upload/extract once, remember cache_id, then align from cached WAV.
@@ -10498,6 +11474,1905 @@ async function alignToSrtMappingOnly(){
 }
 
 
+/* ---------- Media Pool + Iconik Collections Browser ---------- */
+let __iconikLastAssets = [];
+let __iconikLastCollections = [];
+let __iconikCurrentAsset = null;
+let __iconikCurrentCollection = null;
+let __mediaPoolAssets = [];
+let __mediaPoolActiveSource = 'iconik';
+let __mediaPoolLocalFiles = new Map(); // key -> File, session-only because browsers cannot persist File objects safely
+let __mediaPoolCurrentKey = '';
+let __mediaPoolAssetStates = {}; // media_pool_key -> { lastTime, transcriptA, transcriptB, initialA, initialB }
+let __mediaPoolApplyingTranscript = false;
+let __mediaPoolTranscriptSaveTimer = null;
+
+function mediaPoolLoadAssetStates(){
+  try{
+    const raw = localStorage.getItem('transcriberMediaPoolAssetStatesV1');
+    const parsed = raw ? JSON.parse(raw) : {};
+    __mediaPoolAssetStates = (parsed && typeof parsed === 'object') ? parsed : {};
+  }catch(_e){ __mediaPoolAssetStates = {}; }
+}
+function mediaPoolPersistAssetStates(){
+  try{
+    // Keep transcript memory lightweight and project-local. File objects / blob URLs are never stored here.
+    localStorage.setItem('transcriberMediaPoolAssetStatesV1', JSON.stringify(__mediaPoolAssetStates || {}));
+  }catch(_e){}
+}
+mediaPoolLoadAssetStates();
+
+
+function mediaPoolCloneCue(e, idx=0){
+  if (!e) return null;
+  const out = {
+    id: e.id || undefined,
+    start: Number(e.start || 0),
+    end: Number(e.end || 0),
+    text: String(e.text || ''),
+    origIndex: (e.origIndex ?? idx),
+    isNew: !!e.isNew,
+  };
+  if (e.orig) out.orig = { start:Number(e.orig.start || out.start), end:Number(e.orig.end || out.end), text:String(e.orig.text || out.text) };
+  if (e.verifyScore != null) { out.verifyScore = e.verifyScore; out.verifyOk = e.verifyOk; }
+  if (e.aiWarn) { out.aiWarn = e.aiWarn; out.aiDetail = e.aiDetail || ''; }
+  return out;
+}
+function mediaPoolCloneCueList(list){
+  return (Array.isArray(list) ? list : []).map((e, idx) => mediaPoolCloneCue(e, idx)).filter(Boolean);
+}
+function mediaPoolNormalizeCueList(list){
+  return mediaPoolCloneCueList(list).map((e, idx) => ({
+    ...e,
+    orig: e.orig || { start:e.start, end:e.end, text:e.text },
+    origIndex: e.origIndex ?? idx,
+  }));
+}
+function mediaPoolCaptureTranscriptSnapshot(){
+  try{ flushEditsFromDOM?.(); }catch(_e){}
+  return {
+    transcriptA: mediaPoolCloneCueList(entries),
+    transcriptB: mediaPoolCloneCueList(entriesB),
+    initialA: mediaPoolCloneCueList(initialEntries),
+    initialB: mediaPoolCloneCueList(initialEntriesB),
+    baseName: window.currentBaseName || '',
+    savedAt: Date.now(),
+  };
+}
+function mediaPoolTranscriptHasContent(snapshot){
+  const a = snapshot?.transcriptA || [];
+  const b = snapshot?.transcriptB || [];
+  return a.length > 0 || b.some(x => String(x?.text || '').trim());
+}
+function mediaPoolCaptureTranscriptForKey(key){
+  if (!key) return;
+  const snap = mediaPoolCaptureTranscriptSnapshot();
+  const prev = __mediaPoolAssetStates[key] || {};
+  __mediaPoolAssetStates[key] = { ...prev, ...snap, hasTranscript:mediaPoolTranscriptHasContent(snap), transcriptCount:(snap.transcriptA || []).length };
+  const asset = (__mediaPoolAssets || []).find(a => mediaPoolAssetKey(a) === key);
+  if (asset){
+    asset.has_transcript = __mediaPoolAssetStates[key].hasTranscript;
+    asset.transcript_count = __mediaPoolAssetStates[key].transcriptCount;
+  }
+  mediaPoolPersistAssetStates();
+  try{ mediaPoolPersistAssets(); }catch(_e){}
+}
+function mediaPoolSaveCurrentTranscript(){
+  if (__mediaPoolApplyingTranscript || !__mediaPoolCurrentKey) return;
+  mediaPoolCaptureTranscriptForKey(__mediaPoolCurrentKey);
+}
+function mediaPoolMarkTranscriptDirty(){
+  if (__mediaPoolApplyingTranscript || !__mediaPoolCurrentKey) return;
+  clearTimeout(__mediaPoolTranscriptSaveTimer);
+  __mediaPoolTranscriptSaveTimer = setTimeout(() => {
+    mediaPoolSaveCurrentTranscript();
+    try{ renderMediaPoolTray(); }catch(_e){}
+    try{ renderMediaPoolProjectList(); }catch(_e){}
+  }, 350);
+}
+function mediaPoolRestoreAssetTranscript(asset){
+  const key = mediaPoolAssetKey(asset);
+  const st = __mediaPoolAssetStates[key] || {};
+  __mediaPoolApplyingTranscript = true;
+  try{
+    const a = Array.isArray(st.transcriptA) ? st.transcriptA : [];
+    const b = Array.isArray(st.transcriptB) ? st.transcriptB : [];
+    entries = mediaPoolNormalizeCueList(a);
+    initialEntries = mediaPoolNormalizeCueList(Array.isArray(st.initialA) && st.initialA.length ? st.initialA : a);
+    entriesB = mediaPoolNormalizeCueList(b);
+    initialEntriesB = mediaPoolNormalizeCueList(Array.isArray(st.initialB) && st.initialB.length ? st.initialB : b);
+    if (st.baseName) window.currentBaseName = st.baseName;
+    try{ ensureCueIds?.(entries); ensureCueIds?.(entriesB); }catch(_e){}
+    try{ renderBySubsMode?.(); }catch(_e){ try{ renderTranscript?.(); }catch(_e2){} }
+  }finally{
+    __mediaPoolApplyingTranscript = false;
+  }
+}
+function mediaPoolTranscriptBadgeFor(asset){
+  const key = mediaPoolAssetKey(asset);
+  const st = __mediaPoolAssetStates[key] || {};
+  const n = Number(st.transcriptCount || asset?.transcript_count || 0);
+  if (st.hasTranscript || asset?.has_transcript || n > 0) return n > 0 ? `${n} cue${n === 1 ? '' : 's'}` : 'Transcript';
+  return '';
+}
+function mediaPoolWireTranscriptAutosave(){
+  if (window.__mediaPoolTranscriptAutosaveBound) return;
+  window.__mediaPoolTranscriptAutosaveBound = true;
+  document.addEventListener('input', ev => {
+    const t = ev.target;
+    if (t && t.closest && (t.closest('#transcript') || t.closest('#transcriptB') || t.closest('#txtBigBox') || t.closest('#txtBoxA') || t.closest('#txtBoxB'))){
+      mediaPoolMarkTranscriptDirty();
+    }
+  }, true);
+  document.addEventListener('blur', ev => {
+    const t = ev.target;
+    if (t && t.closest && (t.closest('#transcript') || t.closest('#transcriptB') || t.closest('#txtBigBox') || t.closest('#txtBoxA') || t.closest('#txtBoxB'))){
+      mediaPoolSaveCurrentTranscript();
+    }
+  }, true);
+}
+mediaPoolWireTranscriptAutosave();
+
+function getMediaPoolAssets(){
+  return Array.isArray(__mediaPoolAssets) ? __mediaPoolAssets : [];
+}
+
+function mediaPoolSerializableAsset(asset){
+  if (!asset) return null;
+  const out = { ...asset };
+  delete out.file;
+  delete out.object_url;
+  delete out.playbackUrl;
+  delete out._hoverVideo;
+  delete out._el;
+  return out;
+}
+function mediaPoolExportProjectSnapshot(){
+  try{ mediaPoolSaveCurrentTranscript?.(); }catch(_e){}
+  const assets = (typeof getMediaPoolAssets === 'function' ? getMediaPoolAssets() : []).map(mediaPoolSerializableAsset).filter(Boolean);
+  const states = {};
+  try{
+    assets.forEach(a => {
+      const key = a.media_pool_key || (typeof mediaPoolAssetKey === 'function' ? mediaPoolAssetKey(a) : '');
+      if (key && __mediaPoolAssetStates?.[key]) states[key] = __mediaPoolAssetStates[key];
+    });
+    // Also keep any source keys used by Story Cards, even if the asset was not currently visible in the Project Pool.
+    (storyRows || []).forEach(r => (r.cards || []).forEach(c => {
+      const key = c.media_pool_key || c.mediaPoolKey || '';
+      if (key && __mediaPoolAssetStates?.[key]) states[key] = __mediaPoolAssetStates[key];
+    }));
+  }catch(_e){}
+  return {
+    version:1,
+    current_key: __mediaPoolCurrentKey || '',
+    assets,
+    assetStates: states,
+    note:'Local browser File objects cannot be restored after import; re-add local files if needed.'
+  };
+}
+function mediaPoolImportProjectSnapshot(snapshot){
+  if (!snapshot || typeof snapshot !== 'object') return { assets:0, states:0 };
+  let added = 0;
+  let stateCount = 0;
+  try{
+    const assets = Array.isArray(snapshot.assets) ? snapshot.assets : [];
+    assets.forEach(raw => {
+      if (!raw) return;
+      const a = mediaPoolSerializableAsset(raw);
+      if (!a) return;
+      const key = a.media_pool_key || (typeof mediaPoolAssetKey === 'function' ? mediaPoolAssetKey(a) : '');
+      if (!key) return;
+      const idx = (__mediaPoolAssets || []).findIndex(x => (x.media_pool_key || (typeof mediaPoolAssetKey === 'function' ? mediaPoolAssetKey(x) : '')) === key);
+      if (idx >= 0) __mediaPoolAssets[idx] = { ...__mediaPoolAssets[idx], ...a };
+      else { __mediaPoolAssets.push(a); added++; }
+    });
+    const states = snapshot.assetStates || snapshot.asset_states || {};
+    if (states && typeof states === 'object'){
+      Object.entries(states).forEach(([key, value]) => {
+        if (!key || !value || typeof value !== 'object') return;
+        __mediaPoolAssetStates[key] = { ...(__mediaPoolAssetStates[key] || {}), ...value };
+        stateCount++;
+      });
+    }
+    mediaPoolPersistAssets?.();
+    mediaPoolPersistAssetStates?.();
+    renderMediaPoolTray?.();
+    renderMediaPoolProjectList?.();
+  }catch(err){ console.warn('Media Pool project snapshot import failed', err); }
+  return { assets:added, states:stateCount };
+}
+
+function mediaPoolPersistAssets(){
+  // Local File objects and object URLs are session-only. Persist only lightweight
+  // source references so reloads never restore broken blob URLs.
+  try{
+    const safe = (__mediaPoolAssets || []).filter(a => (a.source_type || a.sourceType) !== 'local').map(a => {
+      const out = { ...a };
+      delete out.file;
+      delete out.object_url;
+      delete out.playbackUrl;
+      return out;
+    });
+    localStorage.setItem('transcriberMediaPoolV1', JSON.stringify(safe));
+  }catch(_e){}
+}
+
+function mediaPoolUpsertAsset(asset){
+  if (!asset) return;
+  const sourceType = asset.source_type || asset.sourceType || 'iconik';
+  const assetId = asset.asset_id || asset.id || asset.source_id || asset.local_id || '';
+  const key = `${sourceType}:${assetId || asset.title || Date.now()}`;
+  const normalized = { ...asset, source_type: sourceType, asset_id: assetId, media_pool_key: key };
+  if (sourceType === 'local' && asset.file instanceof File){
+    __mediaPoolLocalFiles.set(key, asset.file);
+    normalized.local_id = assetId || key;
+    normalized.asset_id = normalized.local_id;
+    normalized.size = asset.file.size;
+    normalized.name = asset.file.name;
+    normalized.title = asset.title || asset.file.name;
+    normalized.object_url = normalized.object_url || URL.createObjectURL(asset.file);
+    delete normalized.file;
+  }
+  const idx = __mediaPoolAssets.findIndex(x => x.media_pool_key === key);
+  if (idx >= 0) __mediaPoolAssets[idx] = { ...__mediaPoolAssets[idx], ...normalized };
+  else __mediaPoolAssets.push(normalized);
+
+  // If the user adds the currently loaded media into the pool after already
+  // importing/transcribing, bind the existing transcript to that new asset.
+  try{
+    const hasExistingTranscript = (Array.isArray(entries) && entries.length) || (Array.isArray(entriesB) && entriesB.some(e => String(e?.text || '').trim()));
+    const isCurrent = (__mediaPoolCurrentKey && __mediaPoolCurrentKey === key) ||
+      (!__mediaPoolCurrentKey && hasExistingTranscript && (sourceType === 'local' || sourceType === 'youtube' || sourceType === 'drive' || sourceType === 'google_drive' || sourceType === 'iconik'));
+    if (isCurrent) mediaPoolCaptureTranscriptForKey(key);
+  }catch(_e){}
+
+  renderMediaPoolTray();
+  mediaPoolPersistAssets();
+}
+
+function loadMediaPoolFromStorage(){
+  try{
+    const arr = JSON.parse(localStorage.getItem('transcriberMediaPoolV1') || '[]');
+    if (Array.isArray(arr)) __mediaPoolAssets = arr;
+  }catch(_e){ __mediaPoolAssets = []; }
+}
+loadMediaPoolFromStorage();
+
+async function fetchIconikStatus(){
+  const res = await fetch(`${API_BASE}/api/iconik/status`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+async function searchIconikAssets(q='', page=1){
+  const url = new URL(`${API_BASE}/api/iconik/assets`);
+  url.searchParams.set('limit', '36');
+  url.searchParams.set('page', String(page || 1));
+  if (q) url.searchParams.set('q', q);
+  const res = await fetch(url.toString());
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+async function fetchIconikCollections(q='', page=1){
+  const url = new URL(`${API_BASE}/api/iconik/collections`);
+  url.searchParams.set('limit', '60');
+  url.searchParams.set('page', String(page || 1));
+  if (q) url.searchParams.set('q', q);
+  const res = await fetch(url.toString());
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+async function fetchIconikCollectionAssets(collectionId, page=1){
+  const url = new URL(`${API_BASE}/api/iconik/collections/${encodeURIComponent(collectionId)}/assets`);
+  url.searchParams.set('limit', '48');
+  url.searchParams.set('page', String(page || 1));
+  const res = await fetch(url.toString());
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+async function getIconikProxyUrl(assetId){
+  const res = await fetch(`${API_BASE}/api/iconik/assets/${encodeURIComponent(assetId)}/proxy-url`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+async function fetchIconikAssetComments(assetId){
+  const res = await fetch(`${API_BASE}/api/iconik/assets/${encodeURIComponent(assetId)}/comments`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+async function postIconikAssetCommentSegment(assetId, payload){
+  const res = await fetch(`${API_BASE}/api/iconik/assets/${encodeURIComponent(assetId)}/segments`, {
+    method:'POST',
+    headers:{ 'Content-Type':'application/json' },
+    body:JSON.stringify(payload || {})
+  });
+  let data = null;
+  try{ data = await res.json(); }catch(_e){ data = null; }
+  if (!res.ok || (data && data.ok === false)){
+    const attempts = Array.isArray(data?.attempts) ? data.attempts.slice(-5).map(a => `${a.path || ''} · ${a.status || ''} · ${a.error || ''}`).join('\n') : '';
+    throw new Error((data?.error || data?.detail || `HTTP ${res.status}`) + (attempts ? `\n${attempts}` : ''));
+  }
+  return data || { ok:true };
+}
+
+function mediaPoolParseCommentTime(value){
+  if (value == null || value === '') return 0;
+  if (typeof value === 'number' && Number.isFinite(value)) return Math.max(0, value);
+  const raw = String(value || '').trim();
+  if (!raw) return 0;
+  if (/^\d+(\.\d+)?$/.test(raw)) return Math.max(0, Number(raw));
+  // Accept HH:MM:SS, HH:MM:SS:FF, MM:SS, or MM:SS:FF.
+  const parts = raw.replace(',', '.').split(':').map(x => x.trim());
+  const nums = parts.map(x => Number(x));
+  if (nums.every(n => Number.isFinite(n))){
+    const f = getFPS ? getFPS() : 25;
+    if (parts.length === 4) return Math.max(0, nums[0]*3600 + nums[1]*60 + nums[2] + nums[3]/Math.max(1,f));
+    if (parts.length === 3) return Math.max(0, nums[0]*3600 + nums[1]*60 + nums[2]);
+    if (parts.length === 2) return Math.max(0, nums[0]*60 + nums[1]);
+  }
+  return 0;
+}
+
+function mediaPoolPickFirst(obj, keys){
+  for (const k of keys){
+    try{
+      const val = k.split('.').reduce((acc, part) => acc && acc[part], obj);
+      if (val !== undefined && val !== null && val !== '') return val;
+    }catch(_e){}
+  }
+  return '';
+}
+
+function mediaPoolIsDeletedIconikComment(raw={}){
+  const yes = v => {
+    if (v === true) return true;
+    if (v == null || v === false || v === '') return false;
+    return /^(1|true|yes|y|deleted|archived|inactive|hidden|removed)$/i.test(String(v).trim());
+  };
+  const status = ['status','state','object_status','segment_status','visibility','availability']
+    .map(k => String(raw?.[k] || raw?.metadata?.[k] || '').toLowerCase()).join(' ');
+  const flags = ['deleted','is_deleted','isDeleted','archived','is_archived','isArchived','removed','is_removed','isRemoved','hidden','is_hidden','isHidden'];
+  if (flags.some(k => yes(raw?.[k]) || yes(raw?.metadata?.[k]))) return true;
+  const dated = ['deleted_at','deletedAt','date_deleted','dateDeleted','removed_at','removedAt','archived_at','archivedAt'];
+  if (dated.some(k => (raw?.[k] != null && raw?.[k] !== '') || (raw?.metadata?.[k] != null && raw?.metadata?.[k] !== ''))) return true;
+  return /deleted|archived|removed|hidden/.test(status);
+}
+
+function mediaPoolNormalizeIconikComment(raw={}, idx=0, asset=null){
+  if (mediaPoolIsDeletedIconikComment(raw)) return null;
+  const body = mediaPoolPickFirst(raw, [
+    // Iconik segment comments display their text in segment_text. Prefer it
+    // before title so generic segment titles do not mask the real review note.
+    'segment_text','segmentText','metadata.segment_text','metadata.segmentText',
+    'body','text','message','comment','content','description','note','value','metadata.comment','metadata.text','metadata.value','title','metadata.title'
+  ]) || '';
+  const authorObj = raw.user || raw.author || raw.created_by_user || raw.created_by || raw.owner || {};
+  const author = mediaPoolPickFirst(authorObj, ['full_name','name','email','username']) || mediaPoolPickFirst(raw, ['user_name','author_name','created_by_name']) || '';
+  const startVal = mediaPoolPickFirst(raw, [
+    'start_seconds','start_second','start_time_seconds','startTimeSeconds','time_seconds','timecode_seconds',
+    'time_start_milliseconds','timeStartMilliseconds',
+    'timestamp_seconds','timestamp','time','start','start_time','startTime','in','in_time','in_point','inpoint','mark_in','markIn',
+    'timecode','start_timecode','startTimecode','metadata.start_timecode','metadata.timecode'
+  ]);
+  const endVal = mediaPoolPickFirst(raw, [
+    'end_seconds','end_second','end_time_seconds','endTimeSeconds','time_end_milliseconds','timeEndMilliseconds','end','end_time','endTime','out','out_time','out_point','outpoint','mark_out','markOut',
+    'end_timecode','endTimecode','metadata.end_timecode'
+  ]);
+  const startMs = mediaPoolPickFirst(raw, ['time_start_milliseconds','timeStartMilliseconds']);
+  const endMs = mediaPoolPickFirst(raw, ['time_end_milliseconds','timeEndMilliseconds']);
+  const start = startMs !== '' ? Math.max(0, Number(startMs) / 1000) : mediaPoolParseCommentTime(startVal);
+  let end = endMs !== '' ? Math.max(0, Number(endMs) / 1000) : mediaPoolParseCommentTime(endVal);
+  if (!end || end < start) end = start;
+  const id = raw.id || raw.comment_id || raw.object_id || raw.uuid || `comment_${idx}_${Math.round(start*1000)}`;
+  return {
+    id:String(id),
+    source:'iconik',
+    asset_id:asset?.asset_id || asset?.id || raw.asset_id || '',
+    start,
+    end,
+    text:String(body || '').trim() || '(No comment text)',
+    author:String(author || '').trim(),
+    raw
+  };
+}
+
+function mediaPoolCommentsForAsset(asset){
+  if (!asset) return [];
+  const key = mediaPoolAssetKey(asset);
+  const st = __mediaPoolAssetStates[key] || {};
+  if (Array.isArray(st.comments) && st.comments.length) return st.comments;
+  if (Array.isArray(asset.comments) && asset.comments.length) return asset.comments;
+  return Array.isArray(st.comments) ? st.comments : [];
+}
+function mediaPoolCommentBadgeFor(asset){
+  const key = mediaPoolAssetKey(asset);
+  const st = __mediaPoolAssetStates[key] || {};
+  const n = Number(st.commentCount || asset?.comment_count || (Array.isArray(st.comments) ? st.comments.length : 0));
+  return n > 0 ? `${n} comment${n === 1 ? '' : 's'}` : '';
+}
+
+async function mediaPoolImportIconikComments(asset){
+  if (!asset || (asset.source_type || 'iconik') !== 'iconik') return;
+  const assetId = asset.asset_id || asset.id;
+  if (!assetId){ alert('This Iconik asset has no asset_id.'); return; }
+  const key = mediaPoolAssetKey(asset);
+  const panel = document.getElementById('mediaPoolReviewPanel');
+  if (panel) panel.innerHTML = `<div class="media-pool-review-empty">Importing Iconik review comments…</div>`;
+  try{
+    const data = await fetchIconikAssetComments(assetId);
+    const items = Array.isArray(data?.items) ? data.items : [];
+    if (!items.length && data && data.ok === false){
+      const attempts = Array.isArray(data.attempts) ? data.attempts : [];
+      const summary = attempts.slice(-5).map(a => `${a.path}${a.status ? ' · ' + a.status : ''}${a.count != null ? ' · ' + a.count + ' item(s)' : ''}`).join('\n');
+      console.warn('Iconik comment import returned no items', data);
+      throw new Error((data.error || 'No Iconik comments returned.') + (summary ? `\nTried:\n${summary}` : ''));
+    }
+    const comments = items.map((x, i) => mediaPoolNormalizeIconikComment(x, i, asset))
+      .filter(c => c && (String(c.text || '').trim() || Number.isFinite(Number(c.start))))
+      .sort((a,b) => (a.start || 0) - (b.start || 0));
+    const prev = __mediaPoolAssetStates[key] || {};
+    __mediaPoolAssetStates[key] = { ...prev, comments, commentCount:comments.length, commentsImportedAt:Date.now() };
+    asset.comments = comments;
+    asset.comment_count = comments.length;
+    asset.has_comments = comments.length > 0;
+    const poolIdx = __mediaPoolAssets.findIndex(a => mediaPoolAssetKey(a) === key);
+    if (poolIdx >= 0) {
+      __mediaPoolAssets[poolIdx] = { ...__mediaPoolAssets[poolIdx], comments, comment_count:comments.length, has_comments:comments.length > 0 };
+    }
+    mediaPoolPersistAssetStates();
+    mediaPoolPersistAssets();
+    renderMediaPoolProjectList();
+    renderMediaPoolTray();
+    renderMediaPoolReviewPanel(asset);
+    try{ requestTimelineRender?.(); }catch(_e){}
+    setStatusSafe(`Imported ${comments.length} Iconik review comment${comments.length === 1 ? '' : 's'} for ${asset.title || asset.name || 'asset'}.`);
+  }catch(err){
+    renderMediaPoolReviewPanel(asset, `Could not import comments: ${err?.message || err}`);
+  }
+}
+
+async function mediaPoolActivateComment(asset, comment){
+  if (!asset || !comment) return;
+  if ((asset.source_type || '') === 'iconik') await activateIconikPreview(asset, { keepModalOpen:true });
+  else if ((asset.source_type || '') === 'local') activateLocalMediaPoolAsset(asset);
+  else if ((asset.source_type || '') === 'youtube') activateYouTubeMediaPoolAsset(asset);
+  else if (['drive','google_drive'].includes(String(asset.source_type || '').toLowerCase())) activateGoogleDriveMediaPoolAsset(asset);
+  const seekTo = Math.max(0, Number(comment.start || 0));
+  const doSeek = () => {
+    try{ seekMediaTo ? seekMediaTo(seekTo + 0.001, { play:false }) : (player.currentTime = seekTo); }catch(_e){ try{ player.currentTime = seekTo; }catch(_e2){} }
+  };
+  if (player && player.readyState < 1) player.addEventListener('loadedmetadata', doSeek, { once:true });
+  setTimeout(doSeek, 120);
+}
+
+function renderMediaPoolReviewPanel(asset=null, errorText=''){
+  const panel = document.getElementById('mediaPoolReviewPanel');
+  if (!panel) return;
+  const active = asset || getMediaPoolAssets().find(a => mediaPoolAssetKey(a) === __mediaPoolCurrentKey) || null;
+  if (!active){
+    panel.innerHTML = `<div class="media-pool-review-empty">Select an asset to view review comments.</div>`;
+    return;
+  }
+  const isIconik = (active.source_type || 'iconik') === 'iconik';
+  const comments = mediaPoolCommentsForAsset(active);
+  const title = active.title || active.name || 'Selected asset';
+  if (!isIconik){
+    panel.innerHTML = `<div class="media-pool-review-head"><b>Review Comments</b></div><div class="media-pool-review-empty">Review comment import is currently available for Iconik assets.</div>`;
+    return;
+  }
+  if (errorText){
+    panel.innerHTML = `<div class="media-pool-review-head"><b>Review Comments</b><span class="media-pool-review-actions"><button class="btn btn-outline btn-mini" id="mediaPoolClearCommentsBtn" type="button">Clear Local</button><button class="btn btn-outline btn-mini" id="mediaPoolImportCommentsBtn" type="button">Retry</button></span></div><div class="media-pool-review-error">${escapeHtml(errorText)}</div>`;
+    panel.querySelector('#mediaPoolImportCommentsBtn')?.addEventListener('click', () => mediaPoolImportIconikComments(active));
+    panel.querySelector('#mediaPoolClearCommentsBtn')?.addEventListener('click', () => mediaPoolClearAssetComments(active));
+    return;
+  }
+  if (!comments.length){
+    panel.innerHTML = `<div class="media-pool-review-head"><b>Review Comments</b><button class="btn btn-outline btn-mini" id="mediaPoolImportCommentsBtn" type="button">Import from Iconik</button></div><div class="media-pool-review-empty">No imported review comments for “${escapeHtml(title)}” yet.</div>`;
+    panel.querySelector('#mediaPoolImportCommentsBtn')?.addEventListener('click', () => mediaPoolImportIconikComments(active));
+    return;
+  }
+  panel.innerHTML = `<div class="media-pool-review-head"><b>Review Comments</b><span class="media-pool-review-actions"><button class="btn btn-outline btn-mini" id="mediaPoolClearCommentsBtn" type="button">Clear Local</button><button class="btn btn-outline btn-mini" id="mediaPoolImportCommentsBtn" type="button">Refresh</button></span></div>
+    <div class="media-pool-review-list">
+      ${comments.map((c, idx) => `<button class="media-pool-review-item" type="button" data-review-comment-index="${idx}">
+        <span class="media-pool-review-time">${escapeHtml(formatTimecodeFromSeconds(c.start || 0, getFPS()))}</span>
+        <span class="media-pool-review-text">${escapeHtml(c.text || '')}</span>
+        ${c.author ? `<small>${escapeHtml(c.author)}</small>` : ''}
+      </button>`).join('')}
+    </div>`;
+  panel.querySelector('#mediaPoolImportCommentsBtn')?.addEventListener('click', () => mediaPoolImportIconikComments(active));
+  panel.querySelector('#mediaPoolClearCommentsBtn')?.addEventListener('click', () => {
+    if (confirm('Clear local review markers for this asset? This does not delete anything from Iconik.')) mediaPoolClearAssetComments(active);
+  });
+  panel.querySelectorAll('[data-review-comment-index]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const c = comments[Number(btn.dataset.reviewCommentIndex || -1)];
+      mediaPoolActivateComment(active, c);
+    });
+  });
+}
+
+function iconikWebUrl(kind, itemOrId){
+  const item = (itemOrId && typeof itemOrId === 'object') ? itemOrId : null;
+  const explicit = item ? (item.web_url || item.app_url || item.url || item.share_url || item.view_url || '') : '';
+  if (typeof explicit === 'string' && /^https?:\/\//i.test(explicit) && !explicit.includes('/API/')) return explicit;
+
+  const rawId = item
+    ? (kind === 'collection' ? (item.collection_id || item.id) : (item.asset_id || item.id))
+    : itemOrId;
+  const safe = encodeURIComponent(String(rawId || ''));
+  if (!safe) return 'https://app.iconik.io/';
+
+  // Current iconik web-app deep links are singular. If a tenant returns a
+  // web_url from the API we prefer that above; this fallback keeps old payloads working.
+  if (kind === 'collection') return `https://app.iconik.io/collection/${safe}`;
+  return `https://app.iconik.io/asset/${safe}`;
+}
+
+function iconikFormatDuration(value){
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return value ? String(value) : '';
+  const hh = Math.floor(n / 3600);
+  const mm = Math.floor((n % 3600) / 60);
+  const ss = Math.floor(n % 60);
+  return hh > 0 ? `${pad2(hh)}:${pad2(mm)}:${pad2(ss)}` : `${pad2(mm)}:${pad2(ss)}`;
+}
+
+function iconikAssetInitials(title){
+  const words = String(title || 'Iconik').trim().split(/\s+/).filter(Boolean);
+  const out = words.slice(0, 2).map(w => w[0] || '').join('').toUpperCase();
+  return out || 'i';
+}
+
+
+
+function mediaPoolAssetKey(asset){
+  if (!asset) return '';
+  if (asset.media_pool_key) return String(asset.media_pool_key);
+  const sourceType = asset.source_type || asset.sourceType || 'media';
+  const assetId = asset.asset_id || asset.id || asset.source_id || asset.local_id || asset.youtube_id || asset.drive_id || '';
+  return `${sourceType}:${assetId || asset.title || asset.name || ''}`;
+}
+
+function mediaPoolRememberCurrentTime(){
+  if (!__mediaPoolCurrentKey || !player) return;
+  try{
+    const t = Number(player.currentTime || 0);
+    if (Number.isFinite(t)) {
+      __mediaPoolAssetStates[__mediaPoolCurrentKey] = { ...(__mediaPoolAssetStates[__mediaPoolCurrentKey] || {}), lastTime:t };
+    }
+  }catch(_e){}
+}
+
+function mediaPoolSetCurrentAsset(asset){
+  mediaPoolRememberCurrentTime();
+  mediaPoolSaveCurrentTranscript();
+  __mediaPoolCurrentKey = mediaPoolAssetKey(asset);
+  mediaPoolRestoreAssetTranscript(asset);
+  try{ renderMediaPoolTray(); }catch(_e){}
+  try{ renderMediaPoolProjectList(); }catch(_e){}
+  try{ renderMediaPoolReviewPanel(asset); }catch(_e){}
+  // Asset switched — Story Cards bound to this asset's transcript may need to
+  // re-resolve (their cueRefs are now lookable in the freshly-loaded entries).
+  // Forced because asset switch isn't reflected in the digest gate.
+  try{ scheduleStoryReconcile?.({ force:true, delay:120 }); }catch(_e){}
+}
+
+function mediaPoolRestoreAssetTime(asset){
+  const key = mediaPoolAssetKey(asset);
+  const t = Number(__mediaPoolAssetStates[key]?.lastTime || 0);
+  if (Number.isFinite(t) && t > 0 && player){
+    const apply = () => {
+      try{
+        const dur = Number(player.duration || 0);
+        player.currentTime = dur > 0 ? Math.min(Math.max(0, t), Math.max(0, dur - 0.05)) : t;
+      }catch(_e){}
+    };
+    if (player.readyState >= 1) setTimeout(apply, 30);
+    else player.addEventListener('loadedmetadata', apply, { once:true });
+  }
+}
+
+try{
+  player?.addEventListener('timeupdate', () => {
+    if (!__mediaPoolCurrentKey) return;
+    const t = Number(player.currentTime || 0);
+    if (Number.isFinite(t)) __mediaPoolAssetStates[__mediaPoolCurrentKey] = { ...(__mediaPoolAssetStates[__mediaPoolCurrentKey] || {}), lastTime:t };
+  });
+}catch(_e){}
+
+function mediaPoolSourceLabel(asset){
+  const t = String(asset?.source_type || asset?.sourceType || asset?.type || '').toLowerCase();
+  if (t === 'iconik') return 'Iconik';
+  if (t === 'local') return 'Local';
+  if (t === 'youtube') return 'YouTube';
+  if (t === 'drive' || t === 'google_drive') return 'Google Drive';
+  return 'Media';
+}
+
+function ensureMediaPoolTray(){
+  if (document.getElementById('mediaPoolTray')) return;
+  const panel = document.querySelector('.video-panel') || document.querySelector('.left-panel') || document.body;
+  const tray = document.createElement('div');
+  tray.id = 'mediaPoolTray';
+  tray.className = 'media-pool-tray';
+  tray.innerHTML = `
+    <div class="media-pool-tray-head">
+      <div>
+        <div class="media-pool-tray-title">Media Pool</div>
+        <div class="media-pool-tray-sub" id="mediaPoolTraySub">0 project assets</div>
+      </div>
+      <button class="btn btn-outline btn-mini" id="btnOpenMediaPoolTray" type="button">Open</button>
+    </div>
+    <div id="mediaPoolTrayList" class="media-pool-tray-list"></div>`;
+  try{
+    const status = document.getElementById('status');
+    if (status && status.parentElement) status.insertAdjacentElement('afterend', tray);
+    else panel.appendChild(tray);
+  }catch(_e){ panel.appendChild(tray); }
+  tray.querySelector('#btnOpenMediaPoolTray')?.addEventListener('click', () => openMediaPoolModal());
+  renderMediaPoolTray();
+}
+
+function mediaPoolTrayOpenSources(){
+  try{
+    const raw = localStorage.getItem('mediaPoolTrayOpenSourcesV1');
+    const parsed = raw ? JSON.parse(raw) : {};
+    return (parsed && typeof parsed === 'object') ? parsed : {};
+  }catch(_e){ return {}; }
+}
+function saveMediaPoolTrayOpenSources(state){
+  try{ localStorage.setItem('mediaPoolTrayOpenSourcesV1', JSON.stringify(state || {})); }catch(_e){}
+}
+
+function renderMediaPoolTray(){
+  ensureMediaPoolTray();
+  const list = document.getElementById('mediaPoolTrayList');
+  const sub = document.getElementById('mediaPoolTraySub');
+  const assets = getMediaPoolAssets();
+  if (sub) sub.textContent = `${assets.length} project asset${assets.length === 1 ? '' : 's'}`;
+  if (!list) return;
+  if (!assets.length){
+    list.innerHTML = `<div class="media-pool-empty">Add assets from Local, YouTube, Google Drive, or Iconik.</div>`;
+    return;
+  }
+  const openState = mediaPoolTrayOpenSources();
+  const grouped = assets.slice(0, 48).reduce((acc, a, idx) => {
+    const src = mediaPoolSourceLabel(a);
+    (acc[src] ||= []).push({ a, idx });
+    return acc;
+  }, {});
+  list.innerHTML = Object.keys(grouped).map(src => {
+    const isOpen = !!openState[src]; // default collapsed
+    const items = grouped[src];
+    return `
+      <div class="media-pool-tree-group ${isOpen ? 'is-open' : 'is-collapsed'}" data-media-pool-source="${escapeHtml(src)}">
+        <button class="media-pool-tree-source" type="button" data-media-pool-toggle="${escapeHtml(src)}" aria-expanded="${isOpen ? 'true' : 'false'}">
+          <span class="media-pool-tree-caret">${isOpen ? '▾' : '▸'}</span>
+          <span class="media-pool-tree-source-label">${escapeHtml(src)}</span>
+          <span class="media-pool-tree-count">${items.length}</span>
+        </button>
+        <div class="media-pool-tree-items" ${isOpen ? '' : 'hidden'}>
+          ${items.map(({a, idx}) => {
+            const title = a.title || a.name || 'Untitled asset';
+            const activeCls = mediaPoolAssetKey(a) === __mediaPoolCurrentKey ? ' is-active' : '';
+            const tb = mediaPoolTranscriptBadgeFor(a);
+            const cb = mediaPoolCommentBadgeFor(a);
+            const badges = [tb, cb].filter(Boolean).join(' · ');
+            // Cache dot: visual signal at the chip level so the user can see at
+            // a glance whether each pool asset is render-ready.
+            const isCached = !!(a.cache_id || a.cacheId || a.metadata?.cache_id);
+            const dotCls = isCached ? 'mp-cache-dot is-cached' : 'mp-cache-dot is-uncached';
+            const dotTitle = isCached ? 'Cached on server (Multi-Timeline render ready)' : 'Not cached — Transcribe / Render Preview will trigger an automatic cache';
+            return `<button class="media-pool-tree-item${activeCls}" type="button" data-media-pool-chip="${idx}" title="${escapeHtml(src + ' / ' + title)}">
+              <span class="${dotCls}" title="${escapeHtml(dotTitle)}"></span><span class="media-pool-tree-text">${escapeHtml(title)}</span>${badges ? `<span class="media-pool-tree-badge">${escapeHtml(badges)}</span>` : ''}
+            </button>`;
+          }).join('')}
+        </div>
+      </div>`;
+  }).join('');
+
+  list.querySelectorAll('[data-media-pool-toggle]').forEach(btn => {
+    btn.addEventListener('click', ev => {
+      const src = String(ev.currentTarget.dataset.mediaPoolToggle || '');
+      const state = mediaPoolTrayOpenSources();
+      state[src] = !state[src];
+      saveMediaPoolTrayOpenSources(state);
+      renderMediaPoolTray();
+    });
+  });
+  list.querySelectorAll('[data-media-pool-chip]').forEach(btn => {
+    btn.addEventListener('click', async ev => {
+      const asset = __mediaPoolAssets[Number(ev.currentTarget.dataset.mediaPoolChip || -1)];
+      if (asset?.source_type === 'iconik') await activateIconikPreview(asset, { keepModalOpen:true });
+      else if (asset?.source_type === 'local') activateLocalMediaPoolAsset(asset);
+      else if (asset?.source_type === 'youtube') activateYouTubeMediaPoolAsset(asset);
+      else if (['drive','google_drive'].includes(String(asset?.source_type || '').toLowerCase())) activateGoogleDriveMediaPoolAsset(asset);
+    });
+  });
+}
+
+function ensureMediaPoolModal(){
+  if (document.getElementById('mediaPoolModal')) return;
+  const wrap = document.createElement('div');
+  wrap.id = 'mediaPoolModal';
+  wrap.className = 'modal-overlay hidden media-pool-modal-overlay';
+  wrap.innerHTML = `
+    <div class="modal-card media-pool-modal-card" role="dialog" aria-modal="true" aria-labelledby="mediaPoolTitle">
+      <div class="modal-head media-pool-head">
+        <div>
+          <div id="mediaPoolTitle" class="modal-title">Media Pool</div>
+          <div class="modal-sub">Browse sources, add assets to the project pool, then use them in Transcript, Story and Timeline Mode.</div>
+        </div>
+        <div class="media-pool-head-actions">
+          <span class="iconik-status-pill" id="mediaPoolStatusPill">Checking…</span>
+          <button class="btn btn-outline" id="mediaPoolClose" type="button">Close</button>
+        </div>
+      </div>
+      <div class="media-pool-source-tabs" id="mediaPoolSourceTabs">
+        <button class="media-source-tab is-active" data-source="iconik" type="button">Iconik</button>
+        <button class="media-source-tab" data-source="local" type="button">Local</button>
+        <button class="media-source-tab" data-source="youtube" type="button">YouTube</button>
+        <button class="media-source-tab" data-source="drive" type="button">Google Drive</button>
+      </div>
+      <div class="modal-body media-pool-body">
+        <div class="media-pool-source-workspace">
+          <div class="media-pool-native-source" id="mediaPoolNativeSource" hidden>
+            <div class="iconik-empty">Choose a source tab.</div>
+          </div>
+          <div class="iconik-collections-layout" id="iconikCollectionsLayout">
+            <aside class="iconik-collections-sidebar">
+            <div class="iconik-sidebar-title">Iconik</div>
+            <button class="iconik-nav-item is-active" data-iconik-view="recent" type="button">Recent assets</button>
+            <button class="iconik-nav-item" data-iconik-view="search" type="button">Search</button>
+            <div class="iconik-sidebar-section-row">
+              <span>Collections</span>
+              <button class="btn btn-outline btn-mini" id="iconikCollectionsRefresh" type="button">↻</button>
+            </div>
+            <input id="iconikCollectionSearch" class="ui-dark-input iconik-collection-search" type="text" placeholder="Find collection…">
+            <div id="iconikCollectionsList" class="iconik-collections-list"><div class="iconik-sidebar-empty">Loading collections…</div></div>
+          </aside>
+          <section class="iconik-browser-main">
+            <div class="iconik-browser-toolbar">
+              <div>
+                <div id="iconikBrowserTitle" class="iconik-browser-title">Recent assets</div>
+                <div id="iconikBrowserSub" class="iconik-browser-sub">Browse Iconik like a project bin, then add assets into this app.</div>
+              </div>
+              <div class="iconik-search-row media-pool-search-row">
+                <input id="iconikSearchInput" class="ui-dark-input" type="text" placeholder="Search Iconik assets…">
+                <button class="btn btn-gold" id="iconikSearchBtn" type="button">Search</button>
+                <button class="btn btn-outline" id="iconikRecentBtn" type="button">Recent</button>
+              </div>
+            </div>
+            <div id="iconikResults" class="iconik-results iconik-results-collection"><div class="iconik-empty">Open the Media Pool to load Iconik assets.</div></div>
+          </section>
+        </div>
+        </div>
+        <aside class="media-pool-project-sidebar">
+          <div class="iconik-sidebar-title">Project Pool</div>
+          <div class="media-pool-project-sub">Assets from all sources stay visible here.</div>
+          <div id="mediaPoolProjectList" class="media-pool-project-list"></div>
+          <div id="mediaPoolReviewPanel" class="media-pool-review-panel">
+            <div class="media-pool-review-empty">Select an asset to view review comments.</div>
+          </div>
+        </aside>
+      </div>
+      <div class="modal-foot media-pool-foot">
+        <span class="muted" id="iconikFooterStatus"></span>
+      </div>
+    </div>`;
+  document.body.appendChild(wrap);
+
+  wrap.querySelector('#mediaPoolClose')?.addEventListener('click', () => wrap.classList.add('hidden'));
+  wrap.addEventListener('click', ev => { if (ev.target === wrap) wrap.classList.add('hidden'); });
+  wrap.querySelector('#iconikSearchBtn')?.addEventListener('click', () => refreshIconikAssets({ view:'search' }));
+  wrap.querySelector('#iconikRecentBtn')?.addEventListener('click', () => { const inp = document.getElementById('iconikSearchInput'); if (inp) inp.value=''; refreshIconikAssets({ view:'recent' }); });
+  wrap.querySelector('#iconikSearchInput')?.addEventListener('keydown', ev => { if (ev.key === 'Enter') refreshIconikAssets({ view:'search' }); });
+  wrap.querySelector('#iconikCollectionsRefresh')?.addEventListener('click', () => refreshIconikCollections());
+  wrap.querySelector('#iconikCollectionSearch')?.addEventListener('input', () => renderIconikCollections(__iconikLastCollections));
+
+  wrap.querySelectorAll('.media-source-tab').forEach(btn => {
+    btn.addEventListener('click', ev => setMediaPoolSource(ev.currentTarget.dataset.source || 'iconik'));
+  });
+  wrap.querySelectorAll('.iconik-nav-item').forEach(btn => {
+    btn.addEventListener('click', ev => {
+      const view = ev.currentTarget.dataset.iconikView;
+      if (view === 'recent') refreshIconikAssets({ view:'recent' });
+      if (view === 'search') {
+        document.getElementById('iconikSearchInput')?.focus();
+        refreshIconikAssets({ view:'search' });
+      }
+    });
+  });
+}
+
+function setMediaPoolSource(source){
+  __mediaPoolActiveSource = source || 'iconik';
+  document.querySelectorAll('#mediaPoolSourceTabs .media-source-tab').forEach(btn => btn.classList.toggle('is-active', btn.dataset.source === __mediaPoolActiveSource));
+  const iconikLayout = document.getElementById('iconikCollectionsLayout');
+  const native = document.getElementById('mediaPoolNativeSource');
+  const showIconik = __mediaPoolActiveSource === 'iconik';
+
+  // Use both hidden + inline display because earlier CSS rules define these
+  // panes as grid/flex. Without the inline collapse, inactive panes can still
+  // occupy space and show two sources at once.
+  if (iconikLayout) {
+    iconikLayout.hidden = !showIconik;
+    iconikLayout.style.display = showIconik ? '' : 'none';
+  }
+  if (native) {
+    native.hidden = showIconik;
+    native.style.display = showIconik ? 'none' : '';
+  }
+
+  if (native && !showIconik) renderNativeMediaPoolSource(__mediaPoolActiveSource);
+}
+
+function mediaPoolFileSizeLabel(bytes){
+  const n = Number(bytes || 0);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  if (n >= 1024*1024*1024) return `${(n/(1024*1024*1024)).toFixed(1)} GB`;
+  if (n >= 1024*1024) return `${Math.round(n/(1024*1024))} MB`;
+  if (n >= 1024) return `${Math.round(n/1024)} KB`;
+  return `${n} B`;
+}
+
+function makeLocalPoolAsset(file){
+  const localId = `local_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,8)}`;
+  return {
+    source_type:'local',
+    asset_id:localId,
+    local_id:localId,
+    title:file?.name || 'Local video',
+    name:file?.name || 'Local video',
+    size:file?.size || 0,
+    duration:0,
+    object_url: URL.createObjectURL(file),
+    file
+  };
+}
+
+
+function makeYouTubePoolAsset(url, metadata={}, opts={}){
+  const videoId = metadata?.id || parseYouTubeVideoId(url) || `youtube_${Date.now().toString(36)}`;
+  const title = metadata?.title || metadata?.fulltitle || 'YouTube video';
+  const thumb = metadata?.thumbnail || metadata?.thumbnail_url || (metadata?.thumbnails && metadata.thumbnails.length ? metadata.thumbnails[metadata.thumbnails.length - 1]?.url : '');
+  return {
+    source_type:'youtube',
+    asset_id:String(videoId),
+    youtube_id:String(videoId),
+    title,
+    name:title,
+    url,
+    webpage_url:metadata?.webpage_url || url,
+    duration:metadata?.duration || 0,
+    thumbnail_url:thumb || '',
+    permission_confirmed:!!opts.permissionConfirmed,
+    metadata:metadata || {}
+  };
+}
+
+function renderMediaPoolYouTubeProbeHtml(meta={}, url=''){
+  const title = meta?.title || meta?.fulltitle || 'YouTube video';
+  const id = meta?.id || parseYouTubeVideoId(url) || '';
+  const duration = iconikFormatDuration(meta?.duration || 0);
+  const uploader = meta?.uploader || meta?.channel || '';
+  const thumb = meta?.thumbnail || meta?.thumbnail_url || (meta?.thumbnails && meta.thumbnails.length ? meta.thumbnails[meta.thumbnails.length - 1]?.url : '');
+  return `
+    <div class="media-pool-youtube-probe-inner">
+      ${thumb ? `<img class="media-pool-youtube-probe-thumb" src="${escapeHtml(thumb)}" alt="">` : `<div class="media-pool-youtube-probe-thumb placeholder">YT</div>`}
+      <div>
+        <b>${escapeHtml(title)}</b>
+        <div class="muted">${id ? `ID: ${escapeHtml(id)}` : ''}${duration ? ` · ${escapeHtml(duration)}` : ''}${uploader ? ` · ${escapeHtml(uploader)}` : ''}</div>
+        <div class="muted">${escapeHtml(url || meta?.webpage_url || '')}</div>
+      </div>
+    </div>`;
+}
+
+
+
+async function searchYouTubeDataApi(query, pageToken=''){
+  const url = new URL(`${API_BASE}/api/youtube_search`);
+  url.searchParams.set('q', query);
+  url.searchParams.set('limit', '12');
+  if (pageToken) url.searchParams.set('page_token', pageToken);
+  const res = await fetch(url.toString());
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+function renderMediaPoolYouTubeSearchResults(items=[]){
+  const list = document.getElementById('mediaPoolYouTubeSearchResults');
+  if (!list) return;
+  if (!items.length){
+    list.innerHTML = `<div class="youtube-search-empty">No results yet. Search YouTube videos above.</div>`;
+    return;
+  }
+  list.innerHTML = items.map((v, idx) => {
+    const title = v.title || 'YouTube video';
+    const channel = v.channel_title || v.channelTitle || '';
+    const dur = iconikFormatDuration(v.duration || 0);
+    const thumb = v.thumbnail_url || v.thumbnail || '';
+    return `<button class="youtube-search-result" type="button" data-youtube-search-index="${idx}" title="${escapeHtml(title)}">
+      <div class="youtube-search-thumb">${thumb ? `<img src="${escapeHtml(thumb)}" alt="">` : `<span>YT</span>`}${dur ? `<b>${escapeHtml(dur)}</b>` : ''}</div>
+      <div class="youtube-search-info">
+        <div class="youtube-search-title">${escapeHtml(title)}</div>
+        <div class="youtube-search-meta">${escapeHtml(channel)}</div>
+      </div>
+    </button>`;
+  }).join('');
+}
+
+function activateYouTubeMediaPoolAsset(asset){
+  mediaPoolSetCurrentAsset(asset);
+  const url = asset?.url || asset?.webpage_url || asset?.metadata?.webpage_url || '';
+  if (!url){ alert('This YouTube asset has no URL. Please add it again.'); return; }
+  activateYouTubePreview({
+    url,
+    metadata: asset?.metadata || { id: asset?.youtube_id || asset?.asset_id, title: asset?.title || asset?.name || 'YouTube video' },
+    permissionConfirmed: !!asset?.permission_confirmed
+  });
+}
+
+function renderYouTubeMediaPoolResults(youtubeAssets){
+  const host = document.getElementById('mediaPoolYouTubeResults');
+  if (!host) return;
+  if (!youtubeAssets.length){
+    host.innerHTML = `<div class="iconik-empty">No YouTube videos in the Project Pool yet.</div>`;
+    return;
+  }
+  host.innerHTML = youtubeAssets.map((a, idx) => {
+    const title = a.title || a.name || 'YouTube video';
+    const dur = iconikFormatDuration(a.duration || a.metadata?.duration || 0);
+    const thumb = a.thumbnail_url || a.thumbnail || a.metadata?.thumbnail || '';
+    return `<div class="iconik-card youtube-card" data-youtube-pool-index="${idx}">
+      <div class="iconik-thumb youtube-thumb" data-youtube-thumb="${idx}">
+        ${thumb ? `<img class="iconik-thumb-img" src="${escapeHtml(thumb)}" alt="${escapeHtml(title)} thumbnail" loading="lazy">` : `<div class="iconik-thumb-fallback">YT</div>`}
+        <div class="iconik-thumb-badge">${dur ? `YouTube · ${escapeHtml(dur)}` : 'YouTube'}</div>
+      </div>
+      <div class="iconik-card-title">${escapeHtml(title)}</div>
+      <div class="iconik-card-meta"><span>YouTube</span>${dur ? `<span>${escapeHtml(dur)}</span>` : ''}</div>
+      <div class="iconik-card-actions iconik-card-actions-wrap">
+        <button class="btn btn-gold" type="button" data-youtube-action="preview">Preview</button>
+        <button class="btn btn-outline" type="button" data-youtube-action="remove">Remove</button>
+        <button class="btn btn-outline" type="button" data-youtube-action="open-youtube">Open YouTube</button>
+      </div>
+    </div>`;
+  }).join('');
+  host.querySelectorAll('[data-youtube-action]').forEach(btn => {
+    btn.addEventListener('click', ev => {
+      const card = ev.currentTarget.closest('[data-youtube-pool-index]');
+      const list = getMediaPoolAssets().filter(a => (a.source_type || a.sourceType) === 'youtube');
+      const asset = list[Number(card?.dataset?.youtubePoolIndex || -1)];
+      if (!asset) return;
+      const action = ev.currentTarget.dataset.youtubeAction;
+      if (action === 'preview') activateYouTubeMediaPoolAsset(asset);
+      if (action === 'open-youtube') window.open(asset.url || asset.webpage_url || asset.metadata?.webpage_url || '', '_blank', 'noopener,noreferrer');
+      if (action === 'remove'){
+        const key = asset.media_pool_key;
+        __mediaPoolAssets = __mediaPoolAssets.filter(a => a.media_pool_key !== key);
+        mediaPoolPersistAssets();
+        renderMediaPoolTray();
+        renderMediaPoolProjectList();
+        renderNativeMediaPoolSource('youtube');
+      }
+    });
+  });
+}
+
+
+function makeGoogleDrivePoolAsset(url, metadata={}, opts={}){
+  const fileId = metadata?.file_id || metadata?.fileId || parseGoogleDriveFileId(url) || `drive_${Date.now().toString(36)}`;
+  const title = metadata?.title || metadata?.name || metadata?.source_media_name || `Google Drive ${String(fileId).slice(0,6)}`;
+  return {
+    source_type:'drive',
+    asset_id:String(fileId),
+    drive_id:String(fileId),
+    file_id:String(fileId),
+    title,
+    name:title,
+    url:url || metadata?.url || '',
+    preview_url:metadata?.preview_url || getGoogleDrivePreviewUrl(fileId),
+    duration:metadata?.duration || 0,
+    cache_id:opts.cacheId || metadata?.cache_id || '',
+    cacheId:opts.cacheId || metadata?.cache_id || '',
+    cached:!!(opts.cacheId || metadata?.cache_id),
+    source_media_name:metadata?.source_media_name || '',
+    source_media_path:metadata?.source_media_path || '',
+    metadata:metadata || {}
+  };
+}
+
+function renderMediaPoolDriveProbeHtml(meta={}, url=''){
+  const fileId = meta?.file_id || meta?.fileId || parseGoogleDriveFileId(url) || '';
+  const title = meta?.title || meta?.name || meta?.source_media_name || (fileId ? `Google Drive file ${String(fileId).slice(0,8)}…` : 'Google Drive file');
+  const preview = meta?.preview_url || (fileId ? getGoogleDrivePreviewUrl(fileId) : '');
+  return `
+    <div class="media-pool-drive-probe-inner">
+      <div class="media-pool-drive-probe-icon">GD</div>
+      <div>
+        <b>${escapeHtml(title)}</b>
+        <div class="muted">${fileId ? `File ID: ${escapeHtml(fileId)}` : ''}</div>
+        <div class="muted">${escapeHtml(preview || url || '')}</div>
+      </div>
+    </div>`;
+}
+
+function activateGoogleDriveMediaPoolAsset(asset){
+  mediaPoolSetCurrentAsset(asset);
+  const url = asset?.url || asset?.metadata?.url || '';
+  const fileId = asset?.file_id || asset?.drive_id || asset?.asset_id || parseGoogleDriveFileId(url);
+  const cacheId = asset?.cache_id || asset?.cacheId || asset?.metadata?.cache_id || '';
+  if (!fileId && !url){ alert('This Google Drive asset has no file ID or URL. Please add it again.'); return; }
+  if (cacheId){
+    activateGoogleDriveNativePreview({ url, fileId, metadata: asset?.metadata || asset, cacheId });
+  } else {
+    activateGoogleDrivePreview({ url, fileId, metadata: asset?.metadata || asset });
+  }
+}
+
+function renderGoogleDriveMediaPoolResults(driveAssets){
+  const host = document.getElementById('mediaPoolDriveResults');
+  if (!host) return;
+  if (!driveAssets.length){
+    host.innerHTML = `<div class="iconik-empty">No Google Drive videos in the Project Pool yet.</div>`;
+    return;
+  }
+  host.innerHTML = driveAssets.map((a, idx) => {
+    const title = a.title || a.name || 'Google Drive video';
+    const dur = iconikFormatDuration(a.duration || a.metadata?.duration || 0);
+    const cached = !!(a.cache_id || a.cacheId || a.cached);
+    const fileId = a.file_id || a.drive_id || a.asset_id || '';
+    return `<div class="iconik-card drive-card" data-drive-pool-index="${idx}">
+      <div class="iconik-thumb drive-thumb">
+        <div class="drive-thumb-fallback"><span>GD</span></div>
+        <div class="iconik-thumb-badge">Google Drive${dur ? ' · ' + escapeHtml(dur) : ''}${cached ? ' · cached' : ''}</div>
+      </div>
+      <div class="iconik-card-title">${escapeHtml(title)}</div>
+      <div class="iconik-card-meta"><span>Google Drive</span>${fileId ? `<span>ID: ${escapeHtml(String(fileId).slice(0,8))}…</span>` : ''}<span class="mp-cache-pill ${cached ? 'is-cached' : 'is-uncached'}">${cached ? '● Cached' : '○ Not cached'}</span></div>
+      <div class="iconik-card-actions iconik-card-actions-wrap">
+        <button class="btn btn-gold" type="button" data-drive-action="preview">Preview</button>
+        <button class="btn btn-outline" type="button" data-drive-action="cache">Cache</button>
+        <button class="btn btn-outline" type="button" data-drive-action="remove">Remove</button>
+        <button class="btn btn-outline" type="button" data-drive-action="open-drive">Open Drive</button>
+      </div>
+    </div>`;
+  }).join('');
+  host.querySelectorAll('[data-drive-action]').forEach(btn => {
+    btn.addEventListener('click', async ev => {
+      const card = ev.currentTarget.closest('[data-drive-pool-index]');
+      const list = getMediaPoolAssets().filter(a => ['drive','google_drive'].includes(String(a.source_type || a.sourceType || '').toLowerCase()));
+      const asset = list[Number(card?.dataset?.drivePoolIndex || -1)];
+      if (!asset) return;
+      const action = ev.currentTarget.dataset.driveAction;
+      if (action === 'preview') activateGoogleDriveMediaPoolAsset(asset);
+      if (action === 'open-drive') window.open(asset.url || asset.preview_url || getGoogleDrivePreviewUrl(asset.file_id || asset.drive_id || asset.asset_id), '_blank', 'noopener,noreferrer');
+      if (action === 'cache'){
+        try{
+          if (!asset.url && !asset.file_id) throw new Error('No Google Drive URL or file ID available.');
+          const src = await startGoogleDriveCache(asset.url || asset.file_id, asset.metadata || asset);
+          asset.cache_id = src?.cacheId || src?.cache_id || asset.cache_id || '';
+          asset.cacheId = asset.cache_id;
+          asset.cached = !!asset.cache_id;
+          asset.metadata = Object.assign({}, asset.metadata || {}, src?.metadata || {}, { cache_id: asset.cache_id });
+          mediaPoolPersistAssets(); renderMediaPoolProjectList(); renderMediaPoolTray(); renderMediaPoolReviewPanel(); renderNativeMediaPoolSource('drive');
+        }catch(err){ alert('Google Drive cache failed: ' + (err?.message || err)); }
+      }
+      if (action === 'remove'){
+        const key = asset.media_pool_key;
+        __mediaPoolAssets = __mediaPoolAssets.filter(a => a.media_pool_key !== key);
+        mediaPoolPersistAssets(); renderMediaPoolTray(); renderMediaPoolProjectList(); renderNativeMediaPoolSource('drive');
+      }
+    });
+  });
+}
+
+function renderNativeMediaPoolSource(source){
+  const host = document.getElementById('mediaPoolNativeSource');
+  if (!host) return;
+  if (source === 'local'){
+    const localAssets = getMediaPoolAssets().filter(a => (a.source_type || a.sourceType) === 'local');
+    host.innerHTML = `
+      <div class="native-source-shell">
+        <aside class="native-source-sidebar">
+          <div class="iconik-sidebar-title">Local</div>
+          <button class="iconik-nav-item is-active" type="button">Session files</button>
+          <div class="native-source-note">Local files stay in this browser session. For collaboration, use Iconik, Drive, YouTube, or upload through your backend.</div>
+        </aside>
+        <section class="native-source-main">
+          <div class="iconik-browser-toolbar">
+            <div>
+              <div class="iconik-browser-title">Local videos</div>
+              <div class="iconik-browser-sub">Add local footage into the same Project Pool used by Iconik assets.</div>
+            </div>
+            <div class="iconik-search-row">
+              <button class="btn btn-gold" id="mediaPoolLocalChoose" type="button">Choose local videos</button>
+              <button class="btn btn-outline" id="mediaPoolLocalCurrent" type="button">Add current video</button>
+              <input id="mediaPoolLocalInput" type="file" accept="video/*,audio/*" multiple hidden>
+            </div>
+          </div>
+          <div id="mediaPoolLocalResults" class="iconik-results native-results"></div>
+        </section>
+      </div>`;
+    host.querySelector('#mediaPoolLocalChoose')?.addEventListener('click', () => host.querySelector('#mediaPoolLocalInput')?.click());
+    host.querySelector('#mediaPoolLocalInput')?.addEventListener('change', ev => {
+      const files = Array.from(ev.currentTarget.files || []);
+      files.forEach(file => mediaPoolUpsertAsset(makeLocalPoolAsset(file)));
+      renderNativeMediaPoolSource('local');
+      renderMediaPoolProjectList();
+      setStatusSafe(`${files.length} local file${files.length === 1 ? '' : 's'} added to Media Pool.`);
+    });
+    host.querySelector('#mediaPoolLocalCurrent')?.addEventListener('click', () => {
+      if (!lastLoadedVideoFile){ alert('No current local video file is loaded. Use Choose local videos first, or import a local video from the toolbar.'); return; }
+      mediaPoolUpsertAsset(makeLocalPoolAsset(lastLoadedVideoFile));
+      renderNativeMediaPoolSource('local');
+      renderMediaPoolProjectList();
+      setStatusSafe('Current local video added to Media Pool.');
+    });
+    renderLocalMediaPoolResults(localAssets);
+    return;
+  }
+  if (source === 'youtube'){
+    const youtubeAssets = getMediaPoolAssets().filter(a => (a.source_type || a.sourceType) === 'youtube');
+    host.innerHTML = `
+      <div class="native-source-shell youtube-source-shell">
+        <aside class="native-source-sidebar youtube-search-sidebar">
+          <div class="iconik-sidebar-title">YouTube Search</div>
+          <div class="youtube-search-box">
+            <input id="mediaPoolYouTubeSearchInput" class="ui-dark-input" type="search" placeholder="Search YouTube videos…">
+            <button class="btn btn-gold btn-mini" id="mediaPoolYouTubeSearchBtn" type="button">Search</button>
+          </div>
+          <div class="native-source-note">Search public embeddable videos via YouTube Data API v3. Add only videos you own or have permission to process.</div>
+          <div id="mediaPoolYouTubeSearchResults" class="youtube-search-results"></div>
+          <div class="youtube-search-pager">
+            <button class="btn btn-outline btn-mini" id="mediaPoolYouTubePrev" type="button" disabled>Previous</button>
+            <span class="muted" id="mediaPoolYouTubePageLabel">Page 1</span>
+            <button class="btn btn-outline btn-mini" id="mediaPoolYouTubeNext" type="button" disabled>Next</button>
+          </div>
+        </aside>
+        <section class="native-source-main">
+          <div class="iconik-browser-toolbar">
+            <div>
+              <div class="iconik-browser-title">YouTube videos</div>
+              <div class="iconik-browser-sub">Search or paste a URL, preview it, then add it into the same Project Pool.</div>
+            </div>
+          </div>
+          <div class="media-pool-youtube-box">
+            <label class="muted media-pool-youtube-url">Selected YouTube URL
+              <input id="mediaPoolYouTubeUrl" class="ui-dark-input" type="url" placeholder="https://www.youtube.com/watch?v=...">
+            </label>
+            <div class="media-pool-youtube-options">
+              <label><input type="checkbox" id="mediaPoolYouTubePreview" checked> Preview only</label>
+              <label><input type="checkbox" id="mediaPoolYouTubeDownload"> Download/cache</label>
+              <label class="media-pool-youtube-permission"><input type="checkbox" id="mediaPoolYouTubePermission"> I own or have permission to process this video</label>
+            </div>
+            <div class="media-pool-youtube-actions">
+              <button class="btn btn-outline" id="mediaPoolYouTubeProbe" type="button">Probe URL</button>
+              <button class="btn btn-gold" id="mediaPoolYouTubePreviewBtn" type="button">Preview</button>
+              <button class="btn btn-outline" id="mediaPoolYouTubeAdd" type="button">Add to Pool</button>
+              <button class="btn btn-outline" id="mediaPoolOpenYouTubeImport" type="button">Open full YouTube importer</button>
+              <span class="muted" id="mediaPoolYouTubeStatus"></span>
+            </div>
+            <div id="mediaPoolYouTubeProbeCard" class="youtube-probe-card" style="display:none"></div>
+          </div>
+          <div id="mediaPoolYouTubeResults" class="iconik-results native-results"></div>
+        </section>
+      </div>`;
+    let probedMeta = null;
+    let searchItems = [];
+    let youtubeSearchQuery = '';
+    let youtubeNextPageToken = '';
+    let youtubePrevPageToken = '';
+    let youtubeCurrentPage = 1;
+    const urlEl = host.querySelector('#mediaPoolYouTubeUrl');
+    const stEl = host.querySelector('#mediaPoolYouTubeStatus');
+    const cardEl = host.querySelector('#mediaPoolYouTubeProbeCard');
+    const searchInput = host.querySelector('#mediaPoolYouTubeSearchInput');
+    const prevBtn = host.querySelector('#mediaPoolYouTubePrev');
+    const nextBtn = host.querySelector('#mediaPoolYouTubeNext');
+    const pageLabel = host.querySelector('#mediaPoolYouTubePageLabel');
+    const updateYouTubePager = () => {
+      if (prevBtn) prevBtn.disabled = !youtubePrevPageToken;
+      if (nextBtn) nextBtn.disabled = !youtubeNextPageToken;
+      if (pageLabel) pageLabel.textContent = `Page ${youtubeCurrentPage}`;
+    };
+    const getUrl = () => (urlEl?.value || '').trim();
+    const selectYouTubeSearchItem = (item) => {
+      if (!item) return;
+      probedMeta = { ...item, id:item.id || item.video_id, thumbnail:item.thumbnail_url };
+      if (urlEl) urlEl.value = item.url || item.webpage_url || `https://www.youtube.com/watch?v=${item.video_id || item.id}`;
+      if (cardEl){
+        cardEl.style.display = '';
+        cardEl.innerHTML = renderMediaPoolYouTubeProbeHtml(probedMeta, getUrl());
+      }
+      if (stEl) stEl.textContent = 'Selected from search';
+    };
+    const renderAndBindYouTubeSearch = () => {
+      renderMediaPoolYouTubeSearchResults(searchItems);
+      updateYouTubePager();
+      const list = document.getElementById('mediaPoolYouTubeSearchResults');
+      list?.querySelectorAll('[data-youtube-search-index]').forEach(btn => {
+        btn.addEventListener('click', ev => {
+          const idx = Number(ev.currentTarget.dataset.youtubeSearchIndex || -1);
+          selectYouTubeSearchItem(searchItems[idx]);
+          list.querySelectorAll('.youtube-search-result').forEach(x => x.classList.remove('is-selected'));
+          ev.currentTarget.classList.add('is-selected');
+        });
+      });
+    };
+    const runSearch = async (pageToken = '', direction = 'first') => {
+      const q = (searchInput?.value || '').trim();
+      if (!q){ alert('Enter a YouTube search keyword first.'); return; }
+      if (direction === 'first') youtubeCurrentPage = 1;
+      if (direction === 'next') youtubeCurrentPage += 1;
+      if (direction === 'prev') youtubeCurrentPage = Math.max(1, youtubeCurrentPage - 1);
+      youtubeSearchQuery = q;
+      if (stEl) stEl.textContent = 'Searching YouTube…';
+      try{
+        const data = await searchYouTubeDataApi(q, pageToken || '');
+        searchItems = Array.isArray(data.items) ? data.items : [];
+        youtubeNextPageToken = data.next_page_token || '';
+        youtubePrevPageToken = data.prev_page_token || '';
+        renderAndBindYouTubeSearch();
+        if (stEl) stEl.textContent = `${searchItems.length} result${searchItems.length === 1 ? '' : 's'}`;
+      }catch(err){
+        if (direction === 'next') youtubeCurrentPage = Math.max(1, youtubeCurrentPage - 1);
+        if (direction === 'prev') youtubeCurrentPage += 1;
+        searchItems = [];
+        youtubeNextPageToken = '';
+        youtubePrevPageToken = '';
+        renderAndBindYouTubeSearch();
+        if (stEl) stEl.textContent = 'Search failed';
+        alert('YouTube search failed: ' + (err?.message || err));
+      }
+    };
+    searchItems = [];
+    renderAndBindYouTubeSearch();
+    host.querySelector('#mediaPoolYouTubeSearchBtn')?.addEventListener('click', () => runSearch('', 'first'));
+    nextBtn?.addEventListener('click', () => { if (youtubeNextPageToken) runSearch(youtubeNextPageToken, 'next'); });
+    prevBtn?.addEventListener('click', () => { if (youtubePrevPageToken) runSearch(youtubePrevPageToken, 'prev'); });
+    searchInput?.addEventListener('keydown', ev => { if (ev.key === 'Enter'){ ev.preventDefault(); runSearch('', 'first'); } });
+    const ensureMeta = async () => {
+      const url = getUrl();
+      if (!url) throw new Error('Paste or select a YouTube URL first.');
+      if (stEl) stEl.textContent = 'Probing…';
+      try{
+        probedMeta = await probeYouTubeUrl(url);
+      }catch(_e){
+        probedMeta = probedMeta || { id: parseYouTubeVideoId(url), title: 'YouTube video', webpage_url: url };
+      }
+      if (cardEl){
+        cardEl.style.display = '';
+        cardEl.innerHTML = renderMediaPoolYouTubeProbeHtml(probedMeta, url);
+      }
+      if (stEl) stEl.textContent = 'Ready';
+      return probedMeta;
+    };
+    host.querySelector('#mediaPoolYouTubeProbe')?.addEventListener('click', async () => {
+      try{ await ensureMeta(); }catch(err){ if (stEl) stEl.textContent='Probe failed'; alert('YouTube probe failed: ' + (err?.message || err)); }
+    });
+    host.querySelector('#mediaPoolYouTubePreviewBtn')?.addEventListener('click', async () => {
+      try{
+        const url = getUrl();
+        const meta = probedMeta || await ensureMeta();
+        activateYouTubePreview({ url, metadata: meta, permissionConfirmed: !!host.querySelector('#mediaPoolYouTubePermission')?.checked });
+      }catch(err){ alert('YouTube preview failed: ' + (err?.message || err)); }
+    });
+    host.querySelector('#mediaPoolYouTubeAdd')?.addEventListener('click', async () => {
+      try{
+        const url = getUrl();
+        const meta = probedMeta || await ensureMeta();
+        const permission = !!host.querySelector('#mediaPoolYouTubePermission')?.checked;
+        if (!!host.querySelector('#mediaPoolYouTubePreview')?.checked){
+          activateYouTubePreview({ url, metadata: meta, permissionConfirmed: permission });
+        }
+        if (!!host.querySelector('#mediaPoolYouTubeDownload')?.checked){
+          if (!permission){ alert('Please confirm you own this video or have permission to download/cache it.'); return; }
+          await startYouTubeDownload(url, permission);
+        }
+        mediaPoolUpsertAsset(makeYouTubePoolAsset(url, meta, { permissionConfirmed: permission }));
+        renderNativeMediaPoolSource('youtube');
+        renderMediaPoolProjectList();
+        setStatusSafe(`Added YouTube video to Media Pool: ${meta?.title || 'YouTube video'}`);
+      }catch(err){ alert('Add YouTube to Pool failed: ' + (err?.message || err)); }
+    });
+    host.querySelector('#mediaPoolOpenYouTubeImport')?.addEventListener('click', () => openYouTubeImportModal?.());
+    renderYouTubeMediaPoolResults(youtubeAssets);
+    return;
+  }
+  if (source === 'drive'){
+    const driveAssets = getMediaPoolAssets().filter(a => ['drive','google_drive'].includes(String(a.source_type || a.sourceType || '').toLowerCase()));
+    host.innerHTML = `
+      <div class="native-source-shell drive-source-shell">
+        <aside class="native-source-sidebar drive-source-sidebar">
+          <div class="iconik-sidebar-title">Google Drive</div>
+          <button class="iconik-nav-item is-active" type="button">Shared link</button>
+          <button class="iconik-nav-item" id="mediaPoolDriveExisting" type="button">Existing importer</button>
+          <div class="native-source-note">Paste a Drive file link. Preview uses Google Drive's iframe; Cache downloads through your backend for transcription and native playback.</div>
+        </aside>
+        <section class="native-source-main drive-source-main">
+          <div class="iconik-browser-toolbar media-pool-drive-toolbar">
+            <div>
+              <div class="iconik-browser-title">Google Drive videos</div>
+              <div class="iconik-browser-sub">Preview or cache shared Drive footage, then add it into the same Project Pool.</div>
+            </div>
+          </div>
+          <div class="media-pool-drive-import-card">
+            <label class="media-pool-field-label">Google Drive file URL</label>
+            <div class="media-pool-drive-url-row">
+              <input id="mediaPoolDriveUrl" class="ui-dark-input" type="url" placeholder="https://drive.google.com/file/d/.../view">
+              <button class="btn btn-outline" id="mediaPoolDriveProbe" type="button">Probe</button>
+            </div>
+            <div class="media-pool-option-row">
+              <label><input type="checkbox" id="mediaPoolDrivePreview" checked> Preview</label>
+              <label><input type="checkbox" id="mediaPoolDriveCache"> Cache/download for transcription</label>
+              <span class="muted" id="mediaPoolDriveStatus"></span>
+            </div>
+            <div id="mediaPoolDriveProbeCard" class="media-pool-drive-probe" hidden></div>
+            <div class="media-pool-action-row">
+              <button class="btn btn-gold" id="mediaPoolDrivePreviewBtn" type="button">Preview</button>
+              <button class="btn btn-gold" id="mediaPoolDriveAdd" type="button">Add to Pool</button>
+              <button class="btn btn-outline" id="mediaPoolDriveOpenImporter" type="button">Open full Drive importer</button>
+            </div>
+          </div>
+          <div id="mediaPoolDriveResults" class="iconik-results native-results drive-results"></div>
+        </section>
+      </div>`;
+    let probedMeta = null;
+    const stEl = host.querySelector('#mediaPoolDriveStatus');
+    const probeCard = host.querySelector('#mediaPoolDriveProbeCard');
+    const getUrl = () => (host.querySelector('#mediaPoolDriveUrl')?.value || '').trim();
+    const ensureMeta = async () => {
+      const url = getUrl();
+      if (!url) throw new Error('Paste a Google Drive link first.');
+      if (stEl) stEl.textContent = 'Probing…';
+      probedMeta = await probeGoogleDriveUrl(url);
+      if (probeCard){ probeCard.hidden = false; probeCard.innerHTML = renderMediaPoolDriveProbeHtml(probedMeta, url); }
+      if (stEl) stEl.textContent = 'Ready';
+      return probedMeta;
+    };
+    host.querySelector('#mediaPoolDriveProbe')?.addEventListener('click', async () => {
+      try{ await ensureMeta(); }catch(err){ if (stEl) stEl.textContent='Probe failed'; alert('Google Drive probe failed: ' + (err?.message || err)); }
+    });
+    host.querySelector('#mediaPoolDrivePreviewBtn')?.addEventListener('click', async () => {
+      try{
+        const url = getUrl();
+        const meta = probedMeta || await ensureMeta();
+        activateGoogleDrivePreview({ url, fileId: meta?.file_id || parseGoogleDriveFileId(url), metadata: meta });
+      }catch(err){ alert('Google Drive preview failed: ' + (err?.message || err)); }
+    });
+    host.querySelector('#mediaPoolDriveAdd')?.addEventListener('click', async () => {
+      try{
+        const url = getUrl();
+        const meta = probedMeta || await ensureMeta();
+        let cacheId = '';
+        const shouldPreview = !!host.querySelector('#mediaPoolDrivePreview')?.checked;
+        const shouldCache = !!host.querySelector('#mediaPoolDriveCache')?.checked;
+        if (shouldCache){
+          const cached = await startGoogleDriveCache(url, meta);
+          cacheId = cached?.cacheId || cached?.cache_id || cached?.metadata?.cache_id || '';
+          if (shouldPreview) activateGoogleDriveNativePreview({ url, fileId: cached?.fileId || meta?.file_id, metadata: cached?.metadata || meta, cacheId });
+        } else if (shouldPreview){
+          activateGoogleDrivePreview({ url, fileId: meta?.file_id || parseGoogleDriveFileId(url), metadata: meta });
+        }
+        mediaPoolUpsertAsset(makeGoogleDrivePoolAsset(url, Object.assign({}, meta || {}, cacheId ? { cache_id: cacheId } : {}), { cacheId }));
+        renderNativeMediaPoolSource('drive');
+        renderMediaPoolProjectList();
+        setStatusSafe(`Added Google Drive video to Media Pool.`);
+      }catch(err){ alert('Add Google Drive to Pool failed: ' + (err?.message || err)); }
+    });
+    host.querySelector('#mediaPoolOpenDriveImport')?.addEventListener('click', () => openGoogleDriveImportModal?.());
+    host.querySelector('#mediaPoolDriveOpenImporter')?.addEventListener('click', () => openGoogleDriveImportModal?.());
+    host.querySelector('#mediaPoolDriveExisting')?.addEventListener('click', () => openGoogleDriveImportModal?.());
+    renderGoogleDriveMediaPoolResults(driveAssets);
+  }
+}
+
+function renderLocalMediaPoolResults(localAssets){
+  const host = document.getElementById('mediaPoolLocalResults');
+  if (!host) return;
+  if (!localAssets.length){
+    host.innerHTML = `<div class="iconik-empty">No local videos in this session yet.</div>`;
+    return;
+  }
+  host.innerHTML = localAssets.map((a, idx) => {
+    const title = a.title || a.name || 'Local video';
+    const size = mediaPoolFileSizeLabel(a.size);
+    const isCached = !!(a.cache_id || a.cacheId || a.metadata?.cache_id);
+    return `<div class="iconik-card local-card" data-local-pool-index="${idx}">
+      <div class="iconik-thumb local-thumb" data-local-thumb="${idx}">
+        <video class="local-thumb-video" muted playsinline preload="metadata" src="${escapeHtml(a.object_url || '')}"></video>
+        <div class="iconik-scrub-line"></div>
+        <div class="iconik-thumb-badge">Hover scrub${size ? ' · ' + escapeHtml(size) : ''}</div>
+      </div>
+      <div class="iconik-card-title">${escapeHtml(title)}</div>
+      <div class="iconik-card-meta"><span>Local</span>${size ? `<span>${escapeHtml(size)}</span>` : ''}<span>Session-only</span><span class="mp-cache-pill ${isCached ? 'is-cached' : 'is-uncached'}">${isCached ? '● Cached' : '○ Not cached'}</span></div>
+      <div class="iconik-card-actions iconik-card-actions-wrap">
+        <button class="btn btn-gold" type="button" data-local-action="preview">Preview</button>
+        <button class="btn btn-outline" type="button" data-local-action="remove">Remove</button>
+      </div>
+    </div>`;
+  }).join('');
+  bindLocalHoverScrubbers(host, localAssets);
+  host.querySelectorAll('[data-local-action]').forEach(btn => {
+    btn.addEventListener('click', ev => {
+      const card = ev.currentTarget.closest('[data-local-pool-index]');
+      const localList = getMediaPoolAssets().filter(a => (a.source_type || a.sourceType) === 'local');
+      const asset = localList[Number(card?.dataset?.localPoolIndex || -1)];
+      if (!asset) return;
+      const action = ev.currentTarget.dataset.localAction;
+      if (action === 'preview') activateLocalMediaPoolAsset(asset);
+      if (action === 'remove'){
+        const key = asset.media_pool_key;
+        __mediaPoolAssets = __mediaPoolAssets.filter(a => a.media_pool_key !== key);
+        __mediaPoolLocalFiles.delete(key);
+        mediaPoolPersistAssets();
+        renderMediaPoolTray();
+        renderMediaPoolProjectList();
+        renderNativeMediaPoolSource('local');
+      }
+    });
+  });
+}
+
+function bindLocalHoverScrubbers(root, localAssets){
+  root.querySelectorAll('.local-thumb[data-local-thumb]').forEach(thumb => {
+    if (thumb.__localScrubBound) return;
+    thumb.__localScrubBound = true;
+    const idx = Number(thumb.dataset.localThumb || -1);
+    const asset = localAssets[idx];
+    const video = thumb.querySelector('.local-thumb-video');
+    const line = thumb.querySelector('.iconik-scrub-line');
+    const badge = thumb.querySelector('.iconik-thumb-badge');
+    const scrubAt = (clientX) => {
+      if (!video) return;
+      const rect = thumb.getBoundingClientRect();
+      const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / Math.max(1, rect.width)));
+      if (line) line.style.left = `${Math.round(ratio * rect.width)}px`;
+      const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
+      if (duration > 0){
+        const t = Math.max(0, Math.min(duration - 0.05, duration * ratio));
+        try{ video.currentTime = t; }catch(_e){}
+        if (badge) badge.textContent = `${formatTimecodeFromSeconds(t, getFPS())} / ${iconikFormatDuration(duration)}`;
+      }
+    };
+    thumb.addEventListener('mouseenter', ev => { thumb.classList.add('is-scrubbing','is-video-on'); scrubAt(ev.clientX); });
+    thumb.addEventListener('mousemove', ev => scrubAt(ev.clientX));
+    thumb.addEventListener('mouseleave', () => { thumb.classList.remove('is-scrubbing','is-video-on'); try{ video?.pause(); }catch(_e){} if (badge) badge.textContent = 'Hover scrub' + (asset?.size ? ' · ' + mediaPoolFileSizeLabel(asset.size) : ''); });
+    thumb.addEventListener('click', () => activateLocalMediaPoolAsset(asset));
+  });
+}
+
+function activateLocalMediaPoolAsset(asset){
+  if (!asset) return;
+  mediaPoolSetCurrentAsset(asset);
+  try{ setYouTubePreviewVisible(false); }catch(_e){}
+  try{ setGoogleDrivePreviewVisible(false); }catch(_e){}
+  const file = __mediaPoolLocalFiles.get(asset.media_pool_key || '') || asset.file || null;
+  const url = asset.object_url || (file ? URL.createObjectURL(file) : '');
+  if (!url){ alert('This local file is no longer available in this browser session. Please add it again.'); return; }
+  // Restore cache_id from the asset rather than blanking it. Without this, an
+  // asset that was already cached (Transcribe ran on it) would lose its
+  // cacheId on re-activation, forcing a duplicate cache job and breaking
+  // Multi-Timeline render which keys off media_pool_key → cache_id.
+  const restoredCacheId = String(asset.cache_id || asset.cacheId || asset.metadata?.cache_id || '') || null;
+  currentMediaSource = {
+    type:'local',
+    file,
+    cacheId: restoredCacheId,
+    mediaPoolKey: asset.media_pool_key || '',
+    objectUrl: url,
+    metadata: asset,
+  };
+  lastLoadedVideoFile = file || lastLoadedVideoFile;
+  player.src = url;
+  player.load();
+  mediaPoolRestoreAssetTime(asset);
+  player.play().catch(()=>{});
+  setStatusSafe(`Local preview loaded: ${asset.title || asset.name || 'Local video'}${restoredCacheId ? ' · cached' : ''}`);
+}
+
+function setIconikSidebarActive(view, collectionId=''){
+  document.querySelectorAll('.iconik-nav-item').forEach(btn => btn.classList.toggle('is-active', btn.dataset.iconikView === view && !collectionId));
+  document.querySelectorAll('.iconik-collection-item').forEach(btn => btn.classList.toggle('is-active', String(btn.dataset.collectionId || '') === String(collectionId || '')));
+}
+
+function renderIconikCollections(items){
+  const host = document.getElementById('iconikCollectionsList');
+  if (!host) return;
+  const q = (document.getElementById('iconikCollectionSearch')?.value || '').trim().toLowerCase();
+  const filtered = (items || []).filter(c => !q || String(c.title || c.name || '').toLowerCase().includes(q));
+  if (!filtered.length){
+    host.innerHTML = `<div class="iconik-sidebar-empty">No collections found.</div>`;
+    return;
+  }
+  host.innerHTML = filtered.map((c, idx) => {
+    const id = c.collection_id || c.id || '';
+    const title = c.title || c.name || 'Untitled collection';
+    const count = c.asset_count ?? c.assets_count ?? c.object_count ?? c.count ?? '';
+    return `<button class="iconik-collection-item" type="button" data-collection-id="${escapeHtml(String(id))}" data-collection-index="${idx}">
+      <span class="iconik-folder-icon">▰</span>
+      <span class="iconik-collection-title">${escapeHtml(title)}</span>
+      ${count !== '' ? `<span class="iconik-collection-count">${escapeHtml(String(count))}</span>` : ''}
+    </button>`;
+  }).join('');
+  host.querySelectorAll('.iconik-collection-item').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = btn.dataset.collectionId || '';
+      const collection = filtered.find(c => String(c.collection_id || c.id || '') === String(id));
+      loadIconikCollection(collection || { id, title:id });
+    });
+  });
+}
+
+function renderMediaPoolProjectList(){
+  const host = document.getElementById('mediaPoolProjectList');
+  if (!host) return;
+  const assets = getMediaPoolAssets();
+  if (!assets.length){
+    host.innerHTML = `<div class="media-pool-empty">Nothing added yet.</div>`;
+    return;
+  }
+  host.innerHTML = assets.map((a, idx) => {
+    const title = a.title || a.name || 'Untitled asset';
+    const thumb = a.thumbnail_url || a.thumbnail || a.poster || '';
+    const source = mediaPoolSourceLabel(a);
+    const activeCls = mediaPoolAssetKey(a) === __mediaPoolCurrentKey ? ' is-active' : '';
+    const tb = mediaPoolTranscriptBadgeFor(a);
+    const cb = mediaPoolCommentBadgeFor(a);
+    const badges = [tb, cb].filter(Boolean).join(' · ');
+    return `<div class="media-pool-project-item${activeCls}" data-project-asset-index="${idx}">
+      <button class="media-pool-project-main" type="button" data-project-action="preview">
+        <span class="media-pool-chip-thumb">${thumb ? `<img src="${escapeHtml(thumb)}" alt="">` : `<b>${escapeHtml(iconikAssetInitials(title))}</b>`}</span>
+        <span class="media-pool-project-text"><b>${escapeHtml(title)}</b><small>${escapeHtml(source)} / ${escapeHtml(title)}${badges ? ' · ' + escapeHtml(badges) : ''}</small></span>
+      </button>
+      <button class="media-pool-project-remove" type="button" data-project-action="remove" title="Remove from project pool">×</button>
+    </div>`;
+  }).join('');
+  host.querySelectorAll('[data-project-action]').forEach(btn => {
+    btn.addEventListener('click', async ev => {
+      const row = ev.currentTarget.closest('[data-project-asset-index]');
+      const idx = Number(row?.dataset?.projectAssetIndex || -1);
+      const asset = __mediaPoolAssets[idx];
+      const action = ev.currentTarget.dataset.projectAction;
+      if (!asset) return;
+      if (action === 'remove'){
+        const key = mediaPoolAssetKey(asset);
+        __mediaPoolAssets.splice(idx, 1);
+        if (key){ delete __mediaPoolAssetStates[key]; mediaPoolPersistAssetStates(); }
+        mediaPoolPersistAssets()
+        renderMediaPoolProjectList(); renderMediaPoolTray(); renderMediaPoolReviewPanel();
+      } else if (asset.source_type === 'iconik') {
+        await activateIconikPreview(asset, { keepModalOpen:true });
+        renderMediaPoolReviewPanel(asset);
+      } else if (asset.source_type === 'local') {
+        activateLocalMediaPoolAsset(asset);
+        renderMediaPoolReviewPanel(asset);
+      } else if (asset.source_type === 'youtube') {
+        activateYouTubeMediaPoolAsset(asset);
+        renderMediaPoolReviewPanel(asset);
+      } else if (['drive','google_drive'].includes(String(asset.source_type || '').toLowerCase())) {
+        activateGoogleDriveMediaPoolAsset(asset);
+        renderMediaPoolReviewPanel(asset);
+      }
+    });
+  });
+}
+
+function renderIconikAssets(items){
+  const host = document.getElementById('iconikResults');
+  if (!host) return;
+  if (!items || !items.length){
+    host.innerHTML = `<div class="iconik-empty">No Iconik assets found.</div>`;
+    return;
+  }
+  host.innerHTML = items.map((a, idx) => {
+    const id = a.asset_id || a.id || '';
+    const title = a.title || a.name || 'Untitled asset';
+    const dur = iconikFormatDuration(a.duration);
+    const type = a.type || a.status || '';
+    const thumb = a.thumbnail_url || a.thumbnail || a.poster || '';
+    // Cache state: look up the same asset in the Media Pool to see whether
+    // it's been cached on the server (cache_id present). The pill changes
+    // between Cached / Not cached so the user knows whether Multi-Timeline
+    // render will succeed before they hit Render Preview.
+    const poolMatch = (__mediaPoolAssets || []).find(x => String(x.asset_id || x.id || '') === String(id) && (x.source_type || 'iconik') === 'iconik');
+    const inPool = !!poolMatch;
+    const isCached = !!(poolMatch && (poolMatch.cache_id || poolMatch.cacheId || poolMatch.metadata?.cache_id));
+    return `<div class="iconik-card" data-iconik-index="${idx}">
+      <div class="iconik-thumb" data-iconik-thumb="${idx}" title="Hover and drag across this preview to scrub">
+        ${thumb ? `<img class="iconik-thumb-img" src="${escapeHtml(thumb)}" alt="${escapeHtml(title)} thumbnail" loading="lazy">` : ''}
+        <video class="iconik-thumb-video" muted playsinline preload="metadata"></video>
+        ${thumb ? `` : `<div class="iconik-thumb-fallback">${escapeHtml(iconikAssetInitials(title))}</div>`}
+        <div class="iconik-scrub-line"></div>
+        <div class="iconik-thumb-badge">${dur ? `Hover scrub · ${escapeHtml(dur)}` : 'Hover scrub'}</div>
+      </div>
+      <div class="iconik-card-title">${escapeHtml(title)}</div>
+      <div class="iconik-card-meta">
+        ${type ? `<span>${escapeHtml(type)}</span>` : ''}
+        ${dur ? `<span>${escapeHtml(dur)}</span>` : ''}
+        ${id ? `<span>ID: ${escapeHtml(String(id).slice(0, 8))}…</span>` : ''}
+        <span class="mp-cache-pill ${isCached ? 'is-cached' : 'is-uncached'}">${isCached ? '● Cached' : '○ Not cached'}</span>
+      </div>
+      <div class="iconik-card-actions iconik-card-actions-wrap">
+        <button class="btn btn-gold" type="button" data-iconik-action="preview">Preview</button>
+        <button class="btn btn-outline" type="button" data-iconik-action="add-pool">${inPool ? 'In Pool' : 'Add to Pool'}</button>
+        <button class="btn btn-outline" type="button" data-iconik-action="cache" title="Pre-cache the source media on the server (required for Transcribe / Multi-Timeline render)">${isCached ? 'Re-cache' : 'Cache'}</button>
+        <button class="btn btn-outline" type="button" data-iconik-action="comments">Comments</button>
+        <button class="btn btn-outline" type="button" data-iconik-action="open-iconik">Open in Iconik</button>
+      </div>
+    </div>`;
+  }).join('');
+  bindIconikHoverScrubbers(host);
+  host.querySelectorAll('[data-iconik-action]').forEach(btn => {
+    btn.addEventListener('click', async ev => {
+      const card = ev.currentTarget.closest('[data-iconik-index]');
+      const asset = __iconikLastAssets[Number(card?.dataset?.iconikIndex || -1)];
+      if (!asset) return;
+      const action = ev.currentTarget.dataset.iconikAction;
+      if (action === 'preview') await activateIconikPreview(asset, { keepModalOpen:true });
+      if (action === 'add-pool'){
+        mediaPoolUpsertAsset({ ...asset, source_type:'iconik' });
+        ev.currentTarget.textContent = 'In Pool';
+        renderMediaPoolProjectList();
+        setStatusSafe(`Added to Media Pool: ${asset.title || asset.name || asset.asset_id || asset.id}`);
+      }
+      if (action === 'cache'){
+        try{
+          // Make sure the asset is in the pool first so the cache_id has a
+          // place to land.
+          if (!__mediaPoolAssets.some(x => String(x.asset_id || x.id || '') === String(asset.asset_id || asset.id || '') && (x.source_type || 'iconik') === 'iconik')){
+            mediaPoolUpsertAsset({ ...asset, source_type:'iconik' });
+          }
+          await startIconikCache(asset);
+        }catch(err){ alert('Iconik cache failed: ' + (err?.message || err)); }
+      }
+      if (action === 'comments'){
+        mediaPoolUpsertAsset({ ...asset, source_type:'iconik' });
+        renderMediaPoolProjectList();
+        await mediaPoolImportIconikComments(asset);
+      }
+      if (action === 'open-iconik'){
+        window.open(iconikWebUrl('asset', asset), '_blank', 'noopener,noreferrer');
+      }
+    });
+  });
+}
+
+function bindIconikHoverScrubbers(root){
+  const thumbs = root.querySelectorAll('.iconik-thumb[data-iconik-thumb]');
+  thumbs.forEach(thumb => {
+    if (thumb.__iconikScrubBound) return;
+    thumb.__iconikScrubBound = true;
+    const idx = Number(thumb.dataset.iconikThumb || -1);
+    const asset = __iconikLastAssets[idx];
+    const video = thumb.querySelector('.iconik-thumb-video');
+    const line = thumb.querySelector('.iconik-scrub-line');
+    const badge = thumb.querySelector('.iconik-thumb-badge');
+    let loadingPromise = null;
+
+    const ensurePreviewVideo = async () => {
+      if (!asset || !video) return null;
+      if (video.src) return video;
+      if (!loadingPromise){
+        loadingPromise = getIconikProxyUrl(asset.asset_id || asset.id).then(data => {
+          if (!data?.playback_url) throw new Error('No Iconik playback URL.');
+          video.src = data.playback_url;
+          video.muted = true;
+          video.preload = 'metadata';
+          video.load();
+          return video;
+        }).catch(err => {
+          if (badge) badge.textContent = 'Preview unavailable';
+          console.warn('Iconik hover preview failed', err);
+          return null;
+        });
+      }
+      return loadingPromise;
+    };
+
+    const scrubAt = async (clientX) => {
+      const v = await ensurePreviewVideo();
+      if (!v) return;
+      const rect = thumb.getBoundingClientRect();
+      const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / Math.max(1, rect.width)));
+      if (line) line.style.left = `${Math.round(ratio * rect.width)}px`;
+      const duration = Number.isFinite(v.duration) && v.duration > 0 ? v.duration : Number(asset?.duration || 0);
+      if (duration > 0){
+        const t = Math.max(0, Math.min(duration - 0.05, duration * ratio));
+        if (Math.abs((v.currentTime || 0) - t) > 0.25) {
+          try{ v.currentTime = t; }catch(_e){}
+        }
+        if (badge) badge.textContent = `${formatTimecodeFromSeconds(t, getFPS())} / ${iconikFormatDuration(duration)}`;
+      } else if (badge) {
+        badge.textContent = 'Hover scrub';
+      }
+    };
+
+    thumb.addEventListener('mouseenter', async ev => {
+      thumb.classList.add('is-scrubbing');
+      const v = await ensurePreviewVideo();
+      if (v) {
+        thumb.classList.add('is-video-on');
+        try{ await v.play(); }catch(_e){}
+        try{ v.pause(); }catch(_e){}
+      }
+      scrubAt(ev.clientX);
+    });
+    thumb.addEventListener('mousemove', ev => scrubAt(ev.clientX));
+    thumb.addEventListener('mouseleave', () => {
+      thumb.classList.remove('is-scrubbing');
+      thumb.classList.remove('is-video-on');
+      try{ video?.pause(); }catch(_e){}
+      if (badge) {
+        const dur = iconikFormatDuration(asset?.duration);
+        badge.textContent = dur ? `Hover scrub · ${dur}` : 'Hover scrub';
+      }
+    });
+    thumb.addEventListener('click', async () => await activateIconikPreview(asset, { keepModalOpen:true }));
+  });
+}
+
+async function refreshIconikCollections(){
+  ensureMediaPoolModal();
+  const host = document.getElementById('iconikCollectionsList');
+  try{
+    if (host) host.innerHTML = `<div class="iconik-sidebar-empty">Loading collections…</div>`;
+    const data = await fetchIconikCollections('', 1);
+    __iconikLastCollections = data.items || [];
+    renderIconikCollections(__iconikLastCollections);
+  }catch(err){
+    if (host) host.innerHTML = `<div class="iconik-sidebar-empty">Collections failed: ${escapeHtml(err?.message || err)}</div>`;
+  }
+}
+
+async function refreshIconikAssets({ view='recent' } = {}){
+  ensureMediaPoolModal();
+  const q = view === 'search' ? (document.getElementById('iconikSearchInput')?.value?.trim() || '') : '';
+  const footer = document.getElementById('iconikFooterStatus');
+  const pill = document.getElementById('mediaPoolStatusPill');
+  const host = document.getElementById('iconikResults');
+  const title = document.getElementById('iconikBrowserTitle');
+  const sub = document.getElementById('iconikBrowserSub');
+  try{
+    if (title) title.textContent = q ? `Search: ${q}` : 'Recent assets';
+    if (sub) sub.textContent = q ? 'Search results from Iconik.' : 'Recently available Iconik assets.';
+    setIconikSidebarActive(q ? 'search' : 'recent');
+    __iconikCurrentCollection = null;
+    if (footer) footer.textContent = q ? `Searching “${q}”…` : 'Loading recent Iconik assets…';
+    if (host) host.innerHTML = `<div class="iconik-empty">Loading Iconik assets…</div>`;
+    const status = await fetchIconikStatus();
+    if (pill) pill.textContent = status.configured ? 'Iconik connected' : 'Iconik credentials missing';
+    if (!status.configured){
+      if (host) host.innerHTML = `<div class="iconik-empty">Iconik is not configured. Set ICONIK_APP_ID and ICONIK_AUTH_TOKEN, then restart FastAPI.</div>`;
+      return;
+    }
+    const data = await searchIconikAssets(q, 1);
+    __iconikLastAssets = data.items || [];
+    renderIconikAssets(__iconikLastAssets);
+    renderMediaPoolProjectList();
+    if (footer) footer.textContent = `${__iconikLastAssets.length} asset(s) loaded.`;
+  }catch(err){
+    if (pill) pill.textContent = 'Iconik error';
+    if (host) host.innerHTML = `<div class="iconik-empty">Iconik load failed: ${escapeHtml(err?.message || err)}</div>`;
+    if (footer) footer.textContent = '';
+  }
+}
+
+async function loadIconikCollection(collection){
+  const collectionId = collection?.collection_id || collection?.id || '';
+  if (!collectionId) return;
+  ensureMediaPoolModal();
+  const footer = document.getElementById('iconikFooterStatus');
+  const host = document.getElementById('iconikResults');
+  const title = document.getElementById('iconikBrowserTitle');
+  const sub = document.getElementById('iconikBrowserSub');
+  const name = collection.title || collection.name || 'Collection';
+  __iconikCurrentCollection = collection;
+  setIconikSidebarActive('collection', collectionId);
+  if (title) title.innerHTML = `${escapeHtml(name)} <button class="btn btn-outline btn-mini" id="openCurrentCollectionIconik" type="button">Open in Iconik</button>`;
+  if (sub) sub.textContent = 'Assets inside this Iconik collection.';
+  setTimeout(() => {
+    document.getElementById('openCurrentCollectionIconik')?.addEventListener('click', () => window.open(iconikWebUrl('collection', collection), '_blank', 'noopener,noreferrer'));
+  }, 0);
+  try{
+    if (footer) footer.textContent = `Loading collection “${name}”…`;
+    if (host) host.innerHTML = `<div class="iconik-empty">Loading collection assets…</div>`;
+    const data = await fetchIconikCollectionAssets(collectionId, 1);
+    __iconikLastAssets = data.items || [];
+    renderIconikAssets(__iconikLastAssets);
+    renderMediaPoolProjectList();
+    if (footer) footer.textContent = `${__iconikLastAssets.length} asset(s) in “${name}”.`;
+  }catch(err){
+    if (host) host.innerHTML = `<div class="iconik-empty">Collection load failed: ${escapeHtml(err?.message || err)}</div>`;
+    if (footer) footer.textContent = '';
+  }
+}
+
+async function openMediaPoolModal(){
+  ensureMediaPoolModal();
+  ensureMediaPoolTray();
+  document.getElementById('mediaPoolModal')?.classList.remove('hidden');
+  setMediaPoolSource('iconik');
+  renderMediaPoolProjectList();
+  await refreshIconikCollections();
+  await refreshIconikAssets({ view:'recent' });
+  setTimeout(()=>document.getElementById('iconikSearchInput')?.focus(), 50);
+}
+
+async function openIconikImportModal(){
+  // Backward-compatible function name: the old Iconik button now opens the full Media Pool.
+  await openMediaPoolModal();
+}
+
+async function activateIconikPreview(asset, opts={}){
+  const assetId = asset?.asset_id || asset?.id;
+  if (!assetId){ alert('This Iconik asset has no asset ID.'); return; }
+  mediaPoolSetCurrentAsset({ ...asset, source_type:'iconik', asset_id:assetId });
+  progressStart?.('Loading Iconik preview…');
+  try{
+    try{ setYouTubePreviewVisible(false); }catch(_e){}
+    try{ setGoogleDrivePreviewVisible(false); }catch(_e){}
+    const data = await getIconikProxyUrl(assetId);
+    const url = data.playback_url;
+    if (!url) throw new Error('Iconik did not return a playback URL.');
+    __iconikCurrentAsset = { ...asset, asset_id: assetId, proxy: data };
+    // Restore cacheId from the asset only if it was previously cached. The
+    // cache_id field is stamped onto the asset by rememberIconikCacheFromBackend
+    // after the cache job completes; absent that, we leave cacheId null and
+    // ensureIconikSourceCache() will run a real cache job on demand.
+    const restoredCacheId = String(asset.cache_id || asset.cacheId || asset.metadata?.cache_id || '') || null;
+    const mediaPoolKey = String(asset.media_pool_key || `iconik:${assetId}`);
+    currentMediaSource = {
+      type:'iconik',
+      assetId,
+      fileId:data.file_id || null,
+      metadata:asset,
+      playbackUrl:url,
+      cacheId: restoredCacheId,
+      mediaPoolKey,
+    };
+    lastLoadedVideoFile = null;
+    player.src = url;
+    player.load();
+    mediaPoolRestoreAssetTime({ ...asset, source_type:'iconik', asset_id:assetId });
+    player.onloadedmetadata = () => {
+      try{ renderTranscript(); }catch(_e){}
+      try{ handleMediaTimeUpdate(0); }catch(_e){}
+    };
+    await player.play().catch(()=>{});
+    setStatusSafe(`Iconik preview loaded: ${asset.title || asset.name || assetId}${asset.cache_id ? ' · cached' : ''}`);
+    if (!opts.keepModalOpen) document.getElementById('mediaPoolModal')?.classList.add('hidden');
+  }catch(err){
+    alert('Iconik preview failed: ' + (err?.message || err));
+    setStatusSafe('Iconik preview failed: ' + (err?.message || err));
+  }finally{
+    progressDone?.();
+  }
+}
+
+function ensureIconikImportButton(){
+  if (document.getElementById('btnIconikImport')) return;
+  ensureMediaPoolModal();
+  ensureMediaPoolTray();
+  const toolbar = document.querySelector('.toolbar') || document.querySelector('header .toolbar');
+  if (!toolbar) return;
+  const btn = document.createElement('button');
+  btn.id = 'btnIconikImport';
+  btn.type = 'button';
+  btn.className = 'btn btn-outline iconik-icon-btn';
+  btn.title = 'Open Media Pool';
+  btn.setAttribute('aria-label', 'Open Media Pool');
+  btn.innerHTML = '<span class="iconik-icon" aria-hidden="true">i</span><span>Media Pool</span>';
+  const ytBtn = document.getElementById('btnYouTubeImport');
+  if (ytBtn && ytBtn.parentElement) ytBtn.insertAdjacentElement('afterend', btn);
+  else toolbar.insertBefore(btn, toolbar.firstChild);
+  btn.addEventListener('click', () => openMediaPoolModal());
+}
 /* ---------- Google Drive Import (public/shared link PoC) ---------- */
 function parseGoogleDriveFileId(url){
   const raw = String(url || '').trim();
@@ -11022,6 +13897,11 @@ function buildShareSessionState(){
     comments: COLLAB_COMMENTS || {},
     timeline_clips: (timelineClips || []).map(cleanTimelineClipForShare),
     story_rows: (storyRows || []).map(cleanStoryRowForShare),
+    // Multi-Timeline Mode (Phase 1): share the EDL document alongside the
+    // single-source timelineClips. Empty/default for legacy sessions.
+    multi_timeline: (typeof cleanMultiTimelineDocumentForShare === 'function' && typeof ensureMultiTimelineDocument === 'function')
+      ? cleanMultiTimelineDocumentForShare(ensureMultiTimelineDocument())
+      : null,
   };
 }
 
@@ -12197,7 +15077,7 @@ function applyViewOnlyMode(){
   try{ applyAllLocks(); }catch(_e){}
 
   const disableIds = [
-    'fileInput','srtInput','srtInputA','srtInputB','btnYouTubeImport','btnGoogleDriveImport','btnShareSession',
+    'fileInput','srtInput','srtInputA','srtInputB','btnYouTubeImport','btnIconikImport','btnGoogleDriveImport','btnShareSession',
     'btnTranscribe','btnSrtTranslate','btnDictionary','btnAIAssistant','btnAnalyze','btnAlignSrt','btnAICheck',
     'btnKeyTerms','btnCancelBackend','btnExport','btnExportVtt','alignSrtText',
     'whisperModel','whisperDevice','whisperCompute','whisperLang','aiCheckMode'
@@ -12206,7 +15086,7 @@ function applyViewOnlyMode(){
     const el = document.getElementById(id);
     if (!el) continue;
     try{ el.disabled = true; }catch(_e){}
-    if (id === 'btnShareSession' || id === 'btnYouTubeImport' || id === 'btnGoogleDriveImport'){
+    if (id === 'btnShareSession' || id === 'btnYouTubeImport' || id === 'btnIconikImport' || id === 'btnGoogleDriveImport'){
       try{ el.style.display = 'none'; }catch(_e){}
     }
   }
@@ -12249,6 +15129,13 @@ function applySharedSessionState(state, opts={}){
     normalizeTimelineClips();
     if (!timelineClips.some(c => c.id === timelineSelectedClipId)) timelineSelectedClipId = '';
     if (isTimelineMode) requestTimelineRender();
+  }
+  if (st.multi_timeline && typeof applyMultiTimelineDocument === 'function'){
+    // Phase 1: round-trip the Multi-Timeline EDL through collab. Re-render only
+    // if the multi shell is actually visible to avoid touching DOM during
+    // background updates.
+    const wantsRender = !!(typeof multiTimelineModeEl !== 'undefined' && multiTimelineModeEl && multiTimelineModeEl.style.display !== 'none');
+    applyMultiTimelineDocument(st.multi_timeline, { silent: !wantsRender });
   }
   if (Array.isArray(st.story_rows)){
     if (opts.remoteUpdate && storyIsEditingOrSelecting()){
@@ -13383,7 +16270,17 @@ function normalizeTimelineClips(){
     c.ownerColor = String(c.ownerColor || c.owner_color || c.color || timelineDefaultClipColor(idx));
     c.color = String(c.color || c.ownerColor || timelineDefaultClipColor(idx));
     if (c.enabled !== false) c.enabled = true;
+    // Source identity: ensure all four fields exist as strings, even when an
+    // older project carried none of them. Actual stamping for empty clips
+    // happens in migrateTimelineClipsSourceIdentity().
+    c.source_type = String(c.source_type || c.sourceType || '');
+    c.asset_id = String(c.asset_id || c.assetId || '');
+    c.asset_name = String(c.asset_name || c.assetName || '');
+    c.media_pool_key = String(c.media_pool_key || c.mediaPoolKey || '');
   });
+  // Stamp the active asset onto any clip that's still missing identity.
+  // Idempotent: returns 0 once everything is stamped.
+  try{ migrateTimelineClipsSourceIdentity?.(); }catch(_e){}
 }
 function timelineSetStatus(text){
   const status = timelineModeEl?.querySelector('#tlStatus');
@@ -13437,6 +16334,12 @@ function cleanTimelineClipForShare(clip, idx=0){
     storyKind: String(clip?.storyKind || ''),
     storyLabel: String(clip?.storyLabel || ''),
     sourceMedia: String(clip?.sourceMedia || ''),
+    // Source identity — stamped at clip creation so Story Mode and Multi-Timeline
+    // can resolve the underlying media. Mirrors the Story Card field shape.
+    source_type: String(clip?.source_type || clip?.sourceType || ''),
+    asset_id: String(clip?.asset_id || clip?.assetId || ''),
+    asset_name: String(clip?.asset_name || clip?.assetName || ''),
+    media_pool_key: String(clip?.media_pool_key || clip?.mediaPoolKey || ''),
   };
 }
 
@@ -13656,6 +16559,7 @@ function ensureTimelineMode(){
         <label class="tl-zoom-label">Zoom <input id="tlZoom" type="range" min="1" max="800" step="1" value="28"></label>
         <button class="btn btn-outline tl-zoom-btn" id="tlZoomIn" type="button">+</button>
         <button class="btn btn-outline" id="tlSnapCue" type="button">Snap to Cue</button>
+        <button class="btn btn-outline" id="tlAddMarker" type="button">Add Marker</button>
         <button class="btn btn-outline" id="tlSetIn" type="button">Set In</button>
         <button class="btn btn-outline" id="tlSetOut" type="button">Set Out</button>
         <button class="btn btn-outline" id="tlPreviewClip" type="button">Preview Clip</button>
@@ -13673,6 +16577,7 @@ function ensureTimelineMode(){
           <div class="tl-remote-playheads" id="tlRemotePlayheads"></div>
           <div class="tl-remote-ranges" id="tlRemoteRanges"></div>
           <div class="tl-selection" id="tlSelection" hidden><span></span></div>
+          <div class="tl-review-comments" id="tlReviewComments"></div>
           <div class="tl-cue-markers" id="tlCueMarkers"></div>
           <div class="tl-clips" id="tlClips"></div>
         </div>
@@ -13729,6 +16634,7 @@ function bindTimelineMode(){
   el.querySelector('#tlAiSelect')?.addEventListener('click', () => openTimelineAiModal());
   el.querySelector('#tlExport')?.addEventListener('click', () => exportTimelineCut());
   el.querySelector('#tlSnapCue')?.addEventListener('click', () => snapTimelineSelectionToCurrentCue());
+  el.querySelector('#tlAddMarker')?.addEventListener('click', () => openTimelineAddMarkerPrompt());
   el.querySelector('#tlSetIn')?.addEventListener('click', () => setTimelineInAtPlayhead());
   el.querySelector('#tlSetOut')?.addEventListener('click', () => setTimelineOutAtPlayhead());
   el.querySelector('#tlPreviewExport')?.addEventListener('click', () => openTimelinePreviewModal());
@@ -13751,6 +16657,8 @@ function bindTimelineMode(){
   lane?.addEventListener('pointerdown', onTimelineLanePointerDown);
   document.addEventListener('keydown', (ev) => {
     if (!isTimelineMode) return;
+    // Multi-Timeline sub-mode owns the keyboard when it's the active sub-toggle.
+    if (typeof isMultiTimelineMode !== 'undefined' && isMultiTimelineMode) return;
     if (timelineConfirmModalEl && !timelineConfirmModalEl.classList.contains('hidden')) return;
     if (ev.target && ['INPUT','TEXTAREA','SELECT'].includes(ev.target.tagName)) return;
     if ((ev.ctrlKey || ev.metaKey) && String(ev.key || '').toLowerCase() === 'z'){
@@ -13841,6 +16749,7 @@ function renderTimelineMode(){
   if (zoom) zoom.value = String(Math.round(timelinePxPerSec));
   renderTimelineRuler(ruler, scroll, dur);
   renderTimelineCueMarkers(cueHost, scroll, dur);
+  renderTimelineReviewComments(el.querySelector('#tlReviewComments'), scroll, dur);
   renderTimelineSelection(selEl);
   renderTimelineClips(clipsHost);
   renderTimelineCollabAwareness();
@@ -13850,6 +16759,272 @@ function renderTimelineMode(){
   if (status) status.textContent = timelineClips.length ? `${enabledClips.length}/${timelineClips.length} clip(s) checked · final duration ${fmtTimelineTime(total)} · zoom ${Math.round(timelinePxPerSec)} px/s · ${Math.max(1, Math.round(timelinePxPerSec / getFPS()))} px/frame` : 'No clips yet. Drag on the timeline to create a selection, or snap to the current cue.';
   renderTimelineClipList();
 }
+function timelineCurrentMediaPoolAsset(){
+  try{
+    if (__mediaPoolCurrentKey) {
+      const found = getMediaPoolAssets().find(a => mediaPoolAssetKey(a) === __mediaPoolCurrentKey);
+      if (found) return found;
+      // The current asset may have been previewed/imported from Iconik without
+      // being explicitly added to the Project Pool yet. Return a lightweight
+      // synthetic asset so Timeline comment markers can still read its state.
+      const st = __mediaPoolAssetStates[__mediaPoolCurrentKey] || {};
+      if (st && Array.isArray(st.comments) && st.comments.length){
+        const [sourceType, ...rest] = String(__mediaPoolCurrentKey).split(':');
+        const sourceId = rest.join(':');
+        return { source_type:sourceType || 'media', asset_id:sourceId, id:sourceId, media_pool_key:__mediaPoolCurrentKey, comments:st.comments, comment_count:st.comments.length };
+      }
+    }
+    if (currentMediaSource && currentMediaSource.type === 'iconik' && currentMediaSource.assetId){
+      const key = `iconik:${currentMediaSource.assetId}`;
+      const st = __mediaPoolAssetStates[key] || {};
+      return { source_type:'iconik', asset_id:currentMediaSource.assetId, id:currentMediaSource.assetId, media_pool_key:key, comments:Array.isArray(st.comments) ? st.comments : [] };
+    }
+  }catch(_e){}
+  return null;
+}
+
+function mediaPoolUpsertAssetComment(asset, comment){
+  if (!asset || !comment) return null;
+  const key = mediaPoolAssetKey(asset);
+  const prev = __mediaPoolAssetStates[key] || {};
+  const comments = Array.isArray(prev.comments) ? prev.comments.slice() : [];
+  const id = String(comment.id || `marker_${Date.now().toString(36)}_${comments.length}`);
+  const start = Math.max(0, Number(comment.start ?? comment.in ?? 0) || 0);
+  let end = Number(comment.end ?? comment.out ?? start);
+  if (!Number.isFinite(end) || end < start) end = start;
+  const next = { ...comment, id, start, end, is_range: end > start + (1 / Math.max(1, (typeof getFPS === 'function' ? getFPS() : 25))) };
+  const ix = comments.findIndex(c => String(c.id || '') === id);
+  if (ix >= 0) comments[ix] = { ...comments[ix], ...next };
+  else comments.push(next);
+  comments.sort((a,b) => (Number(a.start || 0) - Number(b.start || 0)));
+  __mediaPoolAssetStates[key] = { ...prev, comments, commentCount:comments.length };
+  asset.comment_count = comments.length;
+  asset.has_comments = comments.length > 0;
+  mediaPoolPersistAssetStates();
+  mediaPoolPersistAssets();
+  try{ renderMediaPoolProjectList?.(); }catch(_e){}
+  try{ renderMediaPoolTray?.(); }catch(_e){}
+  try{ renderMediaPoolReviewPanel?.(asset); }catch(_e){}
+  try{ requestTimelineRender?.(); }catch(_e){}
+  return next;
+}
+
+function mediaPoolDeleteAssetComment(asset, commentId){
+  if (!asset || !commentId) return false;
+  const key = mediaPoolAssetKey(asset);
+  const prev = __mediaPoolAssetStates[key] || {};
+  const before = Array.isArray(prev.comments) ? prev.comments.slice() : [];
+  const after = before.filter(c => String(c?.id || '') !== String(commentId));
+  if (after.length === before.length) return false;
+  __mediaPoolAssetStates[key] = { ...prev, comments:after, commentCount:after.length };
+  asset.comment_count = after.length;
+  asset.has_comments = after.length > 0;
+  mediaPoolPersistAssetStates();
+  mediaPoolPersistAssets();
+  try{ renderMediaPoolProjectList?.(); }catch(_e){}
+  try{ renderMediaPoolTray?.(); }catch(_e){}
+  try{ renderMediaPoolReviewPanel?.(asset); }catch(_e){}
+  try{ requestTimelineRender?.(); }catch(_e){}
+  return true;
+}
+
+function mediaPoolClearAssetComments(asset, opts={}){
+  if (!asset) return false;
+  const key = mediaPoolAssetKey(asset);
+  const prev = __mediaPoolAssetStates[key] || {};
+  __mediaPoolAssetStates[key] = { ...prev, comments:[], commentCount:0, commentsImportedAt:Date.now(), commentsClearedAt:Date.now() };
+  asset.comments = [];
+  asset.comment_count = 0;
+  asset.has_comments = false;
+  const poolIdx = __mediaPoolAssets.findIndex(a => mediaPoolAssetKey(a) === key);
+  if (poolIdx >= 0) __mediaPoolAssets[poolIdx] = { ...__mediaPoolAssets[poolIdx], comments:[], comment_count:0, has_comments:false };
+  mediaPoolPersistAssetStates();
+  mediaPoolPersistAssets();
+  try{ renderMediaPoolProjectList?.(); }catch(_e){}
+  try{ renderMediaPoolTray?.(); }catch(_e){}
+  try{ renderMediaPoolReviewPanel?.(asset); }catch(_e){}
+  try{ requestTimelineRender?.(); }catch(_e){}
+  if (!opts.silent) setStatusSafe('Cleared local review markers for this asset. Re-import from Iconik to reload live comments.');
+  return true;
+}
+
+let __timelineMarkerCtxMenu = null;
+function ensureTimelineMarkerContextMenu(){
+  if (__timelineMarkerCtxMenu) return __timelineMarkerCtxMenu;
+  const menu = document.createElement('div');
+  menu.className = 'tl-marker-ctx-menu';
+  menu.style.display = 'none';
+  menu.innerHTML = `<button type="button" data-action="delete">Delete</button>`;
+  document.body.appendChild(menu);
+  const hide = () => { menu.style.display = 'none'; menu.__asset = null; menu.__commentId = ''; };
+  menu.querySelector('[data-action="delete"]')?.addEventListener('click', () => {
+    const asset = menu.__asset;
+    const id = menu.__commentId;
+    hide();
+    if (!asset || !id) return;
+    const ok = mediaPoolDeleteAssetComment(asset, id);
+    if (ok) setStatusSafe('Timeline marker deleted locally.');
+  });
+  window.addEventListener('click', hide);
+  window.addEventListener('resize', hide);
+  window.addEventListener('scroll', hide, true);
+  __timelineMarkerCtxMenu = menu;
+  return menu;
+}
+function showTimelineMarkerContextMenu(ev, asset, comment){
+  if (!comment) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  const menu = ensureTimelineMarkerContextMenu();
+  menu.__asset = asset;
+  menu.__commentId = String(comment.id || '');
+  menu.style.left = `${ev.clientX}px`;
+  menu.style.top = `${ev.clientY}px`;
+  menu.style.display = 'block';
+}
+
+async function mediaPoolSyncCommentToIconik(asset, comment){
+  if (!asset || !comment) return null;
+  const sourceType = String(asset.source_type || asset.sourceType || '').toLowerCase();
+  if (sourceType !== 'iconik') return null;
+  const assetId = asset.asset_id || asset.id;
+  if (!assetId) throw new Error('This Iconik asset has no asset_id.');
+  const local = mediaPoolUpsertAssetComment(asset, { ...comment, sync_status:'syncing' });
+  try{
+    const data = await postIconikAssetCommentSegment(assetId, {
+      text: local.text || local.body || '',
+      start: Number(local.start || 0),
+      end: Number(local.end || local.start || 0),
+      fps: getFPS ? getFPS() : 25,
+    });
+    const synced = mediaPoolUpsertAssetComment(asset, { ...local, source:'iconik', sync_status:'synced', iconik_response:data, raw:data?.response || local.raw || {} });
+    setStatusSafe(`Synced marker to Iconik: ${local.text || 'comment'}`);
+    return synced;
+  }catch(err){
+    mediaPoolUpsertAssetComment(asset, { ...local, sync_status:'sync_failed', sync_error:String(err?.message || err) });
+    setStatusSafe(`Iconik marker sync failed: ${err?.message || err}`);
+    throw err;
+  }
+}
+
+function getTimelineMarkerDraftRange(){
+  const fps = Math.max(1, (typeof getFPS === 'function' ? getFPS() : 25));
+  const cur = Math.max(0, (typeof getMediaCurrentTime === 'function') ? getMediaCurrentTime() : (player?.currentTime || 0));
+  if (timelineSelection){
+    const a = Math.min(Number(timelineSelection.start) || 0, Number(timelineSelection.end) || 0);
+    const b = Math.max(Number(timelineSelection.start) || 0, Number(timelineSelection.end) || 0);
+    if (Number.isFinite(a) && Number.isFinite(b) && b > a + (1 / fps)){
+      return { start:snapTimeToFrameValue(a), end:snapTimeToFrameValue(b), isRange:true };
+    }
+  }
+  const t = snapTimeToFrameValue(cur);
+  return { start:t, end:t, isRange:false };
+}
+
+async function openTimelineAddMarkerPrompt(){
+  const asset = timelineCurrentMediaPoolAsset();
+  if (!asset){ alert('Select a Project Pool asset first, then add a marker.'); return; }
+  const draft = getTimelineMarkerDraftRange();
+  const fps = Math.max(1, (typeof getFPS === 'function' ? getFPS() : 25));
+  const rangeLabel = draft.isRange
+    ? `${formatTimecodeFromSeconds(draft.start, fps)} → ${formatTimecodeFromSeconds(draft.end, fps)}`
+    : formatTimecodeFromSeconds(draft.start, fps);
+  const text = prompt(`Add timeline ${draft.isRange ? 'range marker' : 'marker'} at ${rangeLabel}:`, '');
+  if (text == null) return;
+  const trimmed = String(text || '').trim();
+  if (!trimmed) return;
+  const marker = {
+    id:`marker_${Date.now().toString(36)}_${Math.round(draft.start*1000)}`,
+    source:'local',
+    start:draft.start,
+    end:draft.end,
+    is_range:draft.isRange,
+    text:trimmed,
+    author:COLLAB_USER_LABEL || 'You',
+    created_at:new Date().toISOString(),
+    sync_status:'local'
+  };
+  const saved = mediaPoolUpsertAssetComment(asset, marker);
+  setTimelineSelection(draft.start, draft.isRange ? draft.end : draft.start + (1 / fps));
+  timelineLiveSeek(draft.start);
+  const isIconik = String(asset.source_type || asset.sourceType || '').toLowerCase() === 'iconik';
+  if (isIconik){
+    try{ await mediaPoolSyncCommentToIconik(asset, saved); }
+    catch(err){ alert(`Marker was saved locally, but Iconik sync failed.\n\n${err?.message || err}`); }
+  } else {
+    setStatusSafe('Timeline marker added locally. Only Iconik assets can sync markers back to Iconik.');
+  }
+}
+
+function renderTimelineReviewComments(host, scroll, dur){
+  if (!host || !scroll) return;
+  let asset = null;
+  try{ asset = timelineCurrentMediaPoolAsset(); }catch(_e){}
+  // Timeline comment labels are source-aware.  They show comments for the active
+  // Project Pool asset, falling back to the currently loaded key if available.
+  let comments = [];
+  try{
+    comments = asset ? mediaPoolCommentsForAsset(asset) : [];
+    if ((!comments || !comments.length) && __mediaPoolCurrentKey){
+      const st = __mediaPoolAssetStates[__mediaPoolCurrentKey] || {};
+      comments = Array.isArray(st.comments) ? st.comments : [];
+      if (!asset) asset = getMediaPoolAssets().find(a => mediaPoolAssetKey(a) === __mediaPoolCurrentKey) || null;
+    }
+  }catch(_e){ comments = []; }
+  if (!comments.length){
+    // Last-resort fallback: if comments were imported for the currently loaded
+    // Iconik asset but the Project Pool object is not active/resolved, show the
+    // current source state's comments instead of dropping Timeline markers.
+    try{
+      const src = currentMediaSource || {};
+      if (src.type === 'iconik' && src.assetId){
+        const st = __mediaPoolAssetStates[`iconik:${src.assetId}`] || {};
+        if (Array.isArray(st.comments) && st.comments.length) comments = st.comments;
+      }
+    }catch(_e){}
+  }
+  if (!comments.length){ host.innerHTML = ''; return; }
+  const fps = Math.max(1, (typeof getFPS === 'function' ? getFPS() : 25));
+  const viewStart = timelinePxToTime(scroll.scrollLeft - 220);
+  const viewEnd = timelinePxToTime(scroll.scrollLeft + scroll.clientWidth + 420);
+  let html = '';
+  comments.forEach((c, idx) => {
+    const start = Math.max(0, Number(c.start || 0));
+    let end = Number(c.end ?? start);
+    if (!Number.isFinite(end) || end < start) end = start;
+    const renderEnd = Math.max(end, start + (1 / fps));
+    if (renderEnd < viewStart || start > viewEnd) return;
+    const left = timelineTimeToPx(start);
+    const width = Math.max(c.is_range || end > start + (1 / fps) ? 72 : 0, timelineTimeToPx(Math.min(renderEnd, dur)) - left);
+    const txt = String(c.text || c.body || c.comment || '').replace(/\s+/g, ' ').trim() || 'Comment';
+    const author = c.author ? ` · ${c.author}` : '';
+    const syncCls = c.sync_status ? ` ${String(c.sync_status).replace(/[^a-z0-9_-]/gi,'')}` : '';
+    const sourceCls = c.source === 'iconik' ? ' iconik' : ' local';
+    const rangeCls = end > start + (1 / fps) ? ' is-range' : ' is-point';
+    const sourceLabel = c.source === 'iconik' ? 'Iconik' : (c.sync_status === 'synced' ? 'Synced' : 'Local');
+    const tcLabel = end > start + (1 / fps) ? `${formatTimecodeFromSeconds(start, fps)} → ${formatTimecodeFromSeconds(end, fps)}` : formatTimecodeFromSeconds(start, fps);
+    const widthStyle = width ? `width:${width}px;` : '';
+    html += `<button class="tl-review-comment${sourceCls}${rangeCls}${syncCls}" type="button" data-review-comment-index="${idx}" title="${escapeHtml(tcLabel)}${escapeHtml(author)} · ${escapeHtml(txt)}" style="left:${left}px;${widthStyle}"><span class="tl-review-pin"></span><span class="tl-review-label">${escapeHtml(txt)}</span><small>${escapeHtml(sourceLabel)}</small></button>`;
+  });
+  host.innerHTML = html;
+  host.querySelectorAll('[data-review-comment-index]').forEach(btn => {
+    btn.addEventListener('click', ev => {
+      ev.stopPropagation();
+      const c = comments[Number(btn.dataset.reviewCommentIndex || -1)];
+      if (!c) return;
+      const s = Math.max(0, Number(c.start || 0));
+      const e = Math.max(Number(c.end || 0), s + (1 / fps));
+      setTimelineSelection(s, e);
+      timelineLiveSeek(s);
+      try{ mediaPoolActivateComment(asset, c); }catch(_e){}
+    });
+    btn.addEventListener('contextmenu', ev => {
+      const c = comments[Number(btn.dataset.reviewCommentIndex || -1)];
+      showTimelineMarkerContextMenu(ev, asset, c);
+    });
+  });
+}
+
 function renderTimelineCueMarkers(host, scroll, dur){
   if (!host || !scroll) return;
   const { tracks } = getTimelineTrackLists(getTimelineTrackChoice());
@@ -13954,6 +17129,7 @@ function addTimelineClipFromSelection(){
   if (b <= a + (1/getFPS())){ alert('Selection is too short.'); return; }
   const ownerLabel = getTimelineOwnerLabel();
   const ownerColor = getTimelineOwnerColor();
+  const srcRef = currentTimelineSourceRef();
   const clip = {
     id:makeTimelineClipId(),
     start:snapTimeToFrameValue(a),
@@ -13965,11 +17141,66 @@ function addTimelineClipFromSelection(){
     color:ownerColor,
     enabled:true,
     createdAt:Date.now(),
+    // Stamp the active Media Pool asset identity so Story Mode (and Multi-
+    // Timeline) can resolve this clip's source later. If no asset is active,
+    // these stay empty strings and migration on load will fill them in.
+    source_type: srcRef.source_type,
+    asset_id: srcRef.asset_id,
+    asset_name: srcRef.asset_name,
+    media_pool_key: srcRef.media_pool_key,
+    source: srcRef.source,
+    sourceMedia: srcRef.source,
   };
   timelineClips.push(clip);
   timelineSelectedClipId = clip.id;
   requestTimelineRender();
   timelineCommitSharedState(true);
+}
+
+// Returns the source identity of the currently-active Media Pool asset.
+// Used by Source Timeline clip creation so each clip carries the same
+// {source_type, asset_id, asset_name, media_pool_key} fields a Story Card has.
+function currentTimelineSourceRef(){
+  const empty = { source_type:'', asset_id:'', asset_name:'', media_pool_key:'', source:'' };
+  try{
+    if (typeof __mediaPoolCurrentKey === 'undefined' || !__mediaPoolCurrentKey) return empty;
+    const assets = (typeof getMediaPoolAssets === 'function') ? getMediaPoolAssets() : [];
+    const active = assets.find(a => typeof mediaPoolAssetKey === 'function' && mediaPoolAssetKey(a) === __mediaPoolCurrentKey);
+    if (!active) return empty;
+    const sourceType = (typeof storySourceTypeForAsset === 'function') ? storySourceTypeForAsset(active) : (active.source_type || active.type || '');
+    const assetId = String(active.asset_id || active.id || active.source_id || active.local_id || active.youtube_id || active.drive_id || active.file_id || '');
+    const assetName = (typeof storyAssetTitle === 'function') ? storyAssetTitle(active) : String(active.title || active.name || active.label || '');
+    const sourceLabel = (typeof mediaPoolSourceLabel === 'function') ? `${mediaPoolSourceLabel(active)} / ${assetName}` : assetName;
+    return {
+      source_type: String(sourceType || ''),
+      asset_id: assetId,
+      asset_name: assetName,
+      media_pool_key: String(__mediaPoolCurrentKey),
+      source: sourceLabel,
+    };
+  }catch(_e){ return empty; }
+}
+
+// Migration: any clip in `timelineClips` that lacks a media_pool_key gets
+// stamped with the currently-active asset (if any). Called once after the
+// project loads so legacy clips become Story-compatible without user action.
+function migrateTimelineClipsSourceIdentity(){
+  if (!Array.isArray(timelineClips) || !timelineClips.length) return 0;
+  const ref = currentTimelineSourceRef();
+  if (!ref.media_pool_key) return 0;
+  let migrated = 0;
+  timelineClips.forEach(c => {
+    if (c && !c.media_pool_key){
+      c.source_type = ref.source_type;
+      c.asset_id = ref.asset_id;
+      c.asset_name = ref.asset_name;
+      c.media_pool_key = ref.media_pool_key;
+      if (!c.source) c.source = ref.source;
+      if (!c.sourceMedia) c.sourceMedia = ref.source;
+      migrated++;
+    }
+  });
+  return migrated;
 }
 function renderTimelineClipList(){
   const host = timelineModeEl?.querySelector('#tlClipList');
@@ -14937,6 +18168,2107 @@ async function exportTimelineCut(){
 }
 
 
+/* ============================================================================
+   Multi-Timeline Mode — Phase 1: shell + persistence only
+   ----------------------------------------------------------------------------
+   Purpose: documentary assembly with multiple video, audio, subtitle and
+   overlay tracks. This phase lays down the EDL document, the empty shell UI,
+   and round-trips the document through saves/collab. Clip drop, render and
+   export arrive in subsequent phases.
+
+   The schema is intentionally additive: existing Source Timeline Mode code
+   (timelineClips[] etc.) is untouched. Multi-Timeline lives in a separate
+   `multiTimeline` document and a separate render path.
+   ========================================================================== */
+
+let isMultiTimelineMode = false;
+// Initialized lazily by ensureMultiTimelineDocument() so we don't hit a
+// temporal-dead-zone error on MULTI_TIMELINE_DEFAULT_TRACKS, which is a
+// `const` declared further down in this section.
+let multiTimeline = null;
+let multiTimelineModeEl = null;
+let multiTimelinePxPerSec = 28;
+let multiTimelinePlayhead = 0;
+let __multiTimelineRaf = 0;
+
+function ensureMultiTimelineDocument(){
+  if (!multiTimeline) multiTimeline = createEmptyMultiTimelineDocument();
+  return multiTimeline;
+}
+
+const MULTI_TIMELINE_DEFAULT_TRACKS = [
+  // Display order is top-to-bottom in the UI: subtitles sit on top of everything
+  // visually, then graphic overlays, then video layers, then audio at the bottom.
+  // Per-group sort direction is applied in orderMultiTimelineTracks() so the
+  // `index` field always reads as "display position within the group" — lower
+  // index appears earlier in the group, except video which keeps NLE
+  // convention (V2 composited above V1, so V2 appears first in the list).
+
+  // Subtitles (per-language programme tracks; lower index = appears higher in UI).
+  { kind:'subtitle', name:'Subs ZH',      index:1, height:36, language:'zh-Hans', burn:false },
+  { kind:'subtitle', name:'Subs EN',      index:2, height:36, language:'en',      burn:false },
+  // Overlays (lower thirds, titles).
+  { kind:'overlay',  name:'Titles',       index:1, height:36 },
+  { kind:'overlay',  name:'Lower Thirds', index:2, height:36 },
+  // Picture (V2 above V1, NLE convention: higher index composites on top).
+  { kind:'video',    name:'V2',           index:2, height:64 },
+  { kind:'video',    name:'V1',           index:1, height:64 },
+  // Audio (A1 first; A4 Music auto-ducks under A3 VO via sidechain compressor).
+  { kind:'audio',    name:'A1 Audio',     index:1, height:46 },
+  { kind:'audio',    name:'A2 Audio',     index:2, height:46 },
+  { kind:'audio',    name:'A3 VO',        index:3, height:46 },
+  { kind:'audio',    name:'A4 Music',     index:4, height:46, gain:-6,
+                     ducking:{ sourceTrackName:'A3 VO', threshold:-20, ratio:4, attack:50, release:400 } },
+];
+
+function makeMultiTimelineId(prefix){
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,8)}`;
+}
+
+function createEmptyMultiTimelineDocument(){
+  const fps = (typeof getFPS === 'function') ? getFPS() : 25;
+  return {
+    version: 1,
+    fps,
+    duration: 0,
+    playhead: 0,
+    selection: null,
+    lastViewedSubMode: 'source',
+    tracks: MULTI_TIMELINE_DEFAULT_TRACKS.map(t => ({
+      id: makeMultiTimelineId('track'),
+      kind: t.kind,
+      name: t.name,
+      index: t.index,
+      locked: false,
+      muted: false,
+      solo: false,
+      visible: true,
+      gain: t.kind === 'audio' ? (t.gain != null ? t.gain : 0) : 0,
+      height: t.height || (t.kind === 'video' ? 64 : t.kind === 'audio' ? 46 : 36),
+      collapsed: false,
+      language: t.language || '',
+      burn: !!t.burn,
+      ducking: t.ducking || null,
+    })),
+    clips: [],
+    markers: [],
+  };
+}
+
+function cleanMultiTimelineClipForShare(c){
+  if (!c || typeof c !== 'object') return null;
+  return {
+    id: String(c.id || makeMultiTimelineId('clip')),
+    trackId: String(c.trackId || ''),
+    kind: ['video','audio','subtitle','overlay'].includes(c.kind) ? c.kind : 'video',
+    // Source identity (mirrors Story Card fields).
+    source_type: String(c.source_type || ''),
+    asset_id: String(c.asset_id || ''),
+    asset_name: String(c.asset_name || ''),
+    media_pool_key: String(c.media_pool_key || ''),
+    // Source-time range (what to pull from the asset).
+    source_in: Number(c.source_in || 0) || 0,
+    source_out: Number(c.source_out || 0) || 0,
+    // Project-time range (where it lives on the timeline).
+    project_in: Number(c.project_in || 0) || 0,
+    project_out: Number(c.project_out || 0) || 0,
+    // Lineage (subtitle/overlay only; null for video/audio).
+    source_cue_id: c.source_cue_id ? String(c.source_cue_id) : null,
+    derived_at: c.derived_at != null ? Number(c.derived_at) : null,
+    edited_at: c.edited_at != null ? Number(c.edited_at) : null,
+    // Content + decoration.
+    label: String(c.label || ''),
+    color: String(c.color || ''),
+    text: String(c.text || ''),
+    style: c.style && typeof c.style === 'object' ? { ...c.style } : null,
+    transitions: c.transitions && typeof c.transitions === 'object' ? { ...c.transitions } : { in:null, out:null },
+    effects: Array.isArray(c.effects) ? c.effects.slice() : [],
+    // Story Mode breadcrumbs (preserved through Story → Multi export).
+    storyRowId: String(c.storyRowId || ''),
+    storyCardId: String(c.storyCardId || ''),
+    // Stack handling for paired captions (Lower Third + Title pair, etc.).
+    stack_id: String(c.stack_id || ''),
+    stack_role: String(c.stack_role || ''),
+  };
+}
+
+function cleanMultiTimelineDocumentForShare(doc){
+  const d = doc || createEmptyMultiTimelineDocument();
+  // Marks: in/out range for Render Preview. Either may be null. Round-tripping
+  // them through save/load means the editor's selected render range survives
+  // a reload — important for long sessions where you tweak then re-render.
+  const inMark = (d.marks && d.marks.in != null) ? Number(d.marks.in) : null;
+  const outMark = (d.marks && d.marks.out != null) ? Number(d.marks.out) : null;
+  return {
+    version: Number(d.version || 1) || 1,
+    fps: Number(d.fps || (typeof getFPS === 'function' ? getFPS() : 25)) || 25,
+    duration: Number(d.duration || 0) || 0,
+    playhead: Number(d.playhead || 0) || 0,
+    selection: d.selection
+      ? { project_in:Number(d.selection.project_in || 0) || 0, project_out:Number(d.selection.project_out || 0) || 0 }
+      : null,
+    marks: {
+      in:  Number.isFinite(inMark)  ? inMark  : null,
+      out: Number.isFinite(outMark) ? outMark : null,
+    },
+    lastViewedSubMode: (d.lastViewedSubMode === 'multi') ? 'multi' : 'source',
+    tracks: (d.tracks || []).map(t => ({
+      id: String(t.id || ''),
+      kind: t.kind,
+      name: String(t.name || ''),
+      index: Number(t.index || 0) || 0,
+      locked: !!t.locked,
+      muted: !!t.muted,
+      solo: !!t.solo,
+      visible: t.visible !== false,
+      gain: Number(t.gain || 0) || 0,
+      height: Number(t.height || 48) || 48,
+      collapsed: !!t.collapsed,
+      language: String(t.language || ''),
+      burn: !!t.burn,
+      ducking: t.ducking && typeof t.ducking === 'object' ? { ...t.ducking } : null,
+    })),
+    clips: (d.clips || []).map(cleanMultiTimelineClipForShare).filter(Boolean),
+    markers: Array.isArray(d.markers) ? d.markers.slice() : [],
+  };
+}
+
+function normalizeMultiTimelineDocument(rawDoc){
+  if (!rawDoc || typeof rawDoc !== 'object') return createEmptyMultiTimelineDocument();
+  const cleaned = cleanMultiTimelineDocumentForShare(rawDoc);
+  // If tracks were missing or empty, fall back to defaults so the shell is usable.
+  if (!cleaned.tracks.length) cleaned.tracks = createEmptyMultiTimelineDocument().tracks;
+  // Recompute duration from clip extents so it stays correct after edits.
+  cleaned.duration = cleaned.clips.reduce((d, c) => Math.max(d, Number(c.project_out || 0) || 0), 0);
+  return cleaned;
+}
+
+function applyMultiTimelineDocument(rawDoc, opts={}){
+  multiTimeline = normalizeMultiTimelineDocument(rawDoc);
+  multiTimelinePlayhead = Number(multiTimeline.playhead || 0) || 0;
+  if (!opts.silent) requestMultiTimelineRender();
+}
+
+function getMultiTimelineMinDuration(){
+  // Empty timeline still needs a visible ruler so the shell looks alive.
+  const doc = ensureMultiTimelineDocument();
+  const fromClips = (doc.clips || []).reduce((d, c) => Math.max(d, Number(c.project_out || 0) || 0), 0);
+  return Math.max(fromClips, 60);
+}
+
+function multiTimelineTimeToPx(t){
+  return Math.round(Math.max(0, Number(t) || 0) * multiTimelinePxPerSec);
+}
+function multiTimelinePxToTime(px){
+  return Math.max(0, (Number(px) || 0) / Math.max(0.1, multiTimelinePxPerSec));
+}
+
+function orderMultiTimelineTracks(tracks){
+  // Display order in the UI is top-to-bottom: subtitles → overlays → video → audio.
+  // Within each group:
+  //   subtitle / overlay / audio: low index first (index = display position).
+  //   video: high index first (NLE convention: V2 composites above V1).
+  const groups = { video:[], audio:[], subtitle:[], overlay:[] };
+  (tracks || []).forEach(t => { if (groups[t.kind]) groups[t.kind].push(t); });
+  groups.subtitle.sort((a,b) => Number(a.index || 0) - Number(b.index || 0));
+  groups.overlay.sort((a,b) => Number(a.index || 0) - Number(b.index || 0));
+  groups.video.sort((a,b)    => Number(b.index || 0) - Number(a.index || 0));
+  groups.audio.sort((a,b)    => Number(a.index || 0) - Number(b.index || 0));
+  return [...groups.subtitle, ...groups.overlay, ...groups.video, ...groups.audio];
+}
+
+function multiTimelineTrackKindBadge(kind){
+  if (kind === 'video') return 'V';
+  if (kind === 'audio') return 'A';
+  if (kind === 'subtitle') return 'SUB';
+  if (kind === 'overlay') return 'OVL';
+  return '?';
+}
+
+function ensureMultiTimelineShell(){
+  if (multiTimelineModeEl && document.body.contains(multiTimelineModeEl)) return multiTimelineModeEl;
+  // Mount inside the Timeline Mode container so the sub-toggle can switch
+  // visibility cleanly without affecting the outer layout.
+  const parent = (typeof ensureTimelineMode === 'function') ? ensureTimelineMode() : (document.querySelector('.transcript-panel') || document.body);
+  multiTimelineModeEl = document.createElement('div');
+  multiTimelineModeEl.id = 'multiTimelineMode';
+  multiTimelineModeEl.className = 'multi-timeline-mode';
+  multiTimelineModeEl.style.display = 'none';
+  multiTimelineModeEl.innerHTML = `
+    <div class="mtl-head">
+      <div>
+        <div class="mtl-title">Multi-Timeline Mode</div>
+        <div class="mtl-sub">Documentary assembly with multiple video, audio, subtitle and overlay tracks. Drop Story Cards or transcript ranges onto a track. Render previews and master export run server-side on demand.</div>
+      </div>
+      <div class="mtl-actions">
+        <button class="btn btn-outline" id="mtlOpenPicker" type="button" title="Open Story Card Picker">Story Card Picker</button>
+        <button class="btn btn-outline" id="mtlFit" type="button">Fit</button>
+        <button class="btn btn-outline mtl-zoom-btn" id="mtlZoomOut" type="button">−</button>
+        <label class="mtl-zoom-label">Zoom <input id="mtlZoom" type="range" min="1" max="800" step="1" value="28"></label>
+        <button class="btn btn-outline mtl-zoom-btn" id="mtlZoomIn" type="button">+</button>
+        <button class="btn btn-outline" id="mtlPreviewSection" type="button" disabled title="Render preview arrives in Phase 3">Render Preview</button>
+        <button class="btn btn-gold"    id="mtlExportMaster"   type="button" disabled title="Master export arrives in Phase 3">Export Master</button>
+      </div>
+    </div>
+    <div class="mtl-status" id="mtlStatus">Empty timeline · Phase 1 ships the shell only.</div>
+    <div class="mtl-grid">
+      <div class="mtl-track-headers" id="mtlTrackHeaders" aria-label="Track headers"></div>
+      <div class="mtl-scroll" id="mtlScroll">
+        <div class="mtl-content" id="mtlContent">
+          <div class="mtl-ruler" id="mtlRuler"></div>
+          <div class="mtl-lanes" id="mtlLanes"></div>
+          <div class="mtl-playhead" id="mtlPlayhead"></div>
+        </div>
+      </div>
+    </div>
+  `;
+  // Place the multi shell as a sibling of the Source Timeline content so the
+  // sub-toggle can hide one and show the other without unmounting either.
+  parent.appendChild(multiTimelineModeEl);
+  bindMultiTimelineShell();
+  return multiTimelineModeEl;
+}
+
+function bindMultiTimelineShell(){
+  const el = multiTimelineModeEl;
+  if (!el || el.__bound) return;
+  el.__bound = true;
+  el.querySelector('#mtlFit')?.addEventListener('click', () => fitMultiTimelineZoom());
+  el.querySelector('#mtlZoomIn')?.addEventListener('click', () => setMultiTimelineZoom(multiTimelinePxPerSec * 1.25));
+  el.querySelector('#mtlZoomOut')?.addEventListener('click', () => setMultiTimelineZoom(multiTimelinePxPerSec / 1.25));
+  el.querySelector('#mtlZoom')?.addEventListener('input', (ev) => setMultiTimelineZoom(Number(ev.currentTarget.value) || multiTimelinePxPerSec));
+  el.querySelector('#mtlOpenPicker')?.addEventListener('click', () => showStoryCardPicker());
+  const scroll = el.querySelector('#mtlScroll');
+  scroll?.addEventListener('scroll', () => requestMultiTimelineRender(), { passive:true });
+  scroll?.addEventListener('wheel', (ev) => {
+    if (ev.ctrlKey || ev.metaKey){
+      ev.preventDefault();
+      const factor = ev.deltaY < 0 ? 1.18 : 0.85;
+      setMultiTimelineZoom(multiTimelinePxPerSec * factor);
+      return;
+    }
+    ev.preventDefault();
+    const dx = Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
+    scroll.scrollLeft += dx;
+  }, { passive:false });
+}
+
+function requestMultiTimelineRender(){
+  if (__multiTimelineRaf) cancelAnimationFrame(__multiTimelineRaf);
+  __multiTimelineRaf = requestAnimationFrame(() => { __multiTimelineRaf = 0; renderMultiTimeline(); });
+}
+
+function setMultiTimelineZoom(v){
+  const fps = (typeof getFPS === 'function') ? getFPS() : 25;
+  const max = Math.max(160, fps * 16);
+  multiTimelinePxPerSec = Math.max(1, Math.min(max, Number(v) || 1));
+  const z = multiTimelineModeEl?.querySelector('#mtlZoom');
+  if (z){ z.max = String(max); z.value = String(Math.round(multiTimelinePxPerSec)); }
+  requestMultiTimelineRender();
+}
+function fitMultiTimelineZoom(){
+  const scroll = multiTimelineModeEl?.querySelector('#mtlScroll');
+  const w = scroll ? scroll.clientWidth : 900;
+  const dur = getMultiTimelineMinDuration();
+  setMultiTimelineZoom(Math.max(1, Math.min(80, (w - 32) / Math.max(1, dur))));
+}
+
+function showMultiTimelineMode(){
+  ensureMultiTimelineShell();
+  multiTimelineModeEl.style.display = 'flex';
+  fitMultiTimelineZoom();
+  requestMultiTimelineRender();
+}
+function hideMultiTimelineMode(){
+  if (multiTimelineModeEl) multiTimelineModeEl.style.display = 'none';
+  try{ if (typeof mtlPause === 'function') mtlPause(); }catch(_e){}
+  try{ hideStoryCardPicker(); }catch(_e){}
+}
+
+function renderMultiTimelineTrackHeaders(){
+  const el = multiTimelineModeEl?.querySelector('#mtlTrackHeaders');
+  if (!el) return;
+  el.innerHTML = '';
+  const doc = ensureMultiTimelineDocument();
+  const ordered = orderMultiTimelineTracks(doc.tracks || []);
+  ordered.forEach(track => {
+    const row = document.createElement('div');
+    const isCollapsed = !!track.collapsed;
+    const isMuted = !!track.muted;
+    row.className = `mtl-track-head mtl-kind-${track.kind}` + (isCollapsed ? ' collapsed' : '') + (isMuted ? ' muted' : '');
+    row.dataset.trackId = track.id;
+    row.style.height = (isCollapsed ? 22 : Math.max(28, Number(track.height || 48))) + 'px';
+    const langBadge = track.kind === 'subtitle' && track.language
+      ? `<span class="mtl-lang-badge">${escapeHtml(track.language)}</span>` : '';
+    const audioCtrls = track.kind === 'audio'
+      ? `<button class="mtl-track-mini ${track.muted ? 'on' : ''}" data-act="mute" type="button" title="Mute">M</button>
+         <button class="mtl-track-mini ${track.solo  ? 'on' : ''}" data-act="solo" type="button" title="Solo">S</button>` : '';
+    const visCtrl = track.kind !== 'audio'
+      ? `<button class="mtl-track-mini ${track.visible === false ? '' : 'on'}" data-act="visible" type="button" title="Visible">V</button>` : '';
+    row.innerHTML = `
+      <button class="mtl-track-collapse" data-act="collapse" type="button" title="${isCollapsed ? 'Expand' : 'Collapse'}">${isCollapsed ? '▸' : '▾'}</button>
+      <span class="mtl-kind-badge mtl-kind-badge-${track.kind}">${multiTimelineTrackKindBadge(track.kind)}</span>
+      <span class="mtl-track-name" title="${escapeHtml(track.name)}">${escapeHtml(track.name)}</span>
+      ${langBadge}
+      <div class="mtl-track-spacer"></div>
+      <div class="mtl-track-ctrls">${audioCtrls}${visCtrl}</div>
+    `;
+    row.addEventListener('click', (ev) => {
+      const btn = ev.target.closest?.('[data-act]');
+      if (!btn) return;
+      const act = btn.dataset.act;
+      const t = (ensureMultiTimelineDocument().tracks || []).find(x => x.id === track.id);
+      if (!t) return;
+      if (act === 'collapse') t.collapsed = !t.collapsed;
+      else if (act === 'mute') t.muted = !t.muted;
+      else if (act === 'solo') t.solo = !t.solo;
+      else if (act === 'visible') t.visible = (t.visible === false);
+      requestMultiTimelineRender();
+    });
+    el.appendChild(row);
+  });
+}
+
+function renderMultiTimelineRuler(){
+  const ruler = multiTimelineModeEl?.querySelector('#mtlRuler');
+  const scroll = multiTimelineModeEl?.querySelector('#mtlScroll');
+  if (!ruler || !scroll) return;
+  const dur = getMultiTimelineMinDuration();
+  const viewStart = multiTimelinePxToTime(scroll.scrollLeft - 100);
+  const viewEnd = multiTimelinePxToTime(scroll.scrollLeft + scroll.clientWidth + 200);
+  const major = (typeof chooseRulerStep === 'function') ? chooseRulerStep(multiTimelinePxPerSec) : 5;
+  const startTick = Math.floor(viewStart / major) * major;
+  const f = (typeof getFPS === 'function') ? getFPS() : 25;
+  let html = '';
+  for (let t = Math.max(0, startTick); t < Math.min(dur, viewEnd); t += major){
+    const left = multiTimelineTimeToPx(t);
+    let labelText;
+    if (multiTimelinePxPerSec >= f * 8 && typeof formatTimecodeFromSeconds === 'function'){
+      labelText = formatTimecodeFromSeconds(t, f);
+    } else {
+      const s = Math.max(0, t);
+      const hh = Math.floor(s / 3600);
+      const mm = Math.floor((s % 3600) / 60);
+      const ss = Math.floor(s % 60);
+      labelText = hh > 0 ? `${pad2(hh)}:${pad2(mm)}:${pad2(ss)}` : `${pad2(mm)}:${pad2(ss)}`;
+    }
+    html += `<div class="mtl-tick major" style="left:${left}px"><span>${labelText}</span></div>`;
+  }
+  ruler.innerHTML = html;
+}
+
+function renderMultiTimelineLanes(){
+  const lanesEl = multiTimelineModeEl?.querySelector('#mtlLanes');
+  if (!lanesEl) return;
+  lanesEl.innerHTML = '';
+  const ordered = orderMultiTimelineTracks(ensureMultiTimelineDocument().tracks || []);
+  ordered.forEach(track => {
+    const lane = document.createElement('div');
+    const isCollapsed = !!track.collapsed;
+    lane.className = `mtl-lane mtl-lane-${track.kind}` + (isCollapsed ? ' collapsed' : '') + (track.muted ? ' muted' : '');
+    lane.dataset.trackId = track.id;
+    lane.dataset.trackKind = track.kind;
+    lane.style.height = (isCollapsed ? 22 : Math.max(28, Number(track.height || 48))) + 'px';
+    if (!isCollapsed){
+      renderMultiTimelineClipsForTrack(lane, track);
+      attachMultiTimelineLaneDropHandlers(lane, track);
+    }
+    lanesEl.appendChild(lane);
+  });
+}
+
+function renderMultiTimelinePlayhead(){
+  const ph = multiTimelineModeEl?.querySelector('#mtlPlayhead');
+  if (!ph) return;
+  ph.style.left = multiTimelineTimeToPx(multiTimelinePlayhead) + 'px';
+}
+
+function renderMultiTimeline(){
+  if (!multiTimelineModeEl || multiTimelineModeEl.style.display === 'none') return;
+  const scroll = multiTimelineModeEl.querySelector('#mtlScroll');
+  const content = multiTimelineModeEl.querySelector('#mtlContent');
+  const dur = getMultiTimelineMinDuration();
+  const width = Math.max((scroll?.clientWidth || 900), Math.ceil(dur * multiTimelinePxPerSec) + 2);
+  if (content) content.style.width = width + 'px';
+  renderMultiTimelineTrackHeaders();
+  renderMultiTimelineRuler();
+  renderMultiTimelineLanes();
+  renderMultiTimelinePlayhead();
+  const status = multiTimelineModeEl.querySelector('#mtlStatus');
+  if (status){
+    const doc = ensureMultiTimelineDocument();
+    const clipCount = (doc.clips || []).length;
+    const trackCount = (doc.tracks || []).length;
+    status.textContent = clipCount
+      ? `${clipCount} clip(s) · ${trackCount} track(s) · zoom ${Math.round(multiTimelinePxPerSec)} px/s`
+      : `Empty timeline · ${trackCount} track(s) · drop-to-clip arrives in Phase 2.`;
+  }
+}
+
+/* ---------- Sub-toggle inside Timeline Mode (Source ↔ Multi) ---------- */
+
+function ensureTimelineSubToggle(){
+  const el = (typeof ensureTimelineMode === 'function') ? ensureTimelineMode() : null;
+  if (!el) return;
+  if (el.querySelector('#tlSubModeToggle')) return;
+  const toggle = document.createElement('div');
+  toggle.id = 'tlSubModeToggle';
+  toggle.className = 'tl-submode-toggle';
+  toggle.innerHTML = `
+    <div class="tl-submode-seg" role="group" aria-label="Timeline Mode sub-toggle">
+      <button class="tl-submode-btn active" data-submode="source" type="button">Source Timeline</button>
+      <button class="tl-submode-btn"        data-submode="multi"  type="button">Multi-Timeline</button>
+    </div>
+    <span class="tl-submode-hint">Source = single-asset assembly · Multi = multi-track documentary</span>
+  `;
+  // Place at the top of the panel, above the existing tl-head.
+  el.insertBefore(toggle, el.firstChild);
+  toggle.addEventListener('click', (ev) => {
+    const btn = ev.target.closest?.('[data-submode]');
+    if (!btn) return;
+    setTimelineSubMode(btn.dataset.submode === 'multi' ? 'multi' : 'source');
+  });
+}
+
+// Selectors of the existing Source Timeline DOM that should hide when the
+// sub-toggle switches to Multi. The .tl-submode-toggle and the multi shell are
+// intentionally excluded so they remain visible across switches.
+const TIMELINE_SOURCE_BLOCKS = ['.tl-head', '.tl-status', '.tl-presence', '.tl-scroll', '.tl-bottom'];
+
+function setTimelineSubMode(mode){
+  const next = (mode === 'multi') ? 'multi' : 'source';
+  isMultiTimelineMode = (next === 'multi');
+  const el = (typeof ensureTimelineMode === 'function') ? ensureTimelineMode() : null;
+  if (!el) return;
+  el.querySelectorAll('#tlSubModeToggle .tl-submode-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.submode === next);
+  });
+  // Hide/show Source Timeline DOM blocks. Use display:'' to restore the
+  // stylesheet-specified default rather than locking it to a value.
+  TIMELINE_SOURCE_BLOCKS.forEach(sel => {
+    el.querySelectorAll(sel).forEach(node => {
+      // Skip nodes inside the multi shell (defensive; multi shell is a sibling).
+      if (multiTimelineModeEl && multiTimelineModeEl.contains(node)) return;
+      node.style.display = (next === 'source') ? '' : 'none';
+    });
+  });
+  if (next === 'multi'){
+    showMultiTimelineMode();
+  } else {
+    try{ if (typeof mtlPause === 'function') mtlPause(); }catch(_e){}
+    hideMultiTimelineMode();
+    try{ requestTimelineRender?.(); }catch(_e){}
+  }
+  // Remember the choice so reopening Timeline Mode lands you in the same place.
+  try{ ensureMultiTimelineDocument().lastViewedSubMode = next; }catch(_e){}
+}
+
+/* ---------- Hooks into existing Source Timeline show/hide ----------
+   We avoid editing the existing functions by wrapping them once: this keeps
+   the Source Timeline code path strictly untouched, which was the design
+   constraint for Phase 1. */
+
+if (typeof showTimelineMode === 'function' && !window.__multiTimelineWrappedShow){
+  window.__multiTimelineWrappedShow = true;
+  const __originalShowTimelineMode = showTimelineMode;
+  showTimelineMode = function patchedShowTimelineMode(){
+    const r = __originalShowTimelineMode.apply(this, arguments);
+    try{
+      ensureTimelineSubToggle();
+      const doc = ensureMultiTimelineDocument();
+      const want = (doc && doc.lastViewedSubMode === 'multi') ? 'multi' : 'source';
+      setTimelineSubMode(want);
+    }catch(err){ console.warn('Multi-Timeline sub-toggle init failed', err); }
+    return r;
+  };
+}
+
+if (typeof hideTimelineMode === 'function' && !window.__multiTimelineWrappedHide){
+  window.__multiTimelineWrappedHide = true;
+  const __originalHideTimelineMode = hideTimelineMode;
+  hideTimelineMode = function patchedHideTimelineMode(){
+    try{ hideMultiTimelineMode(); }catch(_e){}
+    return __originalHideTimelineMode.apply(this, arguments);
+  };
+}
+
+
+/* ============================================================================
+   Multi-Timeline Mode — Phase 2: bulk export, clip rendering, drag/drop picker
+   ----------------------------------------------------------------------------
+   This adds three things on top of the Phase 1 shell:
+     1) `exportStoryToMultiTimeline()` — bulk-builds clips from Story Rows,
+        stamps full source identity, routes caption cards to overlay tracks.
+     2) Clip block rendering inside lanes, with stable per-source colors.
+     3) "Story Card Picker" — a floating draggable modal you drag cards
+        from onto lanes to add them at a specific project position.
+
+   Selection, slip/slide, razor and ripple-delete remain Phase 3+.
+   ========================================================================== */
+
+let __multiTimelineCardPickerEl = null;
+let __multiTimelineDrag = null; // { card, sourceKey } during a picker drag
+let __multiTimelineSelectedClipId = '';
+
+const MULTI_TIMELINE_CAPTION_TO_TRACK = {
+  // Story Mode caption type → default overlay track NAME (matched by exact name).
+  'Lower Third':   'Lower Thirds',
+  'Name Super':    'Lower Thirds',
+  'Source Credit': 'Lower Thirds',
+  'Title Caption': 'Titles',
+  'End Credits':   'Titles',
+};
+
+const MULTI_TIMELINE_CAPTION_DEFAULT_DURATION = 4.0;
+
+function multiTimelineFindTrackByName(name){
+  const doc = ensureMultiTimelineDocument();
+  return (doc.tracks || []).find(t => t.name === name) || null;
+}
+function multiTimelineFindTrackByIndex(kind, index){
+  const doc = ensureMultiTimelineDocument();
+  return (doc.tracks || []).find(t => t.kind === kind && Number(t.index) === Number(index)) || null;
+}
+
+/* ---- Stable per-source color: each Iconik / Local / etc. asset gets its own
+   hue so a documentary editor can scan a multi-source assembly visually. ---- */
+
+function __mtlHashStr(s){
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++){ h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+function multiTimelineColorForKey(key){
+  const k = String(key || '').trim();
+  if (!k) return { fill:'rgba(190,200,215,.18)', stroke:'rgba(190,200,215,.65)', text:'#dde3ec' };
+  // Hue ring of 12 + 30° offset so adjacent assets land on different hues.
+  const h = (__mtlHashStr(k) % 360);
+  return {
+    fill:   `hsl(${h} 65% 45% / .35)`,
+    stroke: `hsl(${h} 75% 60% / .85)`,
+    text:   `hsl(${h} 25% 92%)`,
+  };
+}
+function multiTimelineColorForCaption(){
+  // Caption / overlay clips share the gold accent so they read as graphics, not media.
+  return { fill:'rgba(215,180,106,.22)', stroke:'rgba(215,180,106,.85)', text:'#f4e6c2' };
+}
+
+/* ---- Clip mutation primitives (used by drop and bulk export) ---- */
+
+function multiTimelineRecomputeDuration(){
+  const doc = ensureMultiTimelineDocument();
+  doc.duration = (doc.clips || []).reduce((d, c) => Math.max(d, Number(c.project_out || 0) || 0), 0);
+  return doc.duration;
+}
+
+function multiTimelineSnapToFrame(t){
+  // Reuse the existing source-time frame snap if available; otherwise round to 0.001s.
+  if (typeof snapTimeToFrameValue === 'function') return snapTimeToFrameValue(Number(t) || 0);
+  return Math.round((Number(t) || 0) * 1000) / 1000;
+}
+
+function multiTimelineFindFreeProjectInOnTrack(trackId, preferredStart, durationSec){
+  // Linear placement: if `preferredStart` overlaps an existing clip, push past
+  // it. Phase 2 does not auto-shuffle existing clips; it just avoids overlap.
+  const doc = ensureMultiTimelineDocument();
+  const onTrack = (doc.clips || []).filter(c => c.trackId === trackId)
+    .sort((a,b) => Number(a.project_in || 0) - Number(b.project_in || 0));
+  let cursor = Math.max(0, Number(preferredStart) || 0);
+  for (const c of onTrack){
+    const cs = Number(c.project_in || 0) || 0;
+    const ce = Number(c.project_out || 0) || 0;
+    if (cursor + durationSec <= cs) break;          // fits before this clip
+    if (cursor < ce) cursor = ce;                   // overlaps; push past
+  }
+  return multiTimelineSnapToFrame(cursor);
+}
+
+function multiTimelineNextFreeProjectInOnTrack(trackId){
+  const doc = ensureMultiTimelineDocument();
+  const onTrack = (doc.clips || []).filter(c => c.trackId === trackId);
+  if (!onTrack.length) return 0;
+  return multiTimelineSnapToFrame(onTrack.reduce((m, c) => Math.max(m, Number(c.project_out || 0) || 0), 0));
+}
+
+function multiTimelineBuildClipFromCard(card, opts={}){
+  // Normalize a Story Card into a Multi-Timeline clip without committing it.
+  // Caller decides which track the clip lands on, and the project_in.
+  const range = (typeof storyTimelineRangeForCard === 'function') ? storyTimelineRangeForCard(card) : null;
+  const isCaption = card?.kind === 'caption';
+  let sourceIn = 0, sourceOut = 0, durationSec = 0;
+  if (range && Number(range.end) > Number(range.start)){
+    sourceIn = multiTimelineSnapToFrame(range.start);
+    sourceOut = multiTimelineSnapToFrame(range.end);
+    durationSec = sourceOut - sourceIn;
+  } else if (isCaption){
+    // Captions don't have source ranges — they're authored graphics.
+    durationSec = MULTI_TIMELINE_CAPTION_DEFAULT_DURATION;
+  } else {
+    return null; // No usable timecode and not a caption — caller skips.
+  }
+  return {
+    id: makeMultiTimelineId('clip'),
+    trackId: opts.trackId || '',
+    kind: opts.kind || 'video',
+    source_type: String(card.source_type || card.sourceType || ''),
+    asset_id: String(card.asset_id || card.assetId || ''),
+    asset_name: String(card.asset_name || card.assetName || ''),
+    media_pool_key: String(card.media_pool_key || card.mediaPoolKey || ''),
+    source_in: sourceIn,
+    source_out: sourceOut,
+    project_in: 0, // caller sets this
+    project_out: durationSec,
+    source_cue_id: null,
+    derived_at: null,
+    edited_at: null,
+    label: (typeof storyTimelineClipLabel === 'function') ? storyTimelineClipLabel(opts.rowIndex || 0, opts.cardIndex || 0, card) : (card.label || 'Clip'),
+    color: '',
+    text: isCaption ? String(card.body || card.label || '') : '',
+    style: isCaption ? { captionType: String(card.label || '') } : null,
+    transitions: { in:null, out:null },
+    effects: [],
+    storyRowId: String(card.__rowId || ''),
+    storyCardId: String(card.id || ''),
+    stack_id: '',
+    stack_role: '',
+  };
+}
+
+function multiTimelineCommitClip(clip, opts={}){
+  const doc = ensureMultiTimelineDocument();
+  // Resolve free position on the chosen track if asked.
+  const dur = Math.max(0.04, Number(clip.project_out || 0) - Number(clip.project_in || 0));
+  let pin = Number(clip.project_in || 0) || 0;
+  if (opts.snap !== false){
+    pin = multiTimelineFindFreeProjectInOnTrack(clip.trackId, pin, dur);
+  }
+  clip.project_in = multiTimelineSnapToFrame(pin);
+  clip.project_out = multiTimelineSnapToFrame(pin + dur);
+  doc.clips.push(clip);
+  return clip;
+}
+
+/* ---- Bulk export from Story Mode ---- */
+
+function exportStoryToMultiTimeline(){
+  const rows = Array.isArray(storyRows) ? storyRows : [];
+  if (!rows.length){ alert('No Story Rows yet. Add some Story Cards first.'); return; }
+
+  // Pre-flight: count clips that lack a media_pool_key. Iconik docs need this
+  // to render; warn but allow export so the editor can fix linkage in the UI.
+  let unlinked = 0;
+  rows.forEach(row => (row.cards || []).forEach(card => {
+    if ((card.kind === 'cue' || card.kind === 'clip') && !storySourceKeyForCard(card)) unlinked++;
+  }));
+  if (unlinked > 0){
+    if (!confirm(`${unlinked} Story Card(s) are not linked to a Media Pool source.\nThey'll still be exported, but the renderer won't be able to resolve their media until you link them.\n\nContinue?`)) return;
+  }
+
+  const doc = ensureMultiTimelineDocument();
+  const wantsReplace = (doc.clips || []).length
+    ? confirm(`Multi-Timeline already has ${doc.clips.length} clip(s).\n\nOK = replace\nCancel = append after the current end`)
+    : true;
+  let projectCursor = 0;
+  if (wantsReplace){ doc.clips = []; }
+  else { projectCursor = multiTimelineRecomputeDuration(); }
+
+  const v1 = multiTimelineFindTrackByIndex('video', 1);
+  const a1 = multiTimelineFindTrackByIndex('audio', 1);
+  const v2 = multiTimelineFindTrackByIndex('video', 2);
+  const a2 = multiTimelineFindTrackByIndex('audio', 2);
+  if (!v1 || !a1){ alert('Multi-Timeline is missing default tracks (V1/A1). Reload the project to recreate them.'); return; }
+
+  let placed = 0, captions = 0, skipped = 0;
+
+  rows.forEach((row, rowIndex) => {
+    (row.cards || []).forEach((card, cardIndex) => {
+      // Carry the row id into the card for clip stamping; non-destructive.
+      card.__rowId = row.id;
+
+      if (card.kind === 'caption'){
+        const trackName = MULTI_TIMELINE_CAPTION_TO_TRACK[String(card.label || '')] || 'Lower Thirds';
+        const track = multiTimelineFindTrackByName(trackName);
+        if (!track){ skipped++; return; }
+        const clip = multiTimelineBuildClipFromCard(card, { trackId: track.id, kind:'overlay', rowIndex, cardIndex });
+        if (!clip){ skipped++; return; }
+        clip.project_in = projectCursor;
+        clip.project_out = projectCursor + (Number(clip.project_out) || MULTI_TIMELINE_CAPTION_DEFAULT_DURATION);
+        // Captions don't advance the V cursor — they decorate the V/A clips
+        // already placed. Bulk export drops them at the running cursor as a
+        // visible anchor; the editor will reposition during the overlay pass.
+        multiTimelineCommitClip(clip, { snap:true });
+        captions++;
+        return;
+      }
+
+      // Cue / clip / generic with timecode → V1 + A1
+      const vClip = multiTimelineBuildClipFromCard(card, { trackId: v1.id, kind:'video', rowIndex, cardIndex });
+      if (!vClip){ skipped++; return; }
+      const dur = Math.max(0.04, vClip.project_out - vClip.project_in);
+      vClip.project_in = projectCursor;
+      vClip.project_out = projectCursor + dur;
+      multiTimelineCommitClip(vClip, { snap:false });
+
+      // Sibling A1 audio at the same project position with the same source range.
+      // The editor decides later whether to keep, mute, or detach.
+      const aClip = multiTimelineBuildClipFromCard(card, { trackId: a1.id, kind:'audio', rowIndex, cardIndex });
+      if (aClip){
+        aClip.project_in = projectCursor;
+        aClip.project_out = projectCursor + dur;
+        aClip.label = vClip.label.replace(/^Story\s+/, 'Story · A · ');
+        multiTimelineCommitClip(aClip, { snap:false });
+      }
+
+      projectCursor = vClip.project_out;
+      placed++;
+    });
+  });
+
+  multiTimelineRecomputeDuration();
+
+  // Switch into Timeline Mode + Multi sub-mode so the user lands on the result.
+  isStoryMode = false;
+  isTimelineMode = true;
+  isTxtMode = false;
+  try{ hideStoryMode?.(); }catch(_e){}
+  showTimelineMode?.();
+  setTimelineSubMode('multi');
+  fitMultiTimelineZoom();
+  requestMultiTimelineRender();
+
+  try{
+    document.getElementById('btnModeStory')?.classList.remove('active');
+    document.getElementById('btnModeTimeline')?.classList.add('active');
+    document.getElementById('btnModeSrt')?.classList.remove('active');
+    document.getElementById('btnModeTxt')?.classList.remove('active');
+  }catch(_e){}
+
+  const status = multiTimelineModeEl?.querySelector('#mtlStatus');
+  if (status) status.textContent = `Exported ${placed} V/A clip(s)${captions ? ` + ${captions} caption(s)` : ''}${skipped ? ` · skipped ${skipped}` : ''} from Story Mode.`;
+}
+
+/* ---- Clip rendering: actually paint clip blocks inside lanes ---- */
+
+function renderMultiTimelineClipsForTrack(laneEl, track){
+  const doc = ensureMultiTimelineDocument();
+  const onTrack = (doc.clips || []).filter(c => c.trackId === track.id);
+  onTrack.forEach(clip => {
+    const left = multiTimelineTimeToPx(clip.project_in);
+    const width = Math.max(2, multiTimelineTimeToPx(clip.project_out) - left);
+    const colors = (clip.kind === 'overlay' || clip.kind === 'subtitle')
+      ? multiTimelineColorForCaption()
+      : multiTimelineColorForKey(clip.media_pool_key);
+    const block = document.createElement('div');
+    block.className = `mtl-clip mtl-clip-${clip.kind}`;
+    if (clip.id === __multiTimelineSelectedClipId) block.classList.add('selected');
+    if (!clip.media_pool_key && (clip.kind === 'video' || clip.kind === 'audio')) block.classList.add('unlinked');
+    block.style.left = left + 'px';
+    block.style.width = width + 'px';
+    block.style.background = colors.fill;
+    block.style.borderColor = colors.stroke;
+    block.style.color = colors.text;
+    block.dataset.clipId = clip.id;
+    const sourceLabel = clip.media_pool_key
+      ? (clip.asset_name || clip.asset_id || clip.source_type || 'Source')
+      : (clip.kind === 'overlay' || clip.kind === 'subtitle' ? '' : 'Unlinked');
+    block.title = `${clip.label || ''}\n${sourceLabel}\n${(typeof fmtTC === 'function') ? `${fmtTC(clip.project_in)} → ${fmtTC(clip.project_out)}` : `${clip.project_in.toFixed(2)} → ${clip.project_out.toFixed(2)}`}`;
+    block.innerHTML = `
+      ${sourceLabel ? `<span class="mtl-clip-src">${escapeHtml(sourceLabel)}</span>` : ''}
+      <span class="mtl-clip-label">${escapeHtml(clip.kind === 'overlay' ? (clip.text || clip.label || '') : (clip.label || ''))}</span>
+    `;
+    block.addEventListener('mousedown', (ev) => {
+      ev.stopPropagation();
+      __multiTimelineSelectedClipId = clip.id;
+      requestMultiTimelineRender();
+    });
+    laneEl.appendChild(block);
+  });
+}
+
+/* ---- Drag-and-drop from the Story Card Picker into a lane ---- */
+
+function multiTimelineLaneAcceptsCard(track, card){
+  if (!track || !card) return false;
+  const isCaption = card.kind === 'caption';
+  if (isCaption) return track.kind === 'overlay';
+  // Cue / clip / generic with timecode → V or A tracks.
+  if (track.kind === 'video' || track.kind === 'audio') return true;
+  return false;
+}
+
+function attachMultiTimelineLaneDropHandlers(lane, track){
+  lane.addEventListener('dragover', (ev) => {
+    if (!__multiTimelineDrag) return;
+    if (!multiTimelineLaneAcceptsCard(track, __multiTimelineDrag.card)) return;
+    ev.preventDefault();
+    if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'copy';
+    lane.classList.add('drop-target');
+    // Live drop indicator at the cursor position. The lane's bounding rect
+    // already reflects the current horizontal scroll, so cursor x relative to
+    // rect.left equals the lane-internal pixel coordinate.
+    const rect = lane.getBoundingClientRect();
+    const x = Math.max(0, ev.clientX - rect.left);
+    let ind = lane.querySelector('.mtl-drop-indicator');
+    if (!ind){
+      ind = document.createElement('div');
+      ind.className = 'mtl-drop-indicator';
+      lane.appendChild(ind);
+    }
+    ind.style.left = x + 'px';
+  });
+  lane.addEventListener('dragleave', () => {
+    lane.classList.remove('drop-target');
+    lane.querySelector('.mtl-drop-indicator')?.remove();
+  });
+  lane.addEventListener('drop', (ev) => {
+    lane.classList.remove('drop-target');
+    lane.querySelector('.mtl-drop-indicator')?.remove();
+    if (!__multiTimelineDrag) return;
+    const card = __multiTimelineDrag.card;
+    if (!multiTimelineLaneAcceptsCard(track, card)) return;
+    ev.preventDefault();
+    const rect = lane.getBoundingClientRect();
+    const px = Math.max(0, ev.clientX - rect.left);
+    const projectIn = multiTimelinePxToTime(px);
+    multiTimelineDropCardOnTrack(card, track, projectIn);
+    __multiTimelineDrag = null;
+  });
+}
+
+function multiTimelineDropCardOnTrack(card, track, projectIn){
+  // Stamp the row id onto the card so the clip carries breadcrumbs.
+  try{
+    const row = (storyRows || []).find(r => (r.cards || []).some(c => c.id === card.id));
+    if (row) card.__rowId = row.id;
+  }catch(_e){}
+  const rowIndex = Math.max(0, (storyRows || []).findIndex(r => r.id === card.__rowId));
+  const cardIndex = Math.max(0, ((storyRows[rowIndex]?.cards) || []).findIndex(c => c.id === card.id));
+
+  const clip = multiTimelineBuildClipFromCard(card, { trackId: track.id, kind: track.kind === 'overlay' ? 'overlay' : track.kind, rowIndex, cardIndex });
+  if (!clip){
+    alert('That card has no usable timecode and no caption text — nothing to drop.');
+    return;
+  }
+  const dur = Math.max(0.04, clip.project_out - clip.project_in);
+  clip.project_in = projectIn;
+  clip.project_out = projectIn + dur;
+  multiTimelineCommitClip(clip, { snap:true });
+  __multiTimelineSelectedClipId = clip.id;
+
+  // Auto-spawn the audio sibling for V drops (V1→A1, V2→A2). The user can
+  // delete or detach it later. If the audio track already has a clip overlapping
+  // this range, skip the sibling rather than violate the no-overlap invariant
+  // — the user can drop audio manually onto a free spot.
+  if (track.kind === 'video'){
+    const aTrack = multiTimelineFindTrackByIndex('audio', Number(track.index));
+    if (aTrack){
+      const aClip = multiTimelineBuildClipFromCard(card, { trackId: aTrack.id, kind:'audio', rowIndex, cardIndex });
+      if (aClip){
+        aClip.project_in = clip.project_in;
+        aClip.project_out = clip.project_out;
+        aClip.label = (aClip.label || '').replace(/^Story\s+/, 'Story · A · ');
+        const doc = ensureMultiTimelineDocument();
+        const overlap = (doc.clips || []).some(c =>
+          c.trackId === aTrack.id &&
+          Number(c.project_in) < aClip.project_out &&
+          Number(c.project_out) > aClip.project_in);
+        if (!overlap){
+          multiTimelineCommitClip(aClip, { snap:false });
+        } else {
+          const status = multiTimelineModeEl?.querySelector('#mtlStatus');
+          if (status) status.textContent = `Audio sibling skipped — A${track.index} already has a clip in that range.`;
+        }
+      }
+    }
+  }
+  multiTimelineRecomputeDuration();
+  requestMultiTimelineRender();
+}
+
+/* ---- Story Card Picker (floating draggable modal inside Multi-Timeline) ---- */
+
+function ensureStoryCardPicker(){
+  if (__multiTimelineCardPickerEl && document.body.contains(__multiTimelineCardPickerEl)) return __multiTimelineCardPickerEl;
+  const el = document.createElement('div');
+  el.id = 'mtlStoryCardPicker';
+  el.className = 'mtl-card-picker';
+  el.style.display = 'none';
+  el.innerHTML = `
+    <div class="mtl-card-picker-head">
+      <span class="mtl-card-picker-title">Story Card Picker</span>
+      <span class="mtl-card-picker-hint">Drag a card onto a lane</span>
+      <button class="mtl-card-picker-close" type="button" title="Close">×</button>
+    </div>
+    <div class="mtl-card-picker-toolbar">
+      <input type="search" class="mtl-card-picker-search" placeholder="Filter by text, source, label…">
+      <select class="mtl-card-picker-kind">
+        <option value="all">All kinds</option>
+        <option value="cue">Cue cards</option>
+        <option value="clip">Clip cards</option>
+        <option value="caption">Caption cards</option>
+      </select>
+    </div>
+    <div class="mtl-card-picker-body" id="mtlStoryCardList"></div>
+    <div class="mtl-card-picker-resize" title="Resize"></div>
+  `;
+  document.body.appendChild(el);
+  bindStoryCardPicker(el);
+  __multiTimelineCardPickerEl = el;
+  return el;
+}
+
+function bindStoryCardPicker(el){
+  // Drag the modal by its header.
+  const head = el.querySelector('.mtl-card-picker-head');
+  let dragState = null;
+  head.addEventListener('mousedown', (ev) => {
+    if (ev.target.closest('button')) return;
+    dragState = { startX:ev.clientX, startY:ev.clientY, baseLeft:el.offsetLeft, baseTop:el.offsetTop };
+    ev.preventDefault();
+  });
+  document.addEventListener('mousemove', (ev) => {
+    if (!dragState) return;
+    el.style.left = (dragState.baseLeft + (ev.clientX - dragState.startX)) + 'px';
+    el.style.top = (dragState.baseTop + (ev.clientY - dragState.startY)) + 'px';
+    el.style.right = 'auto';
+  });
+  document.addEventListener('mouseup', () => { dragState = null; });
+
+  // Resize from bottom-right corner.
+  const resizer = el.querySelector('.mtl-card-picker-resize');
+  let resizeState = null;
+  resizer.addEventListener('mousedown', (ev) => {
+    resizeState = { startX:ev.clientX, startY:ev.clientY, baseW:el.offsetWidth, baseH:el.offsetHeight };
+    ev.preventDefault();
+  });
+  document.addEventListener('mousemove', (ev) => {
+    if (!resizeState) return;
+    el.style.width = Math.max(280, resizeState.baseW + (ev.clientX - resizeState.startX)) + 'px';
+    el.style.height = Math.max(220, resizeState.baseH + (ev.clientY - resizeState.startY)) + 'px';
+  });
+  document.addEventListener('mouseup', () => { resizeState = null; });
+
+  // Close.
+  el.querySelector('.mtl-card-picker-close').addEventListener('click', () => { el.style.display = 'none'; });
+
+  // Filters.
+  el.querySelector('.mtl-card-picker-search').addEventListener('input', () => renderStoryCardPickerList());
+  el.querySelector('.mtl-card-picker-kind').addEventListener('change', () => renderStoryCardPickerList());
+}
+
+function renderStoryCardPickerList(){
+  const el = __multiTimelineCardPickerEl;
+  if (!el) return;
+  const list = el.querySelector('#mtlStoryCardList');
+  const search = el.querySelector('.mtl-card-picker-search').value.trim().toLowerCase();
+  const kindFilter = el.querySelector('.mtl-card-picker-kind').value;
+  list.innerHTML = '';
+
+  const cards = [];
+  (storyRows || []).forEach((row, ri) => (row.cards || []).forEach((card, ci) => {
+    cards.push({ row, rowIndex:ri, card, cardIndex:ci });
+  }));
+
+  let visible = 0;
+  cards.forEach(({ row, rowIndex, card, cardIndex }) => {
+    if (kindFilter !== 'all' && card.kind !== kindFilter) return;
+    const sourceLabel = card.asset_name || card.asset_id || card.source_type || '';
+    const cardLabel = String(card.label || '').trim();
+    const cardText = (card.kind === 'cue' || card.kind === 'clip')
+      ? ((typeof storyTextForCard === 'function') ? storyTextForCard(card) : '')
+      : (card.body || '');
+    const haystack = `${sourceLabel} ${cardLabel} ${cardText}`.toLowerCase();
+    if (search && !haystack.includes(search)) return;
+    visible++;
+
+    const range = (typeof storyTimelineRangeForCard === 'function') ? storyTimelineRangeForCard(card) : null;
+    const tcText = range && range.end > range.start
+      ? `${(typeof fmtTC === 'function') ? fmtTC(range.start) : range.start.toFixed(2)} → ${(typeof fmtTC === 'function') ? fmtTC(range.end) : range.end.toFixed(2)}`
+      : (card.kind === 'caption' ? 'Caption' : 'No timecode');
+    const colors = card.kind === 'caption' ? multiTimelineColorForCaption() : multiTimelineColorForKey(card.media_pool_key || '');
+    const item = document.createElement('div');
+    item.className = `mtl-card-pick mtl-card-pick-${card.kind}`;
+    item.draggable = true;
+    item.style.borderLeftColor = colors.stroke;
+    item.dataset.cardId = card.id;
+    item.dataset.rowId = row.id;
+    item.innerHTML = `
+      <div class="mtl-card-pick-head">
+        <span class="mtl-card-pick-kind">${escapeHtml(card.kind || 'card')}</span>
+        ${cardLabel ? `<span class="mtl-card-pick-label">${escapeHtml(cardLabel)}</span>` : ''}
+        <span class="mtl-card-pick-tc">${escapeHtml(tcText)}</span>
+      </div>
+      ${sourceLabel ? `<div class="mtl-card-pick-source">${escapeHtml(sourceLabel)}</div>` : ''}
+      <div class="mtl-card-pick-text">${escapeHtml((cardText || '').slice(0, 240))}</div>
+    `;
+    item.addEventListener('dragstart', (ev) => {
+      // Stash the card by reference; HTML5 dnd `dataTransfer` text is just a marker.
+      __multiTimelineDrag = { card: { ...card, id: card.id }, sourceKey: card.media_pool_key || '' };
+      // Actually retrieve the live card object so the drop sees latest cueRefs/notes.
+      const live = (storyRows || []).find(r => r.id === row.id)?.cards?.find(c => c.id === card.id);
+      if (live){ __multiTimelineDrag.card = live; live.__rowId = row.id; }
+      try{ ev.dataTransfer.setData('text/plain', `story-card:${card.id}`); }catch(_e){}
+      try{ ev.dataTransfer.effectAllowed = 'copy'; }catch(_e){}
+      item.classList.add('dragging');
+    });
+    item.addEventListener('dragend', () => { item.classList.remove('dragging'); __multiTimelineDrag = null; });
+    list.appendChild(item);
+  });
+  if (!visible){
+    list.innerHTML = `<div class="mtl-card-pick-empty">No matching Story Cards.</div>`;
+  }
+}
+
+function showStoryCardPicker(){
+  const el = ensureStoryCardPicker();
+  el.style.display = 'flex';
+  // First open: anchor to the top-right of the multi shell.
+  if (!el.dataset.placed){
+    const shell = multiTimelineModeEl;
+    const rect = shell ? shell.getBoundingClientRect() : { right: window.innerWidth - 40, top: 80 };
+    el.style.right = '24px';
+    el.style.top = Math.max(80, rect.top + 12) + 'px';
+    el.style.left = '';
+    el.dataset.placed = '1';
+  }
+  renderStoryCardPickerList();
+}
+function hideStoryCardPicker(){ if (__multiTimelineCardPickerEl) __multiTimelineCardPickerEl.style.display = 'none'; }
+
+
+/* ============================================================================
+   Multi-Timeline Mode — Phase 3: editorial playback + selection + editing
+   ----------------------------------------------------------------------------
+   Playback (Option A — editorial scrub, not composite):
+     - The player tracks the V1 timeline. As the playhead crosses a V1 clip
+       boundary we switch active asset and seek into source-time. V2 / audio
+       lanes display on the timeline but do not play in editorial mode.
+     - Subtitles continue to come from the active asset's saved transcript.
+     - Composite (V1+V2 layered, A1..A4 mixed, ducking) ships server-side as
+       Render Preview / Export Master in Phase 4.
+
+   Editing primitives:
+     - Selection (single / Cmd-multi / marquee), Delete, Shift-Delete (ripple)
+     - Razor at playhead (B), trim edges, slip (Alt-drag inside), slide (Cmd-drag)
+     - Snap to playhead/edges/markers (toggle N), Cmd-Z / Cmd-Shift-Z undo
+   ========================================================================== */
+
+let __mtlSelected = new Set();              // clip ids
+let __mtlSnapOn = true;
+let __mtlIsPlaying = false;
+let __mtlPlaybackRaf = 0;
+let __mtlLastPlaybackTickMs = 0;
+let __mtlActiveV1ClipId = '';
+let __mtlSeekingDuringPlayback = false;
+let __mtlUndoStack = [];
+let __mtlRedoStack = [];
+const MTL_UNDO_LIMIT = 80;
+const MTL_SNAP_PX = 8;
+
+/* ----- Snapshot / undo helpers -------------------------------------------- */
+
+function mtlSnapshotForUndo(label=''){
+  const doc = ensureMultiTimelineDocument();
+  __mtlUndoStack.push({ label, json: JSON.stringify(cleanMultiTimelineDocumentForShare(doc)), sel:[...__mtlSelected] });
+  if (__mtlUndoStack.length > MTL_UNDO_LIMIT) __mtlUndoStack.shift();
+  __mtlRedoStack.length = 0;
+}
+function mtlRestoreSnapshot(snap){
+  if (!snap) return;
+  applyMultiTimelineDocument(JSON.parse(snap.json), { silent:false });
+  __mtlSelected = new Set(snap.sel || []);
+  multiTimelineSyncStatus();
+}
+function mtlUndo(){
+  if (!__mtlUndoStack.length) return;
+  const doc = ensureMultiTimelineDocument();
+  __mtlRedoStack.push({ label:'redo', json: JSON.stringify(cleanMultiTimelineDocumentForShare(doc)), sel:[...__mtlSelected] });
+  mtlRestoreSnapshot(__mtlUndoStack.pop());
+}
+function mtlRedo(){
+  if (!__mtlRedoStack.length) return;
+  const doc = ensureMultiTimelineDocument();
+  __mtlUndoStack.push({ label:'undo', json: JSON.stringify(cleanMultiTimelineDocumentForShare(doc)), sel:[...__mtlSelected] });
+  mtlRestoreSnapshot(__mtlRedoStack.pop());
+}
+
+/* ----- Selection ---------------------------------------------------------- */
+
+function mtlSelectionList(){
+  const doc = ensureMultiTimelineDocument();
+  const ids = __mtlSelected;
+  return (doc.clips || []).filter(c => ids.has(c.id));
+}
+function mtlClearSelection(){ __mtlSelected.clear(); requestMultiTimelineRender(); }
+function mtlSelectClipId(id, opts={}){
+  if (!id) return;
+  if (opts.additive){ if (__mtlSelected.has(id)) __mtlSelected.delete(id); else __mtlSelected.add(id); }
+  else { __mtlSelected.clear(); __mtlSelected.add(id); }
+  __multiTimelineSelectedClipId = [...__mtlSelected].slice(-1)[0] || '';
+  requestMultiTimelineRender();
+}
+
+/* ----- Snapping ----------------------------------------------------------- */
+
+function mtlCollectSnapTimes(excludeClipIds=new Set()){
+  const doc = ensureMultiTimelineDocument();
+  const times = new Set();
+  times.add(0);
+  times.add(multiTimelinePlayhead);
+  (doc.markers || []).forEach(m => { if (Number.isFinite(m.time)) times.add(Number(m.time)); });
+  (doc.clips || []).forEach(c => {
+    if (excludeClipIds.has(c.id)) return;
+    times.add(Number(c.project_in));
+    times.add(Number(c.project_out));
+  });
+  return [...times].filter(t => Number.isFinite(t)).sort((a,b)=>a-b);
+}
+function mtlMaybeSnap(time, excludeClipIds=new Set()){
+  if (!__mtlSnapOn) return multiTimelineSnapToFrame(time);
+  const tolPx = MTL_SNAP_PX;
+  const tolSec = tolPx / Math.max(0.1, multiTimelinePxPerSec);
+  const candidates = mtlCollectSnapTimes(excludeClipIds);
+  let best = time, bestDelta = Infinity;
+  for (const t of candidates){
+    const d = Math.abs(t - time);
+    if (d < bestDelta){ bestDelta = d; best = t; }
+  }
+  return bestDelta <= tolSec ? multiTimelineSnapToFrame(best) : multiTimelineSnapToFrame(time);
+}
+
+/* ----- Active V1 clip resolution at a project time ------------------------ */
+
+function mtlActiveV1ClipAt(projectTime){
+  const doc = ensureMultiTimelineDocument();
+  const v1 = multiTimelineFindTrackByIndex('video', 1);
+  if (!v1) return null;
+  const t = Math.max(0, Number(projectTime) || 0);
+  // First fully-overlapping V1 clip wins. (V1 enforces no-overlap.)
+  return (doc.clips || []).find(c =>
+    c.trackId === v1.id && Number(c.project_in) <= t && Number(c.project_out) > t
+  ) || null;
+}
+function mtlSourceTimeForProjectTime(clip, projectTime){
+  if (!clip) return 0;
+  return Math.max(0, Number(clip.source_in || 0) + (Number(projectTime) - Number(clip.project_in || 0)));
+}
+
+/* ----- Editorial playback engine ----------------------------------------- */
+
+async function mtlActivateClipAsset(clip){
+  if (!clip || !clip.media_pool_key) return false;
+  const assets = (typeof getMediaPoolAssets === 'function') ? getMediaPoolAssets() : [];
+  const asset = assets.find(a => typeof mediaPoolAssetKey === 'function' && mediaPoolAssetKey(a) === clip.media_pool_key);
+  if (!asset) return false;
+  if (typeof __mediaPoolCurrentKey !== 'undefined' && __mediaPoolCurrentKey === clip.media_pool_key) return true;
+  // Reuse the Story Mode activation path; it knows every source type.
+  try{ await storyActivateAssetForCard({ media_pool_key: clip.media_pool_key, source_type: clip.source_type, asset_id: clip.asset_id }); }
+  catch(_e){ return false; }
+  return true;
+}
+
+async function mtlSeekToProjectTime(t, opts={}){
+  const doc = ensureMultiTimelineDocument();
+  const projectT = Math.max(0, Math.min(getMultiTimelineMinDuration(), Number(t) || 0));
+  multiTimelinePlayhead = projectT;
+  doc.playhead = projectT;
+  const v1Clip = mtlActiveV1ClipAt(projectT);
+  if (v1Clip){
+    if (__mtlActiveV1ClipId !== v1Clip.id){
+      __mtlActiveV1ClipId = v1Clip.id;
+      __mtlSeekingDuringPlayback = true;
+      const ok = await mtlActivateClipAsset(v1Clip);
+      __mtlSeekingDuringPlayback = false;
+      if (!ok){
+        // Asset not in pool — pause and surface a status message.
+        mtlPause();
+        const status = multiTimelineModeEl?.querySelector('#mtlStatus');
+        if (status) status.textContent = `Cannot play: source asset for "${v1Clip.label}" is not in the Media Pool.`;
+        requestMultiTimelineRender();
+        return;
+      }
+    }
+    const srcT = mtlSourceTimeForProjectTime(v1Clip, projectT);
+    if (typeof seekMediaTo === 'function') seekMediaTo(srcT, { play: !!opts.play && __mtlIsPlaying });
+  } else {
+    // Gap on V1 — pause the player but keep the timeline playhead moving so
+    // the editor can scrub past silent regions.
+    __mtlActiveV1ClipId = '';
+    try{ if (typeof pauseMedia === 'function') pauseMedia(); }catch(_e){}
+  }
+  requestMultiTimelineRender();
+}
+
+function mtlPlay(){
+  if (__mtlIsPlaying) return;
+  __mtlIsPlaying = true;
+  __mtlLastPlaybackTickMs = performance.now();
+  // Kick the player on the current clip if any.
+  const v1Clip = mtlActiveV1ClipAt(multiTimelinePlayhead);
+  if (v1Clip){
+    mtlActivateClipAsset(v1Clip).then(() => {
+      const srcT = mtlSourceTimeForProjectTime(v1Clip, multiTimelinePlayhead);
+      try{ if (typeof seekMediaTo === 'function') seekMediaTo(srcT, { play:true }); }catch(_e){}
+    });
+  }
+  mtlPlaybackTick();
+  multiTimelineSyncStatus();
+}
+function mtlPause(){
+  __mtlIsPlaying = false;
+  if (__mtlPlaybackRaf){ cancelAnimationFrame(__mtlPlaybackRaf); __mtlPlaybackRaf = 0; }
+  try{ if (typeof pauseMedia === 'function') pauseMedia(); }catch(_e){}
+  multiTimelineSyncStatus();
+}
+function mtlPlayPauseToggle(){ if (__mtlIsPlaying) mtlPause(); else mtlPlay(); }
+
+function mtlPlaybackTick(){
+  if (!__mtlIsPlaying) return;
+  const now = performance.now();
+  const dt = Math.max(0, (now - __mtlLastPlaybackTickMs) / 1000);
+  __mtlLastPlaybackTickMs = now;
+  // Source-of-truth for playhead motion is the player when on a clip; the
+  // timeline derives its time from the player so subframe drift can't accumulate.
+  const v1Clip = mtlActiveV1ClipAt(multiTimelinePlayhead);
+  if (v1Clip && !__mtlSeekingDuringPlayback){
+    const playerT = (typeof getMediaCurrentTime === 'function') ? Number(getMediaCurrentTime() || 0) : 0;
+    // If the player hasn't completed the seek into this clip's source range
+    // yet, hold the timeline playhead steady rather than snapping it to a
+    // transient pre-seek value.
+    if (playerT >= Number(v1Clip.source_in || 0) - 0.05 && playerT <= Number(v1Clip.source_out || 0) + 0.05){
+      const projectT = Number(v1Clip.project_in || 0) + (playerT - Number(v1Clip.source_in || 0));
+      multiTimelinePlayhead = Math.max(0, projectT);
+    }
+    // Boundary crossing: if we passed clip end, jump to next V1 clip.
+    if (multiTimelinePlayhead >= Number(v1Clip.project_out)){
+      const nextClip = mtlNextV1ClipAfter(v1Clip);
+      if (nextClip){
+        mtlSeekToProjectTime(Number(nextClip.project_in), { play:true });
+      } else {
+        mtlSeekToProjectTime(Number(v1Clip.project_out));
+        mtlPause();
+      }
+    }
+  } else if (!v1Clip){
+    // Gap region — advance playhead in real time until we hit the next V1 clip
+    // or the timeline duration runs out.
+    multiTimelinePlayhead = Math.min(getMultiTimelineMinDuration(), multiTimelinePlayhead + dt);
+    const nextClip = mtlNextV1ClipAfter({ project_out: multiTimelinePlayhead - 0.0001 });
+    if (nextClip && multiTimelinePlayhead >= Number(nextClip.project_in)){
+      mtlSeekToProjectTime(Number(nextClip.project_in), { play:true });
+    } else if (multiTimelinePlayhead >= getMultiTimelineMinDuration() - 0.001){
+      mtlPause();
+    }
+  }
+  ensureMultiTimelineDocument().playhead = multiTimelinePlayhead;
+  renderMultiTimelinePlayhead();
+  __mtlPlaybackRaf = requestAnimationFrame(mtlPlaybackTick);
+}
+
+function mtlNextV1ClipAfter(refClip){
+  const doc = ensureMultiTimelineDocument();
+  const v1 = multiTimelineFindTrackByIndex('video', 1);
+  if (!v1) return null;
+  const t = Number(refClip?.project_out ?? refClip?.project_in ?? 0);
+  return (doc.clips || [])
+    .filter(c => c.trackId === v1.id && Number(c.project_in) >= t)
+    .sort((a,b) => Number(a.project_in) - Number(b.project_in))[0] || null;
+}
+
+function multiTimelineSyncStatus(){
+  const status = multiTimelineModeEl?.querySelector('#mtlStatus');
+  if (!status) return;
+  const doc = ensureMultiTimelineDocument();
+  const clipCount = (doc.clips || []).length;
+  const trackCount = (doc.tracks || []).length;
+  const tcText = (typeof fmtTC === 'function') ? fmtTC(multiTimelinePlayhead) : multiTimelinePlayhead.toFixed(2);
+  const playState = __mtlIsPlaying ? '▶ playing' : '⏸ paused';
+  const selCount = __mtlSelected.size;
+  const snapText = __mtlSnapOn ? 'snap on' : 'snap off';
+  status.textContent = `${playState}  ·  ${tcText}  ·  ${clipCount} clip(s) on ${trackCount} track(s)  ·  ${selCount ? `${selCount} selected · ` : ''}${snapText}  ·  zoom ${Math.round(multiTimelinePxPerSec)} px/s`;
+}
+
+/* ----- Editing primitives ------------------------------------------------- */
+
+function mtlDeleteSelected({ ripple=false }={}){
+  const doc = ensureMultiTimelineDocument();
+  if (!__mtlSelected.size) return;
+  mtlSnapshotForUndo('delete');
+  if (ripple){
+    // Group deletions by track so we close gaps within a track only.
+    const byTrack = new Map();
+    mtlSelectionList().forEach(c => {
+      if (!byTrack.has(c.trackId)) byTrack.set(c.trackId, []);
+      byTrack.get(c.trackId).push(c);
+    });
+    byTrack.forEach((clips, trackId) => {
+      const sorted = clips.slice().sort((a,b)=>Number(a.project_in) - Number(b.project_in));
+      let removedDur = 0;
+      sorted.forEach(c => {
+        const dur = Number(c.project_out) - Number(c.project_in);
+        // Remove this clip.
+        doc.clips = doc.clips.filter(x => x.id !== c.id);
+        // Shift any later clip on the same track left by `dur`.
+        doc.clips.forEach(x => {
+          if (x.trackId === trackId && Number(x.project_in) >= Number(c.project_in) - removedDur){
+            x.project_in = multiTimelineSnapToFrame(Number(x.project_in) - dur);
+            x.project_out = multiTimelineSnapToFrame(Number(x.project_out) - dur);
+          }
+        });
+        removedDur += dur;
+      });
+    });
+  } else {
+    doc.clips = doc.clips.filter(c => !__mtlSelected.has(c.id));
+  }
+  __mtlSelected.clear();
+  multiTimelineRecomputeDuration();
+  requestMultiTimelineRender();
+}
+
+function mtlRazorAtPlayhead(){
+  const doc = ensureMultiTimelineDocument();
+  const t = multiTimelinePlayhead;
+  // If anything is selected, razor only those; else razor every clip the
+  // playhead crosses (Avid behavior).
+  const candidates = __mtlSelected.size ? mtlSelectionList()
+    : (doc.clips || []).filter(c => Number(c.project_in) < t && Number(c.project_out) > t);
+  if (!candidates.length) return;
+  mtlSnapshotForUndo('razor');
+  candidates.forEach(c => {
+    if (Number(c.project_in) >= t || Number(c.project_out) <= t) return; // playhead not strictly inside
+    const sourceCutT = mtlSourceTimeForProjectTime(c, t);
+    const right = JSON.parse(JSON.stringify(c));
+    right.id = makeMultiTimelineId('clip');
+    right.project_in = multiTimelineSnapToFrame(t);
+    right.source_in = multiTimelineSnapToFrame(sourceCutT);
+    c.project_out = multiTimelineSnapToFrame(t);
+    c.source_out = multiTimelineSnapToFrame(sourceCutT);
+    doc.clips.push(right);
+  });
+  requestMultiTimelineRender();
+}
+
+function mtlToggleSnap(){ __mtlSnapOn = !__mtlSnapOn; multiTimelineSyncStatus(); }
+
+/* ----- Drag / trim / slip / slide on clip blocks ------------------------- */
+/* Dispatched by the mousedown handler installed in renderMultiTimelineClipsForTrack. */
+
+function mtlBeginClipDrag(ev, clip, mode){
+  const doc = ensureMultiTimelineDocument();
+  ev.preventDefault();
+  ev.stopPropagation();
+  const startX = ev.clientX;
+  const startProjectIn = Number(clip.project_in);
+  const startProjectOut = Number(clip.project_out);
+  const startSourceIn = Number(clip.source_in);
+  const startSourceOut = Number(clip.source_out);
+  const dur = startProjectOut - startProjectIn;
+  let snapshotTaken = false;
+  const ensureSnap = () => { if (!snapshotTaken){ mtlSnapshotForUndo(mode); snapshotTaken = true; } };
+
+  const onMove = (mev) => {
+    const dxPx = mev.clientX - startX;
+    const dxSec = dxPx / Math.max(0.1, multiTimelinePxPerSec);
+
+    if (mode === 'slide'){
+      ensureSnap();
+      const targetIn = mtlMaybeSnap(startProjectIn + dxSec, new Set([clip.id]));
+      const delta = targetIn - startProjectIn;
+      clip.project_in  = multiTimelineSnapToFrame(targetIn);
+      clip.project_out = multiTimelineSnapToFrame(startProjectOut + delta);
+    } else if (mode === 'slip'){
+      ensureSnap();
+      // Source range slides inside the clip; project range is fixed.
+      const newSourceIn = Math.max(0, startSourceIn - dxSec);
+      const newSourceOut = newSourceIn + (startSourceOut - startSourceIn);
+      clip.source_in  = multiTimelineSnapToFrame(newSourceIn);
+      clip.source_out = multiTimelineSnapToFrame(newSourceOut);
+    } else if (mode === 'trim-left'){
+      ensureSnap();
+      const targetIn = mtlMaybeSnap(startProjectIn + dxSec, new Set([clip.id]));
+      // Don't pass the right edge or go below zero source.
+      const minIn = Math.max(0, startProjectIn - startSourceIn);
+      const maxIn = startProjectOut - 0.04;
+      const projectIn = Math.max(minIn, Math.min(maxIn, targetIn));
+      const sourceIn = startSourceIn + (projectIn - startProjectIn);
+      clip.project_in = multiTimelineSnapToFrame(projectIn);
+      clip.source_in  = multiTimelineSnapToFrame(sourceIn);
+    } else if (mode === 'trim-right'){
+      ensureSnap();
+      const targetOut = mtlMaybeSnap(startProjectOut + dxSec, new Set([clip.id]));
+      const minOut = startProjectIn + 0.04;
+      const projectOut = Math.max(minOut, targetOut);
+      const sourceOut = startSourceOut + (projectOut - startProjectOut);
+      clip.project_out = multiTimelineSnapToFrame(projectOut);
+      clip.source_out  = multiTimelineSnapToFrame(sourceOut);
+    }
+    requestMultiTimelineRender();
+  };
+
+  const onUp = () => {
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    // Resolve overlap conflicts after slide/trim by clamping rather than rolling
+    // back: a slide that lands on top of another clip is corrected to butt
+    // against it. Source operations (slip) don't change layout so they skip.
+    if (snapshotTaken && (mode === 'slide' || mode === 'trim-left' || mode === 'trim-right')){
+      mtlResolveTrackOverlap(clip, { startProjectIn, startProjectOut });
+    }
+    multiTimelineRecomputeDuration();
+    requestMultiTimelineRender();
+  };
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup', onUp);
+}
+
+function mtlResolveTrackOverlap(clip, original){
+  const doc = ensureMultiTimelineDocument();
+  const others = (doc.clips || []).filter(c => c.id !== clip.id && c.trackId === clip.trackId)
+    .sort((a,b) => Number(a.project_in) - Number(b.project_in));
+  // Walk neighbors; if our new range overlaps one, snap to its boundary.
+  for (const o of others){
+    const oin = Number(o.project_in);
+    const oout = Number(o.project_out);
+    if (Number(clip.project_in) < oout && Number(clip.project_out) > oin){
+      const dur = Number(clip.project_out) - Number(clip.project_in);
+      // Choose the side closer to the original position so the edit feels less surprising.
+      const slideRight = Math.abs(oout - original.startProjectIn) < Math.abs(oin - original.startProjectOut);
+      if (slideRight){
+        clip.project_in  = multiTimelineSnapToFrame(oout);
+        clip.project_out = multiTimelineSnapToFrame(oout + dur);
+      } else {
+        clip.project_out = multiTimelineSnapToFrame(oin);
+        clip.project_in  = multiTimelineSnapToFrame(oin - dur);
+        if (clip.project_in < 0){
+          clip.project_in = 0;
+          clip.project_out = multiTimelineSnapToFrame(dur);
+        }
+      }
+    }
+  }
+}
+
+/* ----- Wire up clip-block interaction (replaces the Phase 2 click-only handler) ----- */
+
+function mtlAttachClipInteractions(block, clip){
+  // Trim-edge cursor zones (8px from each end). We keep the same handler and
+  // dispatch by hit-test rather than two extra elements.
+  block.addEventListener('mousemove', (ev) => {
+    const r = block.getBoundingClientRect();
+    const localX = ev.clientX - r.left;
+    const w = r.width;
+    if (localX <= 8) block.style.cursor = 'w-resize';
+    else if (localX >= w - 8) block.style.cursor = 'e-resize';
+    else if (ev.altKey) block.style.cursor = 'ew-resize';   // slip
+    else if (ev.metaKey || ev.ctrlKey) block.style.cursor = 'grab'; // slide
+    else block.style.cursor = 'pointer';
+  });
+  block.addEventListener('mousedown', (ev) => {
+    if (ev.button !== 0) return;
+    ev.stopPropagation();
+    // Selection on plain click; modifier-additive on Cmd/Ctrl.
+    mtlSelectClipId(clip.id, { additive: ev.shiftKey || ev.metaKey || ev.ctrlKey });
+    const r = block.getBoundingClientRect();
+    const localX = ev.clientX - r.left;
+    const w = r.width;
+    if (localX <= 8) mtlBeginClipDrag(ev, clip, 'trim-left');
+    else if (localX >= w - 8) mtlBeginClipDrag(ev, clip, 'trim-right');
+    else if (ev.altKey) mtlBeginClipDrag(ev, clip, 'slip');
+    else if (ev.metaKey || ev.ctrlKey) mtlBeginClipDrag(ev, clip, 'slide');
+  });
+  block.addEventListener('dblclick', (ev) => {
+    // Double-click seeks to clip start.
+    ev.stopPropagation();
+    mtlSeekToProjectTime(Number(clip.project_in));
+  });
+}
+
+/* ----- Ruler click → seek; lane background → marquee select ------------- */
+
+function mtlAttachRulerSeek(){
+  const ruler = multiTimelineModeEl?.querySelector('#mtlRuler');
+  if (!ruler || ruler.__mtlSeekBound) return;
+  ruler.__mtlSeekBound = true;
+  ruler.addEventListener('mousedown', (ev) => {
+    const r = ruler.getBoundingClientRect();
+    const x = Math.max(0, ev.clientX - r.left);
+    mtlSeekToProjectTime(multiTimelinePxToTime(x));
+  });
+  ruler.addEventListener('mousemove', (ev) => {
+    if (ev.buttons !== 1) return;
+    const r = ruler.getBoundingClientRect();
+    const x = Math.max(0, ev.clientX - r.left);
+    mtlSeekToProjectTime(multiTimelinePxToTime(x));
+  });
+}
+
+function mtlAttachLaneMarquee(lane){
+  lane.addEventListener('mousedown', (ev) => {
+    if (ev.target !== lane) return; // only on empty area, not on a clip
+    if (ev.button !== 0) return;
+    const startR = lane.getBoundingClientRect();
+    const startX = ev.clientX - startR.left;
+    const startProjectT = multiTimelinePxToTime(startX);
+    const marquee = document.createElement('div');
+    marquee.className = 'mtl-marquee';
+    marquee.style.left = startX + 'px';
+    marquee.style.width = '0px';
+    lane.appendChild(marquee);
+    let endProjectT = startProjectT;
+    const onMove = (mev) => {
+      const r = lane.getBoundingClientRect();
+      const x = Math.max(0, mev.clientX - r.left);
+      endProjectT = multiTimelinePxToTime(x);
+      const lo = Math.min(startX, x);
+      const w = Math.abs(x - startX);
+      marquee.style.left = lo + 'px';
+      marquee.style.width = w + 'px';
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      marquee.remove();
+      const lo = Math.min(startProjectT, endProjectT);
+      const hi = Math.max(startProjectT, endProjectT);
+      if (Math.abs(hi - lo) < 0.05){
+        // Treated as a click on empty lane: clear selection and seek.
+        if (!ev.shiftKey && !ev.metaKey && !ev.ctrlKey) mtlClearSelection();
+        mtlSeekToProjectTime(lo);
+        return;
+      }
+      const trackId = lane.dataset.trackId;
+      const doc = ensureMultiTimelineDocument();
+      const additive = ev.shiftKey || ev.metaKey || ev.ctrlKey;
+      if (!additive) __mtlSelected.clear();
+      (doc.clips || []).forEach(c => {
+        if (c.trackId !== trackId) return;
+        if (Number(c.project_in) < hi && Number(c.project_out) > lo) __mtlSelected.add(c.id);
+      });
+      requestMultiTimelineRender();
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+}
+
+/* ----- Override the Phase 2 clip handler to use the richer interaction --- */
+
+const __mtlOriginalRenderClipsForTrack = renderMultiTimelineClipsForTrack;
+renderMultiTimelineClipsForTrack = function patchedRenderClipsForTrack(laneEl, track){
+  const doc = ensureMultiTimelineDocument();
+  const onTrack = (doc.clips || []).filter(c => c.trackId === track.id);
+  onTrack.forEach(clip => {
+    const left = multiTimelineTimeToPx(clip.project_in);
+    const width = Math.max(2, multiTimelineTimeToPx(clip.project_out) - left);
+    const colors = (clip.kind === 'overlay' || clip.kind === 'subtitle')
+      ? multiTimelineColorForCaption()
+      : multiTimelineColorForKey(clip.media_pool_key);
+    const block = document.createElement('div');
+    block.className = `mtl-clip mtl-clip-${clip.kind}`;
+    if (__mtlSelected.has(clip.id)) block.classList.add('selected');
+    if (clip.id === __mtlActiveV1ClipId) block.classList.add('playing');
+    if (!clip.media_pool_key && (clip.kind === 'video' || clip.kind === 'audio')) block.classList.add('unlinked');
+    block.style.left = left + 'px';
+    block.style.width = width + 'px';
+    block.style.background = colors.fill;
+    block.style.borderColor = colors.stroke;
+    block.style.color = colors.text;
+    block.dataset.clipId = clip.id;
+    const sourceLabel = clip.media_pool_key
+      ? (clip.asset_name || clip.asset_id || clip.source_type || 'Source')
+      : (clip.kind === 'overlay' || clip.kind === 'subtitle' ? '' : 'Unlinked');
+    block.title = `${clip.label || ''}\n${sourceLabel}\n${(typeof fmtTC === 'function') ? `${fmtTC(clip.project_in)} → ${fmtTC(clip.project_out)}` : `${clip.project_in.toFixed(2)} → ${clip.project_out.toFixed(2)}`}\n\nDrag = select · Cmd+Drag = slide · Alt+Drag = slip · Edges = trim · Dbl-click = seek`;
+    block.innerHTML = `
+      ${sourceLabel ? `<span class="mtl-clip-src">${escapeHtml(sourceLabel)}</span>` : ''}
+      <span class="mtl-clip-label">${escapeHtml(clip.kind === 'overlay' ? (clip.text || clip.label || '') : (clip.label || ''))}</span>
+    `;
+    mtlAttachClipInteractions(block, clip);
+    laneEl.appendChild(block);
+  });
+};
+
+/* ----- Override renderMultiTimeline to wire ruler-seek + lane marquee ---- */
+
+const __mtlOriginalRender = renderMultiTimeline;
+renderMultiTimeline = function patchedRenderMultiTimeline(){
+  __mtlOriginalRender();
+  if (!multiTimelineModeEl || multiTimelineModeEl.style.display === 'none') return;
+  mtlAttachRulerSeek();
+  multiTimelineModeEl.querySelectorAll('#mtlLanes .mtl-lane').forEach(lane => {
+    if (!lane.__mtlMarqueeBound){ lane.__mtlMarqueeBound = true; mtlAttachLaneMarquee(lane); }
+  });
+  multiTimelineSyncStatus();
+};
+
+/* ----- Player time-update hook: keep the multi playhead in sync ---------- */
+
+if (typeof player !== 'undefined' && player && !player.__mtlPlayheadBound){
+  player.__mtlPlayheadBound = true;
+  player.addEventListener('timeupdate', () => {
+    if (!isMultiTimelineMode || !__mtlIsPlaying || __mtlSeekingDuringPlayback) return;
+    const v1Clip = mtlActiveV1ClipAt(multiTimelinePlayhead);
+    if (!v1Clip) return;
+    const playerT = Number(player.currentTime || 0);
+    // Ignore transient values from a fresh asset switch: if the player time is
+    // outside this clip's source range by more than a frame, the underlying
+    // <video> hasn't finished seeking yet — leave the playhead alone.
+    if (playerT < Number(v1Clip.source_in) - 0.05 || playerT > Number(v1Clip.source_out) + 0.05) return;
+    const projectT = Number(v1Clip.project_in) + (playerT - Number(v1Clip.source_in));
+    if (Number.isFinite(projectT) && Math.abs(projectT - multiTimelinePlayhead) > 0.01){
+      multiTimelinePlayhead = Math.max(0, projectT);
+      ensureMultiTimelineDocument().playhead = multiTimelinePlayhead;
+      renderMultiTimelinePlayhead();
+    }
+  });
+}
+
+/* ----- Keyboard shortcuts (only fire while Multi-Timeline sub-mode active) - */
+
+document.addEventListener('keydown', (ev) => {
+  if (!isTimelineMode || !isMultiTimelineMode) return;
+  if (ev.target && ['INPUT','TEXTAREA','SELECT'].includes(ev.target.tagName)) return;
+  if (ev.target && ev.target.isContentEditable) return;
+  const key = ev.key;
+  const mod = ev.metaKey || ev.ctrlKey;
+
+  if (mod && key.toLowerCase() === 'z' && !ev.shiftKey){ ev.preventDefault(); mtlUndo(); return; }
+  if (mod && (key.toLowerCase() === 'y' || (key.toLowerCase() === 'z' && ev.shiftKey))){ ev.preventDefault(); mtlRedo(); return; }
+  if (mod && key.toLowerCase() === 'a'){ ev.preventDefault(); const doc = ensureMultiTimelineDocument(); __mtlSelected = new Set((doc.clips || []).map(c => c.id)); requestMultiTimelineRender(); return; }
+  if (key === 'Escape'){ mtlClearSelection(); return; }
+  if (key === ' '){ ev.preventDefault(); mtlPlayPauseToggle(); return; }
+  if (key === 'Delete' || key === 'Backspace'){ ev.preventDefault(); mtlDeleteSelected({ ripple: ev.shiftKey }); return; }
+  if (key.toLowerCase() === 'b' || key.toLowerCase() === 'c'){ ev.preventDefault(); mtlRazorAtPlayhead(); return; }
+  if (key.toLowerCase() === 'n'){ ev.preventDefault(); mtlToggleSnap(); return; }
+
+  // Frame-level transport with arrow keys.
+  if (key === 'ArrowLeft' || key === 'ArrowRight'){
+    ev.preventDefault();
+    const fps = (typeof getFPS === 'function') ? getFPS() : 25;
+    const step = ev.shiftKey ? 1 : (1 / fps);
+    mtlSeekToProjectTime(multiTimelinePlayhead + (key === 'ArrowRight' ? step : -step));
+    return;
+  }
+  if (key === 'Home'){ ev.preventDefault(); mtlSeekToProjectTime(0); return; }
+  if (key === 'End'){ ev.preventDefault(); mtlSeekToProjectTime(getMultiTimelineMinDuration()); return; }
+});
+
+// Wrap drop and bulk export so they can be undone. We capture the BEFORE state,
+// run the original, then commit the snapshot only if the operation actually
+// changed something (otherwise we'd push no-op undo entries that wipe redo).
+function __mtlPushPreSnapshotIfChanged(label, beforeJson){
+  const afterJson = JSON.stringify(cleanMultiTimelineDocumentForShare(ensureMultiTimelineDocument()));
+  if (afterJson === beforeJson) return false;
+  __mtlUndoStack.push({ label, json: beforeJson, sel: [] });
+  if (__mtlUndoStack.length > MTL_UNDO_LIMIT) __mtlUndoStack.shift();
+  __mtlRedoStack.length = 0;
+  return true;
+}
+
+const __mtlOriginalDropCardOnTrack = multiTimelineDropCardOnTrack;
+multiTimelineDropCardOnTrack = function snapshotWrappedDrop(card, track, projectIn){
+  const beforeJson = JSON.stringify(cleanMultiTimelineDocumentForShare(ensureMultiTimelineDocument()));
+  const result = __mtlOriginalDropCardOnTrack(card, track, projectIn);
+  __mtlPushPreSnapshotIfChanged('drop', beforeJson);
+  return result;
+};
+
+const __mtlOriginalExportStoryToMultiTimeline = exportStoryToMultiTimeline;
+exportStoryToMultiTimeline = function snapshotWrappedExport(){
+  const beforeJson = JSON.stringify(cleanMultiTimelineDocumentForShare(ensureMultiTimelineDocument()));
+  const result = __mtlOriginalExportStoryToMultiTimeline.apply(this, arguments);
+  __mtlPushPreSnapshotIfChanged('export', beforeJson);
+  return result;
+};
+
+
+/* ============================================================================
+   Multi-Timeline Mode — Phase 4a Pass 1: In/Out marks + Render Preview
+   ----------------------------------------------------------------------------
+   This drop wires the first server-side render path:
+     - I / O keys set in / out marks at the playhead (the render range)
+     - Render Preview button POSTs the EDL section to /api/multi_timeline/render
+     - Progress modal polls /status; on done, opens an in-browser overlay
+       playing the returned MP4
+
+   Pass 1 is intentionally narrow on the server side: V1 + A1 only, single
+   source asset, cached Local or Google Drive. The frontend errors out clearly
+   for multi-source ranges so the UX is honest about scope.
+   ========================================================================== */
+
+/* ---- In/Out marks live on the multiTimeline document ---- */
+
+function mtlGetMarks(){
+  const doc = ensureMultiTimelineDocument();
+  if (!doc.marks || typeof doc.marks !== 'object') doc.marks = { in:null, out:null };
+  return doc.marks;
+}
+function mtlSetInMark(t){
+  const doc = ensureMultiTimelineDocument();
+  const marks = mtlGetMarks();
+  const v = Math.max(0, Math.min(getMultiTimelineMinDuration(), Number(t)));
+  // If the new In is past the current Out, drop Out — the user is choosing a
+  // new range starting here, not extending an inverted range.
+  if (marks.out != null && v >= marks.out) marks.out = null;
+  marks.in = multiTimelineSnapToFrame(v);
+  doc.marks = marks;
+  requestMultiTimelineRender();
+}
+function mtlSetOutMark(t){
+  const doc = ensureMultiTimelineDocument();
+  const marks = mtlGetMarks();
+  const v = Math.max(0, Math.min(getMultiTimelineMinDuration(), Number(t)));
+  if (marks.in != null && v <= marks.in) marks.in = null;
+  marks.out = multiTimelineSnapToFrame(v);
+  doc.marks = marks;
+  requestMultiTimelineRender();
+}
+function mtlClearMarks(){
+  const marks = mtlGetMarks();
+  marks.in = null; marks.out = null;
+  requestMultiTimelineRender();
+}
+function mtlMarkedRange(){
+  // Returns the effective render range:
+  //   both I and O set → [in, out]
+  //   only I set       → [in, duration]
+  //   only O set       → [0, out]
+  //   neither          → [0, duration]   (i.e. render whole timeline)
+  const marks = mtlGetMarks();
+  const dur = getMultiTimelineMinDuration();
+  const a = marks.in != null ? Math.max(0, Math.min(dur, Number(marks.in))) : 0;
+  const b = marks.out != null ? Math.max(0, Math.min(dur, Number(marks.out))) : dur;
+  if (b <= a) return null;
+  return { in:a, out:b };
+}
+
+/* Render In/Out flags on the ruler.
+   The flags are sticky on the ruler element so they stay visible during scroll;
+   they're recreated on every render pass so we don't have to track lifecycle. */
+
+function renderMultiTimelineMarksOnRuler(){
+  const ruler = multiTimelineModeEl?.querySelector('#mtlRuler');
+  if (!ruler) return;
+  // Remove any previous marks before painting the new ones.
+  ruler.querySelectorAll('.mtl-mark').forEach(n => n.remove());
+  const range = mtlMarkedRange();
+  const marks = mtlGetMarks();
+  if (!range) return;
+  if (marks.in != null){
+    const el = document.createElement('div');
+    el.className = 'mtl-mark mtl-mark-in';
+    el.style.left = multiTimelineTimeToPx(marks.in) + 'px';
+    el.title = `In: ${(typeof fmtTC === 'function') ? fmtTC(marks.in) : marks.in.toFixed(2)}`;
+    el.textContent = 'I';
+    ruler.appendChild(el);
+  }
+  if (marks.out != null){
+    const el = document.createElement('div');
+    el.className = 'mtl-mark mtl-mark-out';
+    el.style.left = multiTimelineTimeToPx(marks.out) + 'px';
+    el.title = `Out: ${(typeof fmtTC === 'function') ? fmtTC(marks.out) : marks.out.toFixed(2)}`;
+    el.textContent = 'O';
+    ruler.appendChild(el);
+  }
+  // Range fill across lanes for visual context.
+  const lanesEl = multiTimelineModeEl?.querySelector('#mtlLanes');
+  if (lanesEl){
+    let band = lanesEl.querySelector('.mtl-mark-range');
+    if (!band){
+      band = document.createElement('div');
+      band.className = 'mtl-mark-range';
+      lanesEl.appendChild(band);
+    }
+    band.style.left = multiTimelineTimeToPx(range.in) + 'px';
+    band.style.width = (multiTimelineTimeToPx(range.out) - multiTimelineTimeToPx(range.in)) + 'px';
+  }
+}
+
+// Hook the marks render into the existing render override chain.
+const __mtlOriginalRenderForMarks = renderMultiTimeline;
+renderMultiTimeline = function renderWithMarks(){
+  __mtlOriginalRenderForMarks();
+  try{ renderMultiTimelineMarksOnRuler(); }catch(_e){}
+};
+
+// Bind I/O keys. Patched onto the existing Multi-Timeline keyboard handler
+// rather than added as a new listener so the gating logic (only-when-active)
+// stays in one place.
+document.addEventListener('keydown', (ev) => {
+  if (!isTimelineMode || !isMultiTimelineMode) return;
+  if (ev.target && ['INPUT','TEXTAREA','SELECT'].includes(ev.target.tagName)) return;
+  if (ev.target && ev.target.isContentEditable) return;
+  // Don't fire on Cmd-I etc.
+  if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+  const k = ev.key.toLowerCase();
+  if (k === 'i'){ ev.preventDefault(); mtlSetInMark(multiTimelinePlayhead); }
+  else if (k === 'o'){ ev.preventDefault(); mtlSetOutMark(multiTimelinePlayhead); }
+  else if (k === 'x' && ev.shiftKey){ ev.preventDefault(); mtlClearMarks(); }
+});
+
+/* ---- Source-cache resolution: media_pool_key → {type, cache_id} ---- */
+
+function mtlCacheRefForKey(mediaPoolKey){
+  // Find the asset in the Media Pool by its key, then derive a backend-shaped
+  // {type, cache_id} the renderer can understand.
+  if (!mediaPoolKey) return null;
+  const assets = (typeof getMediaPoolAssets === 'function') ? getMediaPoolAssets() : [];
+  const asset = assets.find(a => typeof mediaPoolAssetKey === 'function' && mediaPoolAssetKey(a) === mediaPoolKey);
+  if (!asset) return null;
+  const cacheId = String(asset.cache_id || asset.cacheId || asset.metadata?.cache_id || '');
+  if (!cacheId) return null;
+  const sourceType = String(asset.source_type || asset.sourceType || '').toLowerCase();
+  if (sourceType === 'local') return { media_pool_key:mediaPoolKey, type:'local_cached', cache_id:cacheId };
+  if (sourceType === 'drive' || sourceType === 'google_drive') return { media_pool_key:mediaPoolKey, type:'drive_cached', cache_id:cacheId };
+  if (sourceType === 'iconik') return { media_pool_key:mediaPoolKey, type:'iconik_cached', cache_id:cacheId };
+  // YouTube / shared_local → unsupported in Pass 1.
+  return null;
+}
+
+// Returns true if a Media Pool asset has been cached on the server. Used by
+// the cache status indicator and by Multi-Timeline pre-flight checks.
+function mediaPoolAssetIsCached(asset){
+  if (!asset) return false;
+  return !!(asset.cache_id || asset.cacheId || asset.metadata?.cache_id);
+}
+
+async function mtlEnsureCacheForActiveAsset(){
+  // Pre-flight: if the active source is uncached, kick the appropriate
+  // cache flow before the render request goes out. Best-effort — failures
+  // are swallowed because the caller will surface a clear error if the
+  // asset still can't be resolved.
+  try{
+    const src = currentMediaSource || {};
+    if (src.type === 'local' && !src.cacheId && typeof ensureLocalAudioCache === 'function'){
+      await ensureLocalAudioCache();
+    } else if (src.type === 'iconik' && !src.cacheId && typeof ensureIconikSourceCache === 'function'){
+      await ensureIconikSourceCache();
+    }
+  }catch(_e){}
+}
+
+/* ---- Render Preview: gather payload, call backend, poll status, show video ---- */
+
+let __mtlRenderModalEl = null;
+let __mtlRenderPollTimer = 0;
+
+function ensureRenderPreviewModal(){
+  if (__mtlRenderModalEl && document.body.contains(__mtlRenderModalEl)) return __mtlRenderModalEl;
+  const el = document.createElement('div');
+  el.id = 'mtlRenderModal';
+  el.className = 'mtl-render-modal';
+  el.style.display = 'none';
+  el.innerHTML = `
+    <div class="mtl-render-card">
+      <div class="mtl-render-head">
+        <span class="mtl-render-title">Render Preview</span>
+        <button class="mtl-render-close" type="button" title="Close">×</button>
+      </div>
+      <div class="mtl-render-status" id="mtlRenderStatus">Preparing…</div>
+      <div class="mtl-render-progress"><div class="mtl-render-progress-bar" id="mtlRenderProgressBar"></div></div>
+      <div class="mtl-render-player-wrap" id="mtlRenderPlayerWrap" style="display:none;">
+        <video id="mtlRenderPlayer" class="mtl-render-player" controls preload="metadata" playsinline></video>
+        <div class="mtl-render-meta" id="mtlRenderMeta"></div>
+      </div>
+      <div class="mtl-render-error" id="mtlRenderError" style="display:none;"></div>
+    </div>
+  `;
+  document.body.appendChild(el);
+  el.querySelector('.mtl-render-close').addEventListener('click', () => closeRenderPreviewModal());
+  el.addEventListener('click', (ev) => { if (ev.target === el) closeRenderPreviewModal(); });
+  __mtlRenderModalEl = el;
+  return el;
+}
+function showRenderModal(){ ensureRenderPreviewModal().style.display = 'flex'; }
+function closeRenderPreviewModal(){
+  if (__mtlRenderPollTimer){ clearTimeout(__mtlRenderPollTimer); __mtlRenderPollTimer = 0; }
+  if (!__mtlRenderModalEl) return;
+  // Pause and unload the video so closing doesn't leave audio playing.
+  try{
+    const v = __mtlRenderModalEl.querySelector('#mtlRenderPlayer');
+    if (v){ v.pause(); v.removeAttribute('src'); v.load(); }
+  }catch(_e){}
+  __mtlRenderModalEl.style.display = 'none';
+}
+
+function mtlRenderModalSetStatus(text){
+  const el = __mtlRenderModalEl?.querySelector('#mtlRenderStatus');
+  if (el) el.textContent = text;
+}
+function mtlRenderModalSetProgress(pct){
+  const bar = __mtlRenderModalEl?.querySelector('#mtlRenderProgressBar');
+  if (bar) bar.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+}
+function mtlRenderModalShowError(message){
+  const wrap = __mtlRenderModalEl?.querySelector('#mtlRenderError');
+  if (wrap){ wrap.textContent = message; wrap.style.display = 'block'; }
+  mtlRenderModalSetStatus('Render failed.');
+}
+function mtlRenderModalShowVideo(url, meta){
+  const wrap = __mtlRenderModalEl?.querySelector('#mtlRenderPlayerWrap');
+  const v = __mtlRenderModalEl?.querySelector('#mtlRenderPlayer');
+  const m = __mtlRenderModalEl?.querySelector('#mtlRenderMeta');
+  if (!wrap || !v) return;
+  // The cache URL is a relative API path. Browser prepends the page origin.
+  v.src = url.startsWith('/api/') ? url : url;
+  wrap.style.display = 'block';
+  if (m) m.textContent = meta || '';
+  try{ v.play().catch(()=>{}); }catch(_e){}
+}
+
+function mtlBuildRenderPayload(){
+  const doc = ensureMultiTimelineDocument();
+  const range = mtlMarkedRange();
+  if (!range) return { error:'Set In and Out marks (or leave both clear to render the whole timeline).' };
+
+  // Find V1 clips that overlap the range.
+  const v1 = (doc.tracks || []).find(t => t.kind === 'video' && Number(t.index) === 1);
+  if (!v1) return { error:'No V1 track in this Multi-Timeline document. Reload the project to recreate default tracks.' };
+
+  const v1Clips = (doc.clips || []).filter(c => c.trackId === v1.id
+    && Number(c.project_out) > range.in
+    && Number(c.project_in) < range.out);
+  if (!v1Clips.length) return { error:'No V1 clips in the In/Out range.' };
+
+  // Pass 1 single-source check up front (the backend re-validates, but doing
+  // it here gives the user a faster, friendlier error).
+  const keys = Array.from(new Set(v1Clips.map(c => c.media_pool_key).filter(Boolean)));
+  if (!keys.length) return { error:'V1 clips have no source identity. Re-link them to a Media Pool asset before rendering.' };
+  if (keys.length > 1) return { error:`Render Preview (Pass 1) supports a single source asset only. This range spans ${keys.length} sources.\n\nTighten the In/Out range to one source, or wait for Phase 4c (multi-asset render).` };
+
+  const sourceRef = mtlCacheRefForKey(keys[0]);
+  if (!sourceRef) return { error:'The source asset for this range is not cached on the server.\n\nFor Local files, run Transcribe / Align once or open the asset in the player to cache it. Iconik / YouTube renders arrive in Phase 4c.' };
+
+  // Strip the EDL clips down to just the fields the backend uses, so we keep
+  // payload sizes tight even for long timelines.
+  const clips = v1Clips.map(c => ({
+    id: c.id, trackId: c.trackId, kind: c.kind,
+    source_type: c.source_type, asset_id: c.asset_id, asset_name: c.asset_name,
+    media_pool_key: c.media_pool_key,
+    source_in: Number(c.source_in) || 0,
+    source_out: Number(c.source_out) || 0,
+    project_in: Number(c.project_in) || 0,
+    project_out: Number(c.project_out) || 0,
+  }));
+  const tracks = (doc.tracks || []).map(t => ({ id:t.id, kind:t.kind, name:t.name, index:Number(t.index) || 0 }));
+
+  return {
+    payload: {
+      clips,
+      tracks,
+      sources: [sourceRef],
+      range_in: range.in,
+      range_out: range.out,
+      fps: Number(doc.fps) || 25,
+      quality: 'preview_720p',
+      label: `Multi-Timeline Render Preview ${(typeof fmtTC === 'function') ? `${fmtTC(range.in)}→${fmtTC(range.out)}` : ''}`.trim(),
+    },
+    range,
+  };
+}
+
+async function mtlRenderPreview(){
+  // Make sure the active asset is cached if it's the one we'll be rendering.
+  await mtlEnsureCacheForActiveAsset();
+
+  const built = mtlBuildRenderPayload();
+  if (built.error){ alert(built.error); return; }
+
+  showRenderModal();
+  mtlRenderModalSetStatus('Submitting render…');
+  mtlRenderModalSetProgress(5);
+
+  let res;
+  try{
+    res = await fetch('/api/multi_timeline/render', {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json' },
+      body: JSON.stringify(built.payload),
+    });
+  }catch(err){
+    mtlRenderModalShowError(`Network error: ${err?.message || err}`);
+    return;
+  }
+  if (!res.ok){
+    let msg = `HTTP ${res.status}`;
+    try{ const j = await res.json(); msg = j.detail || JSON.stringify(j); }catch(_e){}
+    mtlRenderModalShowError(`Render request rejected: ${msg}`);
+    return;
+  }
+  const data = await res.json();
+
+  // Cache hit — we already have a rendered MP4 for this exact section.
+  if (data.status === 'done' && data.url){
+    mtlRenderModalSetStatus('Cached render found. Loading…');
+    mtlRenderModalSetProgress(100);
+    mtlRenderModalShowVideo(data.url, `Cached render · range ${(typeof fmtTC === 'function') ? `${fmtTC(built.range.in)} → ${fmtTC(built.range.out)}` : ''}`);
+    return;
+  }
+
+  // Otherwise we have a job id; poll until done or failed.
+  const jobId = data.job_id;
+  if (!jobId){
+    mtlRenderModalShowError('Backend did not return a job id.');
+    return;
+  }
+  mtlRenderModalSetStatus('Queued — waiting for worker…');
+  mtlRenderModalSetProgress(15);
+  pollRenderJob(jobId, built.range);
+}
+
+function pollRenderJob(jobId, range){
+  const tick = async () => {
+    try{
+      const r = await fetch(`/api/multi_timeline/render/${encodeURIComponent(jobId)}/status`);
+      if (!r.ok){
+        mtlRenderModalShowError(`Status poll failed: HTTP ${r.status}`);
+        return;
+      }
+      const s = await r.json();
+      if (s.status === 'queued'){
+        mtlRenderModalSetStatus(`Queued (${s.segments || '?'} segments to render)…`);
+        mtlRenderModalSetProgress(20);
+      } else if (s.status === 'running'){
+        mtlRenderModalSetStatus(`Rendering ${s.segments || '?'} segments…`);
+        // Pass 1 doesn't ship per-segment progress; bar oscillates 30–80 to
+        // signal liveness. Pass 2 will parse ffmpeg time= for real progress.
+        const oscillating = 30 + (Math.floor(performance.now() / 250) % 50);
+        mtlRenderModalSetProgress(oscillating);
+      } else if (s.status === 'done'){
+        mtlRenderModalSetStatus('Render complete.');
+        mtlRenderModalSetProgress(100);
+        const url = s.url || `/api/multi_timeline/render/${encodeURIComponent(jobId)}/file`;
+        mtlRenderModalShowVideo(url, `Range ${(typeof fmtTC === 'function') ? `${fmtTC(range.in)} → ${fmtTC(range.out)}` : ''} · ${s.segments || '?'} segments`);
+        return;
+      } else if (s.status === 'failed'){
+        mtlRenderModalShowError(s.error || 'Render failed (no error detail).');
+        return;
+      }
+      __mtlRenderPollTimer = setTimeout(tick, 500);
+    }catch(err){
+      mtlRenderModalShowError(`Polling error: ${err?.message || err}`);
+    }
+  };
+  tick();
+}
+
+/* Wire the existing Render Preview button. The button shipped disabled in
+   Phase 1; turn it on now and bind. */
+
+(function bindRenderPreviewButton(){
+  // Defer to next tick so the multi-shell DOM exists.
+  const tryBind = () => {
+    const btn = document.getElementById('mtlPreviewSection');
+    if (!btn){ setTimeout(tryBind, 250); return; }
+    btn.disabled = false;
+    btn.title = 'Render the In/Out range — V1+A1, single source (Pass 1)';
+    if (btn.__mtlBound) return;
+    btn.__mtlBound = true;
+    btn.addEventListener('click', () => mtlRenderPreview());
+  };
+  tryBind();
+})();
 
 
 /* ---------- Mobile / iPad adaptive shell ---------- */
@@ -15137,6 +20469,7 @@ function init(){
   ensureWhisperBar();
   ensureLeftPanelControlSurface();
   ensureYouTubeImportButton();
+  ensureIconikImportButton();
   ensureGoogleDriveImportButton();
   ensureShareSessionButton();
   rearrangeTopToolbar();
@@ -15147,3 +20480,24 @@ function init(){
   loadCollaborativeSessionFromUrl().catch(err => { console.error(err); setStatusSafe('Collaborative session load failed: ' + (err?.message || err)); });
 }
 init();
+
+/* ---------- Phase 3.2 Media Pool: per-asset transcript binding hooks ---------- */
+(function initMediaPoolTranscriptBindingHooks(){
+  try{
+    const wrapFunction = (name, after) => {
+      const fn = window[name] || (typeof globalThis !== 'undefined' ? globalThis[name] : null);
+      if (typeof fn !== 'function' || fn.__mediaPoolWrapped) return;
+      const wrapped = function(...args){
+        const ret = fn.apply(this, args);
+        try{ after?.(); }catch(_e){}
+        return ret;
+      };
+      wrapped.__mediaPoolWrapped = true;
+      try{ window[name] = wrapped; }catch(_e){}
+    };
+    // Most transcript-changing flows finish by rendering; debounce-save the active asset snapshot.
+    wrapFunction('renderTranscript', () => mediaPoolMarkTranscriptDirty());
+    wrapFunction('renderTranscriptB', () => mediaPoolMarkTranscriptDirty());
+    wrapFunction('renderBySubsMode', () => mediaPoolMarkTranscriptDirty());
+  }catch(_e){}
+})();
