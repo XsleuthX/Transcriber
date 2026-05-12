@@ -3716,6 +3716,249 @@ function storyCueRange(cueRefs=[], track='A'){
   if (!cues.length) return null;
   return { start:Math.min(...cues.map(c => Number(c.start || 0))), end:Math.max(...cues.map(c => Number(c.end || 0))), cues };
 }
+// Link a generic card back to live cues by deriving cueRefs from cues that
+// overlap the card's current start/end. Used by:
+//   - The fade-in chip after Scenario B's auto-convert
+//   - The right-click context menu "Link to Cues" item on generic cards
+//   - Scenario A's "Apply & Re-link" path inside the timecode-edit modal
+// Per the user spec: extract whichever cues match the time range. If
+// sourceCueRefs is present but no longer matches reality, we just take what's
+// there now — partial restoration is more useful than all-or-nothing.
+function storyLinkCardToCuesInRange(row, card, opts={}){
+  if (!row || !card) return false;
+  // Activate the card's source asset so its transcript is loaded; the
+  // reconciler's source-key context guard would otherwise resolve refs
+  // against the wrong transcript.
+  const previousKey = __storyRelinkSourceKey;
+  __storyRelinkSourceKey = storySourceKeyForCard(card) || '';
+  let refs = [];
+  let track = normalizeStoryTrack(storyActiveSubTrack || subsMode || card.track || 'A');
+  try{
+    const s = Number(card.start ?? 0);
+    const e = Number(card.end ?? 0);
+    if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s){
+      __storyRelinkSourceKey = previousKey;
+      if (!opts.silent) alert('This card has no valid time range to link to.');
+      return false;
+    }
+    refs = storyCueRefsForRange(s, e, track);
+    if (!refs.length){
+      // Try the other track before giving up — the user may have set Sub A
+      // when the cues live on Sub B (or vice versa).
+      const otherTrack = track === 'B' ? 'A' : 'B';
+      const otherRefs = storyCueRefsForRange(s, e, otherTrack);
+      if (otherRefs.length){ refs = otherRefs; track = otherTrack; }
+    }
+  } finally {
+    __storyRelinkSourceKey = previousKey;
+  }
+  if (!refs.length){
+    if (!opts.silent) alert('No cues in this card\'s time range to link to.\n\nTry adjusting the card\'s timecode, or use "Send for Align-To-Audio" to generate cues from the body text.');
+    return false;
+  }
+  // Compare against remembered sourceCueRefs to report partial restoration.
+  const remembered = Array.isArray(card.sourceCueRefs) ? card.sourceCueRefs : [];
+  const newlySet = new Set(refs);
+  const surviving = remembered.filter(r => newlySet.has(r)).length;
+  card.kind = card.originalKind === 'clip' ? 'clip' : 'cue';
+  card.cueRefs = refs;
+  card.track = track;
+  card.bodyManual = false;
+  card.body = '';
+  card.relinkPending = false;
+  card.relinkStatus = 'linked';
+  renderStoryAssembly();
+  storyCommitSharedState(true);
+  if (remembered.length){
+    setStatusSafe?.(`Linked ${refs.length} cue${refs.length === 1 ? '' : 's'} (${surviving} of ${remembered.length} remembered survived; ${refs.length - surviving} new in this range).`);
+  } else {
+    setStatusSafe?.(`Linked to ${refs.length} cue${refs.length === 1 ? '' : 's'} in Track ${track}.`);
+  }
+  return true;
+}
+
+// Scenario C: send a generic card's body text through Align-To-Audio, find
+// where that text appears in the active asset's audio, then insert or
+// overwrite a transcript cue at the found timecode and bind the card to it.
+// Per spec: writes to whichever track the Sub A/B toggle says is active; if
+// the aligned range overlaps existing cues, those cues are collapsed into a
+// single cue with the new text + extended range (id stays stable for the
+// first overlapped cue so other refs don't break).
+//
+// Named distinctly from the legacy storySendCardForAlignToAudio (which aligns
+// the cues inside an already-bound cue card to refine their timings) — this
+// one creates new cues from a generic card.
+async function storyAlignGenericCardToAudio(row, card){
+  if (!row || !card) return false;
+  const bodyText = String(card.body || storyPlainTextFromRichHtml(String(card.bodyHtml || '')) || '').trim();
+  if (!bodyText || bodyText.length < 2){ alert('The card body is empty. Type something to align before sending.'); return false; }
+
+  // Source asset must be cached on the server. mtlCacheRefForKey returns the
+  // {type, cache_id} pair that the backend's cached-align endpoints expect.
+  // If the card has a bound asset (media_pool_key), use it; otherwise align
+  // against whatever asset is currently active in the player.
+  const targetKey = card.media_pool_key || __mediaPoolCurrentKey || '';
+  const cacheRef = targetKey ? mtlCacheRefForKey?.(targetKey) : null;
+  if (!cacheRef){
+    alert('The target source asset is not cached on the server.\n\nCache the asset first (Media Pool → Local / Drive / Iconik card → Cache button), then try again.');
+    return false;
+  }
+
+  // Need a starting timecode hint — the align endpoint refines existing times
+  // rather than searching the whole audio. If the card has no range, refuse
+  // and tell the user how to fix it.
+  const startHint = Number(card.start ?? NaN);
+  const endHint = Number(card.end ?? NaN);
+  if (!Number.isFinite(startHint) || !Number.isFinite(endHint) || endHint <= startHint){
+    alert('Set an approximate timecode on this card first (right-click the timecode), then run Align-To-Audio so the backend has a search hint to refine.');
+    return false;
+  }
+
+  // Make sure the card's asset is the active one so entries/entriesB reflect
+  // its transcript. The insert/overwrite step below targets the active track
+  // of whichever asset is currently loaded.
+  try{
+    if (card.media_pool_key && __mediaPoolCurrentKey !== card.media_pool_key){
+      await storyActivateAssetForCard(card);
+    }
+  }catch(_e){}
+
+  // Build a one-cue SRT around the body text using the current range as the
+  // search hint. Whisper's force-aligner expects an existing SRT structure.
+  // Use the same toSRT helper that the rest of the app uses (from srt.js)
+  // rather than re-implementing the time format inline.
+  const oneCueSrt = toSRT([{ start: startHint, end: endHint, text: bodyText }]);
+
+  // Dispatch to the matching cached-align endpoint by source type. All three
+  // share the same request/response shape: { cache_id, text, ...whisper opts }
+  // → { aligned_srt }.
+  const { model, device, compute, language } = getWhisperSettings();
+  const endpointByType = {
+    'local_cached':   '/api/local_cached_align_start',
+    'drive_cached':   '/api/google_drive_cached_align_start',
+    'iconik_cached':  '/api/iconik_cached_align_start',
+  };
+  const endpoint = endpointByType[cacheRef.type];
+  if (!endpoint){
+    alert(`Align-To-Audio doesn't support source type "${cacheRef.type}" yet.`);
+    return false;
+  }
+
+  progressStart('Aligning card text to audio…');
+  try{
+    const res = await fetch(`${API_BASE}${endpoint}`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        cache_id: cacheRef.cache_id,
+        text: oneCueSrt,
+        model, device, compute_type: compute, language,
+        word_timestamps: true,
+        vad_filter: true,
+      }),
+    });
+    const startResp = await res.json().catch(()=>({}));
+    if (!res.ok) throw new Error(startResp?.error || startResp?.message || `HTTP ${res.status}`);
+    const jobId = startResp?.job_id;
+    if (!jobId) throw new Error('No job_id returned from align endpoint.');
+    setActiveBackendJob(jobId, 'story_card_align');
+    await pollJob(jobId);
+    const data = await fetchJobResult(jobId);
+
+    const alignedSrt = data?.aligned_srt || '';
+    if (!alignedSrt.trim()) throw new Error('Backend returned an empty aligned SRT.');
+    const parsed = parseSRT(alignedSrt);
+    if (!parsed?.length) throw new Error('Aligned SRT had no parseable cues.');
+    const aligned = parsed[0];
+    const alignedStart = Number(aligned.start || 0);
+    const alignedEnd   = Number(aligned.end   || 0);
+    if (!Number.isFinite(alignedStart) || !Number.isFinite(alignedEnd) || alignedEnd <= alignedStart){
+      throw new Error('Aligned timecode is invalid.');
+    }
+    const alignedText = String(aligned.text || bodyText);
+
+    // Insert or overwrite a transcript cue at the aligned range. Active track
+    // = subsMode (Story Mode's Sub A/B toggle is mirrored there). The
+    // overwrite semantics:
+    //   - No overlap with existing cues → insert in time order, new id.
+    //   - Overlaps exactly one cue → rewrite that cue's text and extend its
+    //     range to the aligned range. Keep its id stable.
+    //   - Overlaps multiple cues → rewrite the FIRST overlapped cue's text +
+    //     range to cover the aligned range, delete the rest. Keep first id.
+    const trackForWrite = normalizeStoryTrack(subsMode || storyActiveSubTrack || card.track || 'A');
+    const list = trackForWrite === 'B' ? entriesB : entries;
+    try{ ensureCueIds?.(list); }catch(_e){}
+
+    // Find overlapping cues. Tolerance = half a frame to catch boundary cases.
+    const fps = (typeof getFPS === 'function') ? getFPS() : 25;
+    const tol = Math.max(0.001, 0.5 / Math.max(1, fps));
+    const overlapIndices = [];
+    list.forEach((cue, ix) => {
+      const cs = Number(cue?.start ?? 0), ce = Number(cue?.end ?? 0);
+      if (!Number.isFinite(cs) || !Number.isFinite(ce) || ce <= cs) return;
+      if (Math.min(ce, alignedEnd + tol) - Math.max(cs, alignedStart - tol) > 0.001) overlapIndices.push(ix);
+    });
+
+    let boundCueId = '';
+    if (!overlapIndices.length){
+      // Insert: walk to find time-order position, splice in.
+      const newCue = { id: (typeof generateCueId === 'function' ? generateCueId() : `cue_${Date.now().toString(36)}`), start: alignedStart, end: alignedEnd, text: alignedText };
+      let insertAt = list.findIndex(c => Number(c.start) >= alignedStart);
+      if (insertAt < 0) insertAt = list.length;
+      list.splice(insertAt, 0, newCue);
+      boundCueId = newCue.id;
+    } else {
+      // Rewrite the first overlapped cue; delete the rest. Keep first id.
+      const firstIx = overlapIndices[0];
+      const firstCue = list[firstIx];
+      firstCue.text = alignedText;
+      firstCue.start = Math.min(Number(firstCue.start ?? alignedStart), alignedStart);
+      firstCue.end = Math.max(Number(firstCue.end ?? alignedEnd), alignedEnd);
+      if (!firstCue.id) firstCue.id = (typeof generateCueId === 'function' ? generateCueId() : `cue_${Date.now().toString(36)}`);
+      boundCueId = firstCue.id;
+      // Remove the additional overlapping cues from highest index down to
+      // avoid shifting the indices we still need to delete.
+      for (let i = overlapIndices.length - 1; i >= 1; i--){
+        list.splice(overlapIndices[i], 1);
+      }
+    }
+
+    // Bind the card to the new/updated cue.
+    card.kind = card.originalKind === 'clip' ? 'clip' : 'cue';
+    card.cueRefs = [boundCueId];
+    card.track = trackForWrite;
+    // If the card had no bound asset before, bind it to the asset we just
+    // aligned against — otherwise next session's reconciler can't find the
+    // cue (it would look in the wrong transcript).
+    if (!card.media_pool_key && targetKey){
+      card.media_pool_key = targetKey;
+    }
+    card.bodyManual = false;
+    card.body = '';
+    card.start = alignedStart;
+    card.end = alignedEnd;
+    card.source_in = alignedStart;
+    card.source_out = alignedEnd;
+    card.relinkPending = false;
+    card.relinkStatus = 'linked';
+
+    // Push the modified transcript into the per-asset state so it persists,
+    // then re-render everything.
+    try{ mediaPoolSaveCurrentTranscript?.(); }catch(_e){}
+    try{ renderTranscript?.(); }catch(_e){}
+    try{ if (isDualMode) renderTranscriptB?.(); }catch(_e){}
+    try{ scheduleStoryReconcile?.({ force:true, delay:50 }); }catch(_e){}
+    renderStoryAssembly();
+    storyCommitSharedState(true);
+    progressDone(true);
+    setStatusSafe?.(`Aligned at ${fmtTC(alignedStart, fps)} → ${fmtTC(alignedEnd, fps)} (Track ${trackForWrite}). ${overlapIndices.length > 1 ? `Collapsed ${overlapIndices.length} overlapping cues.` : overlapIndices.length === 1 ? 'Existing cue overwritten.' : 'New cue inserted.'}`);
+    return true;
+  }catch(err){
+    progressDone(false);
+    alert('Align-To-Audio failed: ' + (err?.message || err));
+    return false;
+  }
+}
+
 function storyEffectiveTrack(card){
   const wanted = normalizeStoryTrack(storyActiveSubTrack || subsMode || card?.track || 'A');
   const baseTrack = normalizeStoryTrack(card?.track || wanted || 'A');
@@ -6319,6 +6562,10 @@ function onStoryInput(ev){
     const { card } = storyFindCard(rowEl0?.dataset?.rowId, cardEl0?.dataset?.cardId);
     if (card && isStoryCardRemoteLocked(card.id)) return;
     storyHandleFocusForCollab(miniText);
+    // Cue card body edits mutate the underlying transcript cue — the card is
+    // a live view into the cue, and that's how cue cards have always behaved.
+    // (Scenario B / auto-convert-on-body-edit was removed; it caused too many
+    // conflicts in the editing logic.)
     storyUpdateCueFromMiniText(cueId, track, miniText.textContent || '');
     if (card){ card.bodyManual = false; card.body = ''; storyUpdateCardTimecodeDom(cardEl0, card); }
     sendCollabStoryCursor(rowEl0?.dataset?.rowId, cardEl0?.dataset?.cardId, cueId, 'mini');
@@ -6478,10 +6725,18 @@ function ensureStoryCardTimePopover(){
   document.addEventListener('click', ev => {
     if (!storyCardTimePopover.classList.contains('is-open')) return;
     if (storyCardTimePopover.contains(ev.target) || ev.target?.closest?.('.story-timecode')) return;
+    // The floating cue-range preview is logically part of the popover UI —
+    // clicks/drag releases inside it (including its drag handle) must not
+    // dismiss the popover. Without this, releasing a drag of the floater
+    // tears down the whole edit session.
+    if (__storyCueRangePreviewEl && __storyCueRangePreviewEl.contains(ev.target)) return;
     hideStoryCardTimePopover();
   });
   window.addEventListener('resize', hideStoryCardTimePopover);
-  window.addEventListener('scroll', hideStoryCardTimePopover, true);
+  // NOTE: a previous version dismissed the popover on every scroll, but that
+  // misfires when the floating preview's body scrolls (the user scrolling
+  // through cues). The popover doesn't actually need to dismiss on page
+  // scroll — it's position:fixed and stays visually anchored.
   return storyCardTimePopover;
 }
 function hideStoryCardTimePopover(){
@@ -6490,6 +6745,8 @@ function hideStoryCardTimePopover(){
   storyCardTimePopover.classList.remove('is-open');
   storyCardTimePopover.style.display = 'none';
   storyCardTimePopover.__ctx = null;
+  // The floating cue-preview modal is paired with the popover; hide it too.
+  try{ hideStoryCueRangePreviewFloater(); }catch(_e){}
 }
 function positionStoryCardTimePopover(anchor){
   if (!storyCardTimePopover || !anchor) return;
@@ -6503,9 +6760,35 @@ function positionStoryCardTimePopover(anchor){
 }
 function showStoryCardTimePopover(ev, rowId, cardId){
   const { row, card } = storyFindCard(rowId, cardId);
-  if (!row || !card || !storyCanEditCardTimecode(card)) return;
+  if (!row || !card) return;
   if (isStoryCardRemoteLocked(card.id)){ storyPreviewCardRange(card); return; }
+
+  // Captions and other non-editable kinds → just preview the range.
+  // Cue / clip / generic all use the SAME editable popover. For cue/clip
+  // cards the Apply button does a Re-link (refreshes cueRefs to whatever
+  // cues live in the new range, keeping the binding). The floating preview
+  // modal alongside the popover shows the user what those cues will be,
+  // updating live as they type.
+  const editable = (card.kind === 'cue' || card.kind === 'clip' || storyCanEditCardTimecode(card));
+  if (!editable){ storyPreviewCardRange(card); return; }
+  const isBoundCard = (card.kind === 'cue' || card.kind === 'clip');
+
   const pop = ensureStoryCardTimePopover();
+  // If the popover was previously rendered in read-only mode, its innerHTML
+  // no longer contains the editable inputs. Re-render the editable structure.
+  if (!pop.querySelector('#storyCardTcIn')){
+    pop.innerHTML = `
+      <div class="tc-pop-title">Edit Story Card timecode</div>
+      <label><span>In</span><input id="storyCardTcIn" type="text" placeholder="00:00:00:00"></label>
+      <label><span>Out</span><input id="storyCardTcOut" type="text" placeholder="00:00:00:00"></label>
+      <div class="txt-time-note">Updates this manual Story Card only. Transcript and alignment cues are not changed.</div>
+      <div class="txt-time-actions">
+        <button type="button" id="storyCardTcSeek">Seek</button>
+        <button type="button" id="storyCardTcCancel">Cancel</button>
+        <button type="button" class="primary" id="storyCardTcApply">Apply</button>
+      </div>
+    `;
+  }
   pop.__ctx = { rowId, cardId };
   sendStoryCardLock(rowId, cardId, 'timecode');
   sendCollabStoryCursor(rowId, cardId, '', 'timecode', { force:true });
@@ -6515,21 +6798,130 @@ function showStoryCardTimePopover(ev, rowId, cardId){
   const e = Number.isFinite(Number(card.end)) && Number(card.end) > s ? Number(card.end) : s + 5;
   const inInput = pop.querySelector('#storyCardTcIn');
   const outInput = pop.querySelector('#storyCardTcOut');
+  const applyBtn = pop.querySelector('#storyCardTcApply');
   if (inInput) inInput.value = fmtTC(s, f);
   if (outInput) outInput.value = fmtTC(e, f);
+  // Adjust the popover's note based on kind. For cue/clip cards Apply
+  // re-derives cueRefs from cues in the new range, so the floating preview
+  // beside the popover shows exactly what those cues are.
+  const note = pop.querySelector('.txt-time-note');
+  if (note){
+    if (isBoundCard){
+      note.textContent = 'Apply will re-link this card to whichever transcript cues fall within the new In / Out range (live preview shown beside).';
+    } else {
+      note.textContent = 'Updates this manual Story Card only. Transcript and alignment cues are not changed.';
+    }
+  }
   const locked = !!VIEW_ONLY_SESSION || isStoryCardRemoteLocked(card.id);
-  [inInput, outInput, pop.querySelector('#storyCardTcApply')].forEach(el => { if (el) el.disabled = locked; });
+  [inInput, outInput, applyBtn].forEach(el => { if (el) el.disabled = locked; });
   pop.querySelector('#storyCardTcSeek').onclick = () => seekMediaTo(Math.max(0, s) + 0.001, { play:false });
   pop.querySelector('#storyCardTcCancel').onclick = hideStoryCardTimePopover;
-  pop.querySelector('#storyCardTcApply').onclick = () => {
-    const live = pop.__ctx || { rowId, cardId };
-    const found = storyFindCard(live.rowId, live.cardId);
+
+  // Live-preview integration for cue/clip cards. Helper closures used both
+  // by the input handlers and the Apply commit so the resolution logic lives
+  // in one place.
+  let liveRefs = [];
+  let liveTrack = storyEffectiveTrack(card);
+  const resolveRangeRefs = (s2, e2) => {
+    // Resolve which cues overlap [s2, e2] against the card's source asset's
+    // transcript. Tries the card's active track first, falls back to the
+    // other track if no cues match — many sessions only have one track
+    // populated, and we don't want a track mismatch to block Apply.
+    const previousKey = __storyRelinkSourceKey;
+    __storyRelinkSourceKey = storySourceKeyForCard(card) || '';
+    try{
+      const t0 = storyEffectiveTrack(card);
+      let refs = storyCueRefsForRange(s2, e2, t0);
+      let track = t0;
+      if (!refs.length){
+        const other = t0 === 'B' ? 'A' : 'B';
+        const otherRefs = storyCueRefsForRange(s2, e2, other);
+        if (otherRefs.length){ refs = otherRefs; track = other; }
+      }
+      const cues = refs.map(id => storyCueById(id, track)).filter(Boolean);
+      return { refs, track, cues };
+    } finally { __storyRelinkSourceKey = previousKey; }
+  };
+  const refreshLivePreview = () => {
+    if (!isBoundCard) return;
+    const s2 = parseDisplayedTcToSeconds(inInput.value, f);
+    const e2 = parseDisplayedTcToSeconds(outInput.value, f);
+    if (s2 == null || e2 == null || e2 <= s2){
+      liveRefs = []; liveTrack = storyEffectiveTrack(card);
+      updateStoryCueRangePreviewFloater({ status:'invalid', track: liveTrack, cues:[], fps: f });
+      if (applyBtn) applyBtn.disabled = true;
+      return;
+    }
+    const r = resolveRangeRefs(s2, e2);
+    liveRefs = r.refs;
+    liveTrack = r.track;
+    updateStoryCueRangePreviewFloater({ status:'ok', track: liveTrack, cues: r.cues, fps: f });
+    if (applyBtn) applyBtn.disabled = locked || (liveRefs.length === 0);
+    // Tooltip on Apply tells the user what will happen when there are no cues
+    // — the disabled state alone can be confusing.
+    if (applyBtn){
+      applyBtn.title = liveRefs.length
+        ? `Re-link to ${liveRefs.length} cue${liveRefs.length === 1 ? '' : 's'} on Track ${liveTrack}.`
+        : 'No cues in this range. Adjust In / Out so at least one transcript cue overlaps.';
+    }
+  };
+  if (isBoundCard){
+    // Open the floating preview modal beside the popover and seed the live
+    // preview from the initial range. Must be called AFTER the popover is
+    // positioned and displayed below — the floater reads the popover's
+    // bounding rect to place itself, and an undisplayed element has a zero
+    // rect. (Hence the slightly-out-of-order looking sequence: position +
+    // show below, then come back here via setTimeout to open the floater.)
+    setTimeout(() => {
+      showStoryCueRangePreviewFloater(pop);
+      refreshLivePreview();
+    }, 0);
+    // Hook keystroke-level updates on both fields so the preview tracks the
+    // user as they type. The Apply button's enabled state is recomputed on
+    // each refresh.
+    ['input', 'change', 'blur'].forEach(evt => {
+      inInput?.addEventListener(evt, refreshLivePreview);
+      outInput?.addEventListener(evt, refreshLivePreview);
+    });
+  }
+
+  applyBtn.onclick = () => {
+    const liveCtx = pop.__ctx || { rowId, cardId };
+    const found = storyFindCard(liveCtx.rowId, liveCtx.cardId);
     const liveCard = found.card;
-    if (!liveCard || !storyCanEditCardTimecode(liveCard) || VIEW_ONLY_SESSION || isStoryCardRemoteLocked(liveCard.id)) return;
+    if (!liveCard || VIEW_ONLY_SESSION || isStoryCardRemoteLocked(liveCard.id)) return;
     const s2 = parseDisplayedTcToSeconds(inInput.value, f);
     const e2 = parseDisplayedTcToSeconds(outInput.value, f);
     if (s2 == null || e2 == null){ alert('Invalid timecode. Use HH:MM:SS:FF.'); return; }
     if (e2 <= s2){ alert('Out timecode must be after In timecode.'); return; }
+
+    if (liveCard.kind === 'cue' || liveCard.kind === 'clip'){
+      // Re-resolve refs at commit time (in case the user typed a new value
+      // and clicked Apply without blurring first). This is the same logic the
+      // preview ran on each keystroke.
+      const r = resolveRangeRefs(s2, e2);
+      if (!r.refs.length){
+        // Apply should already be disabled here; this is a defensive fallback.
+        alert('No transcript cues fall within the new range.\n\nAdjust In / Out so at least one cue overlaps.');
+        return;
+      }
+      liveCard.start = Math.max(0, s2);
+      liveCard.end = Math.max(liveCard.start + (1 / f), e2);
+      liveCard.kind = liveCard.originalKind === 'clip' ? 'clip' : 'cue';
+      liveCard.cueRefs = r.refs.slice();
+      liveCard.track = r.track;
+      liveCard.bodyManual = false;
+      liveCard.body = '';
+      liveCard.relinkPending = false;
+      liveCard.relinkStatus = 'linked';
+      hideStoryCardTimePopover();
+      renderStoryAssembly();
+      storyCommitSharedState(true);
+      seekMediaTo(Math.max(0, liveCard.start) + 0.001, { play:false });
+      setStatusSafe?.(`Card re-linked to ${r.refs.length} cue${r.refs.length === 1 ? '' : 's'} on Track ${r.track}.`);
+      return;
+    }
+    // Generic / caption commit directly.
     liveCard.start = Math.max(0, s2);
     liveCard.end = Math.max(liveCard.start + (1 / f), e2);
     hideStoryCardTimePopover();
@@ -6542,6 +6934,342 @@ function showStoryCardTimePopover(ev, rowId, cardId){
   pop.style.display = 'block';
   pop.classList.add('is-open');
   setTimeout(() => { try{ inInput?.focus({preventScroll:true}); inInput?.select(); }catch(_e){} }, 0);
+}
+
+/* ============================================================================
+   Floating draggable preview of cues in the proposed new range
+   ----------------------------------------------------------------------------
+   Used by the Edit Story Card timecode popover for cue/clip cards. Lives in
+   a separate floating element that sits beside the popover by default but
+   the user can drag it around to compare against the card body.
+   ============================================================================ */
+let __storyCueRangePreviewEl = null;
+let __storyCueRangePreviewDrag = null;
+
+function ensureStoryCueRangePreviewFloater(){
+  if (__storyCueRangePreviewEl && document.body.contains(__storyCueRangePreviewEl)) return __storyCueRangePreviewEl;
+  const el = document.createElement('div');
+  el.id = 'storyCueRangePreviewFloater';
+  el.className = 'story-cue-range-preview-floater';
+  el.style.display = 'none';
+  el.innerHTML = `
+    <div class="story-cue-range-preview-header" data-drag-handle="1">
+      <div class="story-cue-range-preview-title">Cues in new range</div>
+      <button type="button" class="story-cue-range-preview-close" title="Close preview">×</button>
+    </div>
+    <div class="story-cue-range-preview-body"></div>
+  `;
+  document.body.appendChild(el);
+  // Drag-to-move via the header handle.
+  const header = el.querySelector('.story-cue-range-preview-header');
+  header.addEventListener('mousedown', (mev) => {
+    if (mev.target.closest('.story-cue-range-preview-close')) return;
+    mev.preventDefault();
+    mev.stopPropagation();
+    const r = el.getBoundingClientRect();
+    __storyCueRangePreviewDrag = { ox: mev.clientX - r.left, oy: mev.clientY - r.top };
+    const onMove = (mm) => {
+      if (!__storyCueRangePreviewDrag) return;
+      const w = el.offsetWidth, h = el.offsetHeight;
+      const left = Math.max(8, Math.min(window.innerWidth - w - 8, mm.clientX - __storyCueRangePreviewDrag.ox));
+      const top  = Math.max(8, Math.min(window.innerHeight - h - 8, mm.clientY - __storyCueRangePreviewDrag.oy));
+      el.style.left = left + 'px';
+      el.style.top  = top + 'px';
+    };
+    const onUp = (uev) => {
+      __storyCueRangePreviewDrag = null;
+      // Eat the trailing click that the browser synthesizes from mouseup so
+      // it doesn't trigger any outside-click dismissers on its way through
+      // the document. The capture-phase listener catches it before bubbling.
+      const eatClick = (cev) => { cev.stopPropagation(); cev.preventDefault(); document.removeEventListener('click', eatClick, true); };
+      document.addEventListener('click', eatClick, true);
+      // In case no click is fired (rare), drop the listener on a microtask.
+      setTimeout(() => document.removeEventListener('click', eatClick, true), 0);
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+  el.querySelector('.story-cue-range-preview-close').addEventListener('click', hideStoryCueRangePreviewFloater);
+  __storyCueRangePreviewEl = el;
+  return el;
+}
+
+function showStoryCueRangePreviewFloater(anchorPopover){
+  const el = ensureStoryCueRangePreviewFloater();
+  el.style.display = 'flex';
+  // Reset to a sensible default size each time the floater opens. The user
+  // can resize freely from there via the bottom-right grip.
+  el.style.width  = '320px';
+  el.style.height = '320px';
+  // Position to the right of the popover by default; fall back to the left
+  // if there isn't room. The user can drag from there.
+  try{
+    const popRect = anchorPopover?.getBoundingClientRect?.();
+    const desiredW = 320;
+    const desiredH = 320;
+    // If the popover rect is empty (not yet positioned at call time), fall
+    // back to a viewport-relative anchor near the top-right. The caller
+    // should be scheduling this AFTER the popover is shown, but the
+    // defensive fallback keeps the floater visible regardless.
+    const haveRect = popRect && (popRect.width > 0 || popRect.height > 0);
+    let left = haveRect ? popRect.right + 12 : Math.max(8, window.innerWidth - desiredW - 24);
+    let top  = haveRect ? popRect.top : 80;
+    if (left + desiredW > window.innerWidth - 8){
+      left = haveRect ? Math.max(8, popRect.left - desiredW - 12) : 8;
+    }
+    if (top + desiredH > window.innerHeight - 8){
+      top = Math.max(8, window.innerHeight - desiredH - 8);
+    }
+    el.style.left = left + 'px';
+    el.style.top  = top + 'px';
+  }catch(_e){}
+}
+
+function hideStoryCueRangePreviewFloater(){
+  if (__storyCueRangePreviewEl) __storyCueRangePreviewEl.style.display = 'none';
+}
+
+function updateStoryCueRangePreviewFloater({ status, track, cues, fps }){
+  if (!__storyCueRangePreviewEl || __storyCueRangePreviewEl.style.display === 'none') return;
+  const title = __storyCueRangePreviewEl.querySelector('.story-cue-range-preview-title');
+  const body = __storyCueRangePreviewEl.querySelector('.story-cue-range-preview-body');
+  if (status === 'invalid'){
+    if (title) title.textContent = 'Cues in new range';
+    if (body) body.innerHTML = `<div class="story-cue-range-preview-empty">Enter a valid In / Out range to see cues.</div>`;
+    return;
+  }
+  if (!cues?.length){
+    if (title) title.textContent = `Cues in new range (Track ${track || 'A'})`;
+    if (body) body.innerHTML = `<div class="story-cue-range-preview-empty">No cues in this range. Adjust In / Out so at least one cue overlaps.</div>`;
+    return;
+  }
+  if (title) title.textContent = `Cues in new range (Track ${track || 'A'}) · ${cues.length}`;
+  if (body){
+    body.innerHTML = `<ol class="story-cue-range-preview-list">
+      ${cues.map(c => `<li><span class="story-cue-range-preview-tc">${escapeHtml(fmtTC(Number(c.start) || 0, fps))}</span><span class="story-cue-range-preview-text">${escapeHtml(String(c.text || '').slice(0, 400))}</span></li>`).join('')}
+    </ol>`;
+  }
+}
+
+// Confirmation modal that fires when the user clicks Apply in the timecode
+// editor on a cue/clip Story Card. Explains that the edit will convert the
+// card to Generic (because the cue binding can't survive a freely-chosen
+// range), and only commits on explicit confirmation. Cancel returns to the
+// edit popover so the user can adjust.
+// DEPRECATED — no longer called. The cue/clip timecode Apply flow now uses
+// the floating preview modal (updateStoryCueRangePreviewFloater) for live
+// feedback and a single Apply button that does the Re-link. This big overlay
+// is kept temporarily as dead code in case we want to revert quickly; safe
+// to remove in a future cleanup pass.
+function showCueTimecodeConversionConfirm(row, card, newStart, newEnd, fps){
+  // Lazily build the confirm overlay; reused across calls.
+  let overlay = document.getElementById('storyCardConvertConfirmOverlay');
+  if (!overlay){
+    overlay = document.createElement('div');
+    overlay.id = 'storyCardConvertConfirmOverlay';
+    overlay.className = 'story-convert-confirm-overlay';
+    overlay.style.display = 'none';
+    overlay.innerHTML = `
+      <div class="story-convert-confirm-card" role="dialog" aria-modal="true" aria-labelledby="storyConvertConfirmTitle">
+        <div class="story-convert-confirm-title" id="storyConvertConfirmTitle">Edit Cue Story Card timecode</div>
+        <div class="story-convert-confirm-body" id="storyConvertConfirmBody"></div>
+        <div class="story-convert-confirm-preview" id="storyConvertConfirmPreview"></div>
+        <div class="story-convert-confirm-actions">
+          <button type="button" class="story-convert-confirm-cancel" id="storyConvertConfirmCancel">Cancel</button>
+          <button type="button" class="story-convert-confirm-convert" id="storyConvertConfirmConvert">Apply &amp; Convert</button>
+          <button type="button" class="story-convert-confirm-ok primary" id="storyConvertConfirmRelink">Apply &amp; Re-link</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    overlay.addEventListener('click', (ev) => { if (ev.target === overlay) overlay.style.display = 'none'; });
+  }
+  const body = overlay.querySelector('#storyConvertConfirmBody');
+  const previewEl = overlay.querySelector('#storyConvertConfirmPreview');
+  const kindLabel = card.kind === 'clip' ? 'Clip' : 'Cue';
+  body.innerHTML = `
+    <p>This <b>${escapeHtml(kindLabel)} Story Card</b> is bound to ${(card.cueRefs || []).length} transcript cue${(card.cueRefs || []).length === 1 ? '' : 's'}.</p>
+    <p>You're editing it to a new range:</p>
+    <p class="story-convert-confirm-tc"><b>${escapeHtml(fmtTC(newStart, fps))}</b> → <b>${escapeHtml(fmtTC(newEnd, fps))}</b></p>
+    <p class="story-convert-confirm-options">Two ways to commit:</p>
+    <ul class="story-convert-confirm-bullets">
+      <li><b>Apply &amp; Re-link</b> — keep the cue binding, refresh cueRefs to whatever cues live in the new range. Body text recomputes from those cues.</li>
+      <li><b>Apply &amp; Convert</b> — convert to Generic with free-form unlinked timecodes. Body stays as the current cue snapshot for editorial control.</li>
+    </ul>
+  `;
+  // Preview pane: list cues that overlap the new range in the card's active
+  // track. Refreshes whenever the modal opens. (Live refresh on input would be
+  // nice but the modal isn't re-entrant from the popover today.)
+  const previewTrack = storyEffectiveTrack(card);
+  const previousKey = __storyRelinkSourceKey;
+  __storyRelinkSourceKey = storySourceKeyForCard(card) || '';
+  let previewRefs = [];
+  let previewCues = [];
+  try{
+    previewRefs = storyCueRefsForRange(newStart, newEnd, previewTrack);
+    previewCues = previewRefs.map(id => storyCueById(id, previewTrack)).filter(Boolean);
+    if (!previewCues.length){
+      // Try the other track in case the user has the wrong Sub toggled.
+      const otherTrack = previewTrack === 'B' ? 'A' : 'B';
+      const otherRefs = storyCueRefsForRange(newStart, newEnd, otherTrack);
+      const otherCues = otherRefs.map(id => storyCueById(id, otherTrack)).filter(Boolean);
+      if (otherCues.length){ previewRefs = otherRefs; previewCues = otherCues; }
+    }
+  } finally {
+    __storyRelinkSourceKey = previousKey;
+  }
+  const relinkBtn = overlay.querySelector('#storyConvertConfirmRelink');
+  if (previewCues.length){
+    previewEl.innerHTML = `
+      <div class="story-convert-confirm-preview-title">Cues in new range (Track ${previewTrack})</div>
+      <ol class="story-convert-confirm-preview-list">
+        ${previewCues.map(c => `<li><span class="story-convert-confirm-preview-tc">${escapeHtml(fmtTC(Number(c.start) || 0, fps))}</span> ${escapeHtml(String(c.text || '').slice(0, 200))}</li>`).join('')}
+      </ol>
+    `;
+    relinkBtn.disabled = false;
+    relinkBtn.title = `Bind this card to the ${previewCues.length} cue${previewCues.length === 1 ? '' : 's'} above.`;
+  } else {
+    previewEl.innerHTML = `<div class="story-convert-confirm-preview-empty">No cues in this range in either Sub A or Sub B. Apply &amp; Re-link is unavailable; Apply &amp; Convert is still available.</div>`;
+    relinkBtn.disabled = true;
+    relinkBtn.title = 'No cues in the new range to bind to.';
+  }
+  overlay.querySelector('#storyConvertConfirmCancel').onclick = () => { overlay.style.display = 'none'; };
+  // Shared commit helper — does the time write. Branch by `mode`.
+  const commitTimes = () => {
+    const found = storyFindCard(row.id, card.id);
+    const live = found.card;
+    if (!live) return null;
+    live.start = Math.max(0, newStart);
+    live.end = Math.max(live.start + (1 / fps), newEnd);
+    return { found, live };
+  };
+  overlay.querySelector('#storyConvertConfirmConvert').onclick = () => {
+    overlay.style.display = 'none';
+    const r = commitTimes();
+    if (!r) return;
+    const live = r.live;
+    if (live.kind === 'cue' || live.kind === 'clip'){
+      const previousRefs = Array.isArray(live.cueRefs) ? live.cueRefs.slice() : [];
+      const snapshotText = storyImportedCardSnapshotText(live) || storyPlainTextFromRichHtml(String(live.bodyHtml || '')) || String(live.body || '');
+      const snapshotHtml = String(live.bodyHtml || '').trim() || storyPlainTextToRichHtml(snapshotText);
+      live.originalKind = live.originalKind || live.kind || 'generic';
+      live.kind = 'generic';
+      live.cueRefs = [];
+      live.sourceCueRefs = previousRefs;
+      live.altCueRefs = { A:[], B:[] };
+      live.body = snapshotText;
+      live.bodyHtml = storySanitizeRichHtml(snapshotHtml);
+      live.bodyManual = true;
+      live.relinkPending = false;
+      live.relinkStatus = 'generic';
+    }
+    hideStoryCardTimePopover();
+    renderStoryAssembly();
+    storyCommitSharedState(true);
+    seekMediaTo(Math.max(0, live.start) + 0.001, { play:false });
+    setStatusSafe?.(`Card converted to Generic. ${(card.cueRefs || []).length} cue link${(card.cueRefs || []).length === 1 ? '' : 's'} remembered for re-link.`);
+  };
+  overlay.querySelector('#storyConvertConfirmRelink').onclick = () => {
+    if (relinkBtn.disabled) return;
+    overlay.style.display = 'none';
+    const r = commitTimes();
+    if (!r) return;
+    const live = r.live;
+    // Set cueRefs directly to the preview's resolved list; clear bodyManual
+    // and body so the live cues drive the rendered text again.
+    live.kind = live.originalKind === 'clip' ? 'clip' : 'cue';
+    live.cueRefs = previewRefs.slice();
+    live.track = previewTrack;
+    live.bodyManual = false;
+    live.body = '';
+    live.relinkPending = false;
+    live.relinkStatus = 'linked';
+    hideStoryCardTimePopover();
+    renderStoryAssembly();
+    storyCommitSharedState(true);
+    seekMediaTo(Math.max(0, live.start) + 0.001, { play:false });
+    setStatusSafe?.(`Card re-linked to ${previewRefs.length} cue${previewRefs.length === 1 ? '' : 's'} on Track ${previewTrack}.`);
+  };
+  overlay.style.display = 'flex';
+  // Focus the primary action so Enter commits Re-link by default (the more
+  // common path for editorial range adjustments).
+  setTimeout(() => {
+    try{
+      if (relinkBtn.disabled) overlay.querySelector('#storyConvertConfirmConvert').focus({preventScroll:true});
+      else relinkBtn.focus({preventScroll:true});
+    }catch(_e){}
+  }, 0);
+}
+
+// Read-only timecode popover for cue/clip cards. Cue cards are bound to live
+// transcript cues; their start/end is the union of those cues' ranges and
+// can't be freely edited without breaking the binding. The popover surfaces
+// the binding explicitly and offers a "Convert to Generic" escape valve for
+// users who want to take editorial control of the range. Drop 2 will replace
+// this with an editable + re-link flow.
+function showStoryCardTimePopoverReadOnly(ev, row, card){
+  // Reuse the same DOM element as the editable popover so we share position
+  // and dismiss machinery, but swap its inner HTML for the read-only view.
+  const pop = ensureStoryCardTimePopover();
+  pop.__ctx = { rowId: row.id, cardId: card.id };
+  const f = getFPS();
+  const s = Number.isFinite(Number(card.start)) ? Number(card.start) : 0;
+  const e = Number.isFinite(Number(card.end)) && Number(card.end) > s ? Number(card.end) : s + 5;
+  const refCount = (card.cueRefs || []).length;
+  const kindLabel = card.kind === 'clip' ? 'Clip' : 'Cue';
+  pop.innerHTML = `
+    <div class="tc-pop-title">${escapeHtml(kindLabel)} Story Card timecode</div>
+    <div class="story-tc-readonly-row"><span>In</span><b>${escapeHtml(fmtTC(s, f))}</b></div>
+    <div class="story-tc-readonly-row"><span>Out</span><b>${escapeHtml(fmtTC(e, f))}</b></div>
+    <div class="txt-time-note story-tc-readonly-note">
+      Bound to ${refCount} transcript cue${refCount === 1 ? '' : 's'}. The timecode is the union of those cues' ranges.<br>
+      To change the range while keeping the cue link, edit the underlying cues in Subtitle or Transcript mode.<br>
+      To take editorial control of this card (free-form range, manual text), convert it to a Generic card.
+    </div>
+    <div class="txt-time-actions">
+      <button type="button" id="storyCardTcSeek">Seek to In</button>
+      <button type="button" id="storyCardTcCancel">Cancel</button>
+      <button type="button" class="primary" id="storyCardTcConvert">Convert to Generic</button>
+    </div>
+  `;
+  pop.querySelector('#storyCardTcSeek').onclick = () => seekMediaTo(Math.max(0, s) + 0.001, { play:false });
+  pop.querySelector('#storyCardTcCancel').onclick = hideStoryCardTimePopover;
+  pop.querySelector('#storyCardTcConvert').onclick = () => {
+    const found = storyFindCard(row.id, card.id);
+    if (!found.card) return;
+    if (!confirm('Convert this card to Generic? The cue link will be remembered (so you can re-link later from the generic card), but the card will no longer auto-update when the underlying cues change.')) return;
+    // Use the existing primitive that handles kind transition + body snapshot
+    // preservation. storyMarkCardAsGenericAfterRelink clears cueRefs/sourceCueRefs,
+    // which is the "import couldn't link, give up" semantics — for our user-
+    // driven conversion we want to PRESERVE sourceCueRefs as the memory of
+    // what this card used to be bound to. So we do the transition manually.
+    const live = found.card;
+    const previousRefs = Array.isArray(live.cueRefs) ? live.cueRefs.slice() : [];
+    const snapshotText = storyImportedCardSnapshotText(live) || storyPlainTextFromRichHtml(String(live.bodyHtml || '')) || String(live.body || '');
+    const snapshotHtml = String(live.bodyHtml || '').trim() || storyPlainTextToRichHtml(snapshotText);
+    live.originalKind = live.originalKind || live.kind || 'generic';
+    live.kind = 'generic';
+    live.cueRefs = [];
+    // sourceCueRefs becomes the "remembered link" — Drop 2's "Link to Cues"
+    // button will use this to offer one-click re-binding.
+    live.sourceCueRefs = previousRefs;
+    live.altCueRefs = { A:[], B:[] };
+    live.body = snapshotText;
+    live.bodyHtml = storySanitizeRichHtml(snapshotHtml);
+    live.bodyManual = true;
+    live.relinkPending = false;
+    live.relinkStatus = 'generic';
+    hideStoryCardTimePopover();
+    renderStoryAssembly();
+    storyCommitSharedState(true);
+    setStatusSafe?.(`Card converted to Generic. ${previousRefs.length} cue link${previousRefs.length === 1 ? '' : 's'} remembered for re-link.`);
+  };
+  const anchor = ev?.target?.closest?.('.story-timecode') || ev?.target || ev?.currentTarget;
+  positionStoryCardTimePopover(anchor);
+  pop.style.display = 'block';
+  pop.classList.add('is-open');
 }
 
 function onStoryClick(ev){
@@ -6599,10 +7327,29 @@ function onStoryClick(ev){
   if (action === 'done-mini-transcript' && cardEl){ const card = row.cards.find(c => c.id === cardEl.dataset.cardId); if (card){ card.editMode = false; card.bodyManual = false; card.body = ''; try{ renderBySubsMode?.(); updateTxtBox?.(); }catch(_e){} renderStoryAssembly(); storyCommitSharedState(true); } return; }
   if (action === 'seek-mini-cue' || action === 'edit-mini-time') { const cueEl = ev.target.closest('.story-mini-cue'); const cue = storyCueById(cueEl?.dataset?.cueId, cueEl?.dataset?.track || 'A'); if (action === 'edit-mini-time') { const ctx = storyMiniFindContextFromNode(cueEl); if (ctx) showStoryMiniTimePopover(ev, ctx); } else if (cue) seekMediaTo(Math.max(0, Number(cue.start || 0)) + 0.001, { play:false }); return; }
   if (action === 'toggle-card-notes' && cardEl){ const card = row.cards.find(c => c.id === cardEl.dataset.cardId); if (card){ card.notesOpen = !card.notesOpen; renderStoryAssembly(); storyCommitSharedState(); } return; }
+  if (action === 'link-to-cues' && cardEl){
+    // Re-link a generic card to whatever cues currently overlap its time range
+    // in the active asset's transcript. Triggered by the fade-in chip after
+    // Scenario B's auto-convert, and by the right-click context menu.
+    const card = row.cards.find(c => c.id === cardEl.dataset.cardId);
+    if (card) storyLinkCardToCuesInRange(row, card);
+    return;
+  }
+  if (action === 'send-align' && cardEl){
+    // Scenario C: send this generic card's body text through Align-To-Audio
+    // for the active asset; insert/overwrite a transcript cue at the found
+    // timecode and bind the card.
+    const card = row.cards.find(c => c.id === cardEl.dataset.cardId);
+    if (card) storyAlignGenericCardToAudio(row, card);
+    return;
+  }
   if (action === 'seek-card' && cardEl){
     const card = row.cards.find(c => c.id === cardEl.dataset.cardId);
-    if (storyCanEditCardTimecode(card)) { storyActivateAssetForCard(card).finally(() => showStoryCardTimePopover(ev, row.id, card.id)); }
-    else storySeekLinkedCard(card, { preview:true });
+    // Left-click on the timecode now always previews the card's range, for
+    // every card kind. The popover (formerly opened by left-click on generic
+    // cards) is now bound to right-click via the onStoryContextMenu handler
+    // below, so the UX is consistent across cue / clip / generic / caption.
+    storySeekLinkedCard(card, { preview:true });
     return;
   }
 }
@@ -7243,7 +7990,7 @@ function ensureStoryContextMenu(){
   storyContextMenuEl = document.createElement('div');
   storyContextMenuEl.className = 'story-context-menu';
   storyContextMenuEl.style.display = 'none';
-  storyContextMenuEl.innerHTML = `<button type="button" data-story-context-action="remove-cue">Remove Cue From Card</button><button type="button" data-story-context-action="edit-transcript">Edit Transcript</button><button type="button" data-story-context-action="align-audio">Send For Align-To-Audio</button><button type="button" data-story-context-action="translate">Send For Translation</button><button type="button" data-story-context-action="ai">Send For AI Assistant</button>`;
+  storyContextMenuEl.innerHTML = `<button type="button" data-story-context-action="remove-cue">Remove Cue From Card</button><button type="button" data-story-context-action="edit-transcript">Edit Transcript</button><button type="button" data-story-context-action="align-audio">Send For Align-To-Audio</button><button type="button" data-story-context-action="translate">Send For Translation</button><button type="button" data-story-context-action="ai">Send For AI Assistant</button><div class="story-context-menu-separator"></div><button type="button" data-story-context-action="convert-generic" title="Detach this cue/clip card from its transcript cues. The current text snapshot becomes the editorial body; the cue link is remembered in sourceCueRefs.">Convert To Generic Card</button>`;
   document.body.appendChild(storyContextMenuEl);
   storyContextMenuEl.addEventListener('click', ev => {
     const act = ev.target?.dataset?.storyContextAction;
@@ -7286,6 +8033,10 @@ function ensureStoryContextMenu(){
       storySendCardForAIAssistant(target.rowId, target.cardId);
       return;
     }
+    if (act === 'convert-generic'){
+      storyConvertCardToGeneric(target.rowId, target.cardId);
+      return;
+    }
   });
   document.addEventListener('click', (ev) => {
     if (storyContextMenuEl && storyContextMenuEl.contains(ev.target)) return;
@@ -7296,6 +8047,46 @@ function ensureStoryContextMenu(){
   return storyContextMenuEl;
 }
 function hideStoryContextMenu(){ if (storyContextMenuEl) storyContextMenuEl.style.display = 'none'; storyContextCueTarget = null; }
+
+// User-driven conversion of a cue/clip card to generic. Reachable from the
+// right-click context menu's "Convert To Generic Card" item. The current
+// rendered cue text becomes the editorial body (with rich HTML preserved if
+// available), cueRefs move to sourceCueRefs as memory for "Link to Cues",
+// and bodyManual is set so the reconciler stops touching the body.
+function storyConvertCardToGeneric(rowId, cardId){
+  const { row, card } = storyFindCard(rowId, cardId);
+  if (!row || !card) return false;
+  if (VIEW_ONLY_SESSION || isStoryCardRemoteLocked(card.id)) return false;
+  if (card.kind !== 'cue' && card.kind !== 'clip'){
+    // Already generic / caption — nothing to do.
+    return false;
+  }
+  if (!confirm('Convert this card to Generic?\n\nThe cue link will be remembered (so you can re-link later from the generic card), but the card will no longer auto-update when the underlying cues change. You\'ll be able to edit the body freely.')) return false;
+
+  const previousRefs = Array.isArray(card.cueRefs) ? card.cueRefs.slice() : [];
+  // Capture the rendered text as the new editorial body. Prefer the rich-
+  // HTML snapshot (preserves bold/italic/links) when available; fall back
+  // to the plain text composed from the underlying cues.
+  const snapshotText = storyImportedCardSnapshotText(card)
+    || storyPlainTextFromRichHtml(String(card.bodyHtml || ''))
+    || String(card.body || '');
+  const snapshotHtml = String(card.bodyHtml || '').trim() || storyPlainTextToRichHtml(snapshotText);
+
+  card.originalKind = card.originalKind || card.kind || 'generic';
+  card.kind = 'generic';
+  card.cueRefs = [];
+  card.sourceCueRefs = previousRefs;
+  card.altCueRefs = { A:[], B:[] };
+  card.body = snapshotText;
+  card.bodyHtml = storySanitizeRichHtml(snapshotHtml);
+  card.bodyManual = true;
+  card.relinkPending = false;
+  card.relinkStatus = 'generic';
+  renderStoryAssembly();
+  storyCommitSharedState(true);
+  setStatusSafe?.(`Card converted to Generic. ${previousRefs.length} cue link${previousRefs.length === 1 ? '' : 's'} remembered (right-click → Link to Cues to restore).`);
+  return true;
+}
 
 function storyCardToPlainLines(card){
   if (!card) return '';
@@ -7837,6 +8628,23 @@ function onStoryKeydown(ev){
 }
 
 function onStoryContextMenu(ev){
+  // Right-click on a Story Card timecode button → open the Edit Timecode
+  // popover for every card kind (consistent UX across cue/clip/generic/
+  // caption). Cue/clip cards show a read-only modal with a "Convert to
+  // Generic" action; generic/caption cards get the full editable popover.
+  const timeBtn = ev.target?.closest?.('.story-timecode');
+  if (timeBtn){
+    const tCardEl = timeBtn.closest('.story-card');
+    const tRowEl = timeBtn.closest('.story-row');
+    if (tCardEl && tRowEl){
+      ev.preventDefault();
+      const tRow = getStoryRow(tRowEl.dataset.rowId);
+      const tCard = tRow?.cards?.find(c => c.id === tCardEl.dataset.cardId);
+      if (tCard) showStoryCardTimePopover(ev, tRow.id, tCard.id);
+    }
+    return;
+  }
+
   const miniText = ev.target?.closest?.('.story-mini-text');
   if (miniText){
     const ctx = storyMiniFindContextFromNode(miniText);
@@ -7846,10 +8654,23 @@ function onStoryContextMenu(ev){
   const textarea = ev.target?.closest?.('.story-card-body');
   const cardEl = ev.target?.closest?.('.story-card');
   const rowEl = ev.target?.closest?.('.story-row');
-  if (!textarea || !cardEl || !rowEl) return;
+  if (!cardEl || !rowEl) return;
   const row = getStoryRow(rowEl.dataset.rowId);
   const card = row?.cards?.find(c => c.id === cardEl.dataset.cardId);
-  if (!card || !(card.kind === 'cue' || card.kind === 'clip') || !(card.cueRefs || []).length) return;
+  if (!card) return;
+
+  // Generic-card right-click: surface the kind-transition actions in a small
+  // floating menu. "Link to Cues" derives cueRefs from the card's current
+  // time range; "Send for Align-To-Audio" submits the body text to the align
+  // pipeline and inserts/overwrites a cue at the found range.
+  if (card.kind === 'generic'){
+    ev.preventDefault();
+    showStoryGenericContextMenu(ev, row, card);
+    return;
+  }
+
+  if (!textarea) return;
+  if (!(card.kind === 'cue' || card.kind === 'clip') || !(card.cueRefs || []).length) return;
   window.__storyLastContextY = ev.clientY;
   const cueId = storyCueIdFromTextareaLine(textarea, card);
   if (!cueId) return;
@@ -7859,6 +8680,104 @@ function onStoryContextMenu(ev){
   menu.style.left = (ev.clientX + window.scrollX) + 'px';
   menu.style.top = (ev.clientY + window.scrollY) + 'px';
   menu.style.display = 'block';
+}
+
+// Floating right-click menu for generic Story Cards. Shows "Link to Cues" and
+// "Send for Align-To-Audio" — the two paths for moving a generic card back to
+// the bound state. Dismisses on outside-click or Esc.
+let __storyGenericContextMenuEl = null;
+function ensureStoryGenericContextMenu(){
+  if (__storyGenericContextMenuEl && document.body.contains(__storyGenericContextMenuEl)) return __storyGenericContextMenuEl;
+  const el = document.createElement('div');
+  el.id = 'storyGenericContextMenu';
+  el.className = 'story-generic-context-menu';
+  el.style.display = 'none';
+  document.body.appendChild(el);
+  document.addEventListener('mousedown', (ev) => {
+    if (!__storyGenericContextMenuEl || __storyGenericContextMenuEl.style.display === 'none') return;
+    if (!__storyGenericContextMenuEl.contains(ev.target)) __storyGenericContextMenuEl.style.display = 'none';
+  });
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && __storyGenericContextMenuEl && __storyGenericContextMenuEl.style.display !== 'none'){
+      __storyGenericContextMenuEl.style.display = 'none';
+    }
+  });
+  __storyGenericContextMenuEl = el;
+  return el;
+}
+function showStoryGenericContextMenu(ev, row, card){
+  // Pre-check what each action would do so we can disable + tooltip
+  // appropriately. The user shouldn't have to click something to find out it
+  // isn't valid right now.
+  let linkableCount = 0;
+  let linkableTrack = '';
+  try{
+    const previousKey = __storyRelinkSourceKey;
+    __storyRelinkSourceKey = storySourceKeyForCard(card) || '';
+    try{
+      const s = Number(card.start ?? 0);
+      const e = Number(card.end ?? 0);
+      if (Number.isFinite(s) && Number.isFinite(e) && e > s){
+        const t = normalizeStoryTrack(storyActiveSubTrack || subsMode || card.track || 'A');
+        let refs = storyCueRefsForRange(s, e, t);
+        let useTrack = t;
+        if (!refs.length){
+          const other = t === 'B' ? 'A' : 'B';
+          const otherRefs = storyCueRefsForRange(s, e, other);
+          if (otherRefs.length){ refs = otherRefs; useTrack = other; }
+        }
+        linkableCount = refs.length;
+        linkableTrack = useTrack;
+      }
+    } finally { __storyRelinkSourceKey = previousKey; }
+  }catch(_e){}
+
+  const bodyText = String(card.body || storyPlainTextFromRichHtml(String(card.bodyHtml || '')) || '').trim();
+  const hasBody = bodyText.length >= 2;
+  // Where will Scenario C send this card? If the card is bound to a Media
+  // Pool asset (media_pool_key set), use that asset. Otherwise fall back to
+  // whatever asset is currently active in the player. The check must mirror
+  // the runtime resolution done by storyAlignGenericCardToAudio.
+  const targetKey = card.media_pool_key || __mediaPoolCurrentKey || '';
+  const hasSourceCache = !!(targetKey && mtlCacheRefForKey?.(targetKey));
+
+  const menu = ensureStoryGenericContextMenu();
+  const rows = [
+    {
+      id: 'link-to-cues',
+      label: linkableCount ? `Link to Cues (${linkableCount} on Track ${linkableTrack})` : 'Link to Cues',
+      disabled: !linkableCount,
+      title: linkableCount
+        ? `Bind this card to ${linkableCount} cue${linkableCount === 1 ? '' : 's'} that overlap its current time range.`
+        : 'No cues overlap this card\'s time range. Adjust the timecode, or try Send for Align-To-Audio instead.',
+    },
+    {
+      id: 'send-align',
+      label: 'Send for Align-To-Audio',
+      disabled: !hasBody || !hasSourceCache,
+      title: !hasBody
+        ? 'The card body must contain text to align against the audio.'
+        : !hasSourceCache
+        ? 'The card\'s source asset is not cached on the server. Cache it first (Local / Drive / Iconik card → Cache button).'
+        : 'Align this card\'s body text against the source audio. The result will create or overwrite a transcript cue at the found timecode.',
+    },
+  ];
+  menu.innerHTML = rows.map(r => `<button type="button" data-story-generic-ctx="${r.id}"${r.disabled ? ' disabled' : ''} title="${escapeStoryAttr(r.title)}">${escapeHtml(r.label)}</button>`).join('');
+  menu.querySelectorAll('button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const action = btn.dataset.storyGenericCtx;
+      menu.style.display = 'none';
+      if (btn.disabled) return;
+      if (action === 'link-to-cues') storyLinkCardToCuesInRange(row, card);
+      else if (action === 'send-align') storyAlignGenericCardToAudio(row, card);
+    });
+  });
+  menu.style.display = 'block';
+  const r = menu.getBoundingClientRect();
+  const maxX = window.innerWidth - r.width - 8;
+  const maxY = window.innerHeight - r.height - 8;
+  menu.style.left = Math.min(maxX, Math.max(8, ev.clientX)) + 'px';
+  menu.style.top  = Math.min(maxY, Math.max(8, ev.clientY)) + 'px';
 }
 
 
@@ -10859,6 +11778,38 @@ async function ensureLocalAudioCache(){
   return src;
 }
 
+// Pre-warm a local Media Pool asset's cache from a card button, without
+// going through Transcribe/Align. Activates the asset briefly if it's not
+// already current (so ensureLocalAudioCache has a file to upload), runs the
+// cache job, stamps cache_id back onto the asset.
+async function startLocalCache(asset){
+  if (!asset) throw new Error('No asset.');
+  const key = String(asset.media_pool_key || '');
+  const file = (key && __mediaPoolLocalFiles?.get?.(key)) || asset.file || null;
+  if (!file){
+    throw new Error('This local file is no longer available in this browser session. Add it again, then cache it.');
+  }
+  // If this asset isn't the active one, briefly activate it so the existing
+  // ensureLocalAudioCache() path (which uploads the File from currentMediaSource)
+  // has the right bytes. After caching, leave currentMediaSource pointing at
+  // this asset — it's the natural "you just cached this" state.
+  const wasActive = (currentMediaSource?.mediaPoolKey === key);
+  if (!wasActive){
+    activateLocalMediaPoolAsset(asset);
+  }
+  try{
+    await ensureLocalAudioCache();
+    // rememberLocalCacheFromBackend already propagates cache_id onto the
+    // matching pool asset, so we just need a final UI refresh.
+    try{ renderMediaPoolTray?.(); }catch(_e){}
+    try{ renderMediaPoolProjectList?.(); }catch(_e){}
+    try{ renderNativeMediaPoolSource?.('local'); }catch(_e){}
+    setStatusSafe(`Local cached: ${asset.title || asset.name || 'Local video'}`);
+  } finally {
+    progressDone(false);
+  }
+}
+
 async function transcribeLocalCachedWithBackend(){
   const src = getCurrentLocalCachedSource();
   if (!src?.cacheId) return false;
@@ -11557,6 +12508,47 @@ function mediaPoolCaptureTranscriptForKey(key){
   mediaPoolPersistAssetStates();
   try{ mediaPoolPersistAssets(); }catch(_e){}
 }
+
+// Source Timeline clips live INSIDE each asset's state. The global
+// `timelineClips` array is a view: it holds the currently-active asset's
+// clips at runtime, and gets flushed back to the asset state whenever the
+// asset switches or persistence runs.
+function mediaPoolCaptureTimelineClipsForKey(key){
+  if (!key) return;
+  const prev = __mediaPoolAssetStates[key] || {};
+  // Snapshot whatever the current global timelineClips array holds. Use the
+  // clean-for-share path so the snapshot strips runtime-only fields like
+  // DOM references — same shape as the JSON export.
+  let snap = [];
+  try{
+    if (Array.isArray(timelineClips)) snap = timelineClips.map((c, ix) => cleanTimelineClipForShare(c, ix));
+  }catch(_e){ snap = []; }
+  __mediaPoolAssetStates[key] = { ...prev, timelineClips: snap };
+  mediaPoolPersistAssetStates();
+}
+function mediaPoolSaveCurrentTimelineClips(){
+  if (__mediaPoolApplyingTimelineClips || !__mediaPoolCurrentKey) return;
+  mediaPoolCaptureTimelineClipsForKey(__mediaPoolCurrentKey);
+}
+function mediaPoolRestoreAssetTimelineClips(asset){
+  const key = mediaPoolAssetKey(asset);
+  const st = __mediaPoolAssetStates[key] || {};
+  __mediaPoolApplyingTimelineClips = true;
+  try{
+    const list = Array.isArray(st.timelineClips) ? st.timelineClips : [];
+    // Replace global timelineClips wholesale so external references that hold
+    // onto the array see the new contents. Use splice rather than reassignment
+    // so any module-level let timelineClips bindings still work.
+    timelineClips.length = 0;
+    list.forEach(c => timelineClips.push({ ...c }));
+    try{ normalizeTimelineClips?.(); }catch(_e){}
+    try{ requestTimelineRender?.(); }catch(_e){}
+  }finally{
+    __mediaPoolApplyingTimelineClips = false;
+  }
+}
+let __mediaPoolApplyingTimelineClips = false;
+
 function mediaPoolSaveCurrentTranscript(){
   if (__mediaPoolApplyingTranscript || !__mediaPoolCurrentKey) return;
   mediaPoolCaptureTranscriptForKey(__mediaPoolCurrentKey);
@@ -11629,6 +12621,10 @@ function mediaPoolSerializableAsset(asset){
 }
 function mediaPoolExportProjectSnapshot(){
   try{ mediaPoolSaveCurrentTranscript?.(); }catch(_e){}
+  // Flush current Source Timeline clips into the active asset's state so the
+  // export snapshot reflects the latest in-memory edits. Without this, the
+  // snapshot would carry stale clips for whichever asset was last persisted.
+  try{ mediaPoolSaveCurrentTimelineClips?.(); }catch(_e){}
   const assets = (typeof getMediaPoolAssets === 'function' ? getMediaPoolAssets() : []).map(mediaPoolSerializableAsset).filter(Boolean);
   const states = {};
   try{
@@ -12040,6 +13036,11 @@ function mediaPoolAssetKey(asset){
 
 function mediaPoolRememberCurrentTime(){
   if (!__mediaPoolCurrentKey || !player) return;
+  // Multi-Timeline owns the playhead: don't pollute the asset's remembered
+  // resume position with what is really the project-timeline-driven seek.
+  // The user's last position in single-source modes (Subtitle / Transcript /
+  // Source Timeline / Story) is the right value to preserve here.
+  if (typeof isMultiTimelineMode !== 'undefined' && isMultiTimelineMode) return;
   try{
     const t = Number(player.currentTime || 0);
     if (Number.isFinite(t)) {
@@ -12051,8 +13052,13 @@ function mediaPoolRememberCurrentTime(){
 function mediaPoolSetCurrentAsset(asset){
   mediaPoolRememberCurrentTime();
   mediaPoolSaveCurrentTranscript();
+  // Save the outgoing asset's timeline clips before we swap. After the swap,
+  // restore the incoming asset's clips so Source Timeline Mode reflects the
+  // per-asset clips library.
+  mediaPoolSaveCurrentTimelineClips();
   __mediaPoolCurrentKey = mediaPoolAssetKey(asset);
   mediaPoolRestoreAssetTranscript(asset);
+  mediaPoolRestoreAssetTimelineClips(asset);
   try{ renderMediaPoolTray(); }catch(_e){}
   try{ renderMediaPoolProjectList(); }catch(_e){}
   try{ renderMediaPoolReviewPanel(asset); }catch(_e){}
@@ -12063,6 +13069,11 @@ function mediaPoolSetCurrentAsset(asset){
 }
 
 function mediaPoolRestoreAssetTime(asset){
+  // In Multi-Timeline mode the playhead position is the source of truth; the
+  // asset's remembered lastTime would compete with the timeline-driven seek
+  // and produce skipped playback. Skip the resume in that case — the Multi-
+  // Timeline asset switcher issues its own seek to clip.source_in + offset.
+  if (typeof isMultiTimelineMode !== 'undefined' && isMultiTimelineMode) return;
   const key = mediaPoolAssetKey(asset);
   const t = Number(__mediaPoolAssetStates[key]?.lastTime || 0);
   if (Number.isFinite(t) && t > 0 && player){
@@ -12080,6 +13091,9 @@ function mediaPoolRestoreAssetTime(asset){
 try{
   player?.addEventListener('timeupdate', () => {
     if (!__mediaPoolCurrentKey) return;
+    // Same guard as mediaPoolRememberCurrentTime() — Multi-Timeline's playhead
+    // shouldn't bleed into per-asset resume positions.
+    if (typeof isMultiTimelineMode !== 'undefined' && isMultiTimelineMode) return;
     const t = Number(player.currentTime || 0);
     if (Number.isFinite(t)) __mediaPoolAssetStates[__mediaPoolCurrentKey] = { ...(__mediaPoolAssetStates[__mediaPoolCurrentKey] || {}), lastTime:t };
   });
@@ -12893,19 +13907,24 @@ function renderLocalMediaPoolResults(localAssets){
       <div class="iconik-card-meta"><span>Local</span>${size ? `<span>${escapeHtml(size)}</span>` : ''}<span>Session-only</span><span class="mp-cache-pill ${isCached ? 'is-cached' : 'is-uncached'}">${isCached ? '● Cached' : '○ Not cached'}</span></div>
       <div class="iconik-card-actions iconik-card-actions-wrap">
         <button class="btn btn-gold" type="button" data-local-action="preview">Preview</button>
+        <button class="btn btn-outline" type="button" data-local-action="cache" title="Pre-cache the source media on the server (required for Transcribe / Multi-Timeline render)">${isCached ? 'Re-cache' : 'Cache'}</button>
         <button class="btn btn-outline" type="button" data-local-action="remove">Remove</button>
       </div>
     </div>`;
   }).join('');
   bindLocalHoverScrubbers(host, localAssets);
   host.querySelectorAll('[data-local-action]').forEach(btn => {
-    btn.addEventListener('click', ev => {
+    btn.addEventListener('click', async ev => {
       const card = ev.currentTarget.closest('[data-local-pool-index]');
       const localList = getMediaPoolAssets().filter(a => (a.source_type || a.sourceType) === 'local');
       const asset = localList[Number(card?.dataset?.localPoolIndex || -1)];
       if (!asset) return;
       const action = ev.currentTarget.dataset.localAction;
       if (action === 'preview') activateLocalMediaPoolAsset(asset);
+      if (action === 'cache'){
+        try{ await startLocalCache(asset); }
+        catch(err){ alert('Local cache failed: ' + (err?.message || err)); }
+      }
       if (action === 'remove'){
         const key = asset.media_pool_key;
         __mediaPoolAssets = __mediaPoolAssets.filter(a => a.media_pool_key !== key);
@@ -15125,8 +16144,17 @@ function applySharedSessionState(state, opts={}){
   initialEntriesB = entriesB.map((e) => ({ start:e.start, end:e.end, text:e.text }));
 
   if (Array.isArray(st.timeline_clips)){
+    // Legacy shape: flat top-level timeline_clips array (sessions saved
+    // before clips were scoped per-asset). Migrate by moving the array into
+    // whichever asset is currently active (the one those clips were
+    // implicitly cut from). If no asset is active, clips load into the
+    // global view but won't persist into any asset state until the user
+    // activates one — at which point the per-asset save path kicks in.
     timelineClips = st.timeline_clips.map((c, idx) => cleanTimelineClipForShare(c, idx));
     normalizeTimelineClips();
+    if (__mediaPoolCurrentKey){
+      try{ mediaPoolSaveCurrentTimelineClips?.(); }catch(_e){}
+    }
     if (!timelineClips.some(c => c.id === timelineSelectedClipId)) timelineSelectedClipId = '';
     if (isTimelineMode) requestTimelineRender();
   }
@@ -16351,6 +17379,10 @@ function timelineWsSend(payload){
   }catch(_e){ return false; }
 }
 function timelineCommitSharedState(force=false){
+  // Persist the current timeline clips into the active asset's state, so the
+  // per-asset clips library survives mode/asset switches and page reloads.
+  // Guarded so we don't recursively save during a restore.
+  try{ mediaPoolSaveCurrentTimelineClips?.(); }catch(_e){}
   if (!COLLAB_SESSION_ID || VIEW_ONLY_SESSION || COLLAB_APPLYING) return;
   if (COLLAB_TIMELINE_STATE_TIMER) clearTimeout(COLLAB_TIMELINE_STATE_TIMER);
   COLLAB_TIMELINE_STATE_TIMER = setTimeout(() => {
@@ -16754,10 +17786,41 @@ function renderTimelineMode(){
   renderTimelineClips(clipsHost);
   renderTimelineCollabAwareness();
   updateTimelinePlayhead((typeof getMediaCurrentTime === 'function') ? getMediaCurrentTime() : 0);
+  renderSourceTimelineEmptyBanner(el);
   const enabledClips = getTimelineExportClips();
   const total = enabledClips.reduce((sum, c) => sum + Math.max(0, c.end - c.start), 0);
   if (status) status.textContent = timelineClips.length ? `${enabledClips.length}/${timelineClips.length} clip(s) checked · final duration ${fmtTimelineTime(total)} · zoom ${Math.round(timelinePxPerSec)} px/s · ${Math.max(1, Math.round(timelinePxPerSec / getFPS()))} px/frame` : 'No clips yet. Drag on the timeline to create a selection, or snap to the current cue.';
   renderTimelineClipList();
+}
+
+// Source Timeline Mode now scopes clips per asset. When no asset is active,
+// the clip library has nothing to display and editing is disabled. The banner
+// makes the state explicit so the user isn't confused by an empty timeline.
+function renderSourceTimelineEmptyBanner(el){
+  if (!el) return;
+  const hasAsset = !!(__mediaPoolCurrentKey);
+  let banner = el.querySelector('#tlNoAssetBanner');
+  if (hasAsset){
+    if (banner) banner.remove();
+    el.classList.remove('tl-no-asset');
+    return;
+  }
+  el.classList.add('tl-no-asset');
+  if (!banner){
+    banner = document.createElement('div');
+    banner.id = 'tlNoAssetBanner';
+    banner.className = 'tl-no-asset-banner';
+    banner.innerHTML = `
+      <div class="tl-no-asset-title">No Active Asset Found</div>
+      <div class="tl-no-asset-body">
+        Select a Media Pool asset to load its Source Timeline clips.
+        Each asset has its own independent clips library.
+      </div>
+    `;
+    // Mount inside the timeline body so it sits over the empty ruler/lanes.
+    const body = el.querySelector('#tlBody') || el.querySelector('.tl-body') || el;
+    body.appendChild(banner);
+  }
 }
 function timelineCurrentMediaPoolAsset(){
   try{
@@ -17123,6 +18186,12 @@ function onTimelineClipPointerDown(ev){
   window.addEventListener('pointerup', up, { once:true });
 }
 function addTimelineClipFromSelection(){
+  // Clips are scoped to the active Media Pool asset. Without an asset, a new
+  // clip would have nowhere to be stored.
+  if (!__mediaPoolCurrentKey){
+    alert('No Active Asset Found.\n\nSelect a Media Pool asset before creating a clip — clips are stored per asset.');
+    return;
+  }
   if (!timelineSelection) createDefaultTimelineSelection();
   const a = Math.min(timelineSelection.start, timelineSelection.end);
   const b = Math.max(timelineSelection.start, timelineSelection.end);
@@ -18286,6 +19355,10 @@ function cleanMultiTimelineClipForShare(c){
     // Story Mode breadcrumbs (preserved through Story → Multi export).
     storyRowId: String(c.storyRowId || ''),
     storyCardId: String(c.storyCardId || ''),
+    // Linked clip group: clips with the same linkGroupId move/trim/razor/
+    // delete together. Empty string = unlinked. Set on the V+A pair created
+    // by drop or bulk export so they behave as one unit in the timeline.
+    linkGroupId: String(c.linkGroupId || ''),
     // Stack handling for paired captions (Lower Third + Title pair, etc.).
     stack_id: String(c.stack_id || ''),
     stack_role: String(c.stack_role || ''),
@@ -18340,7 +19413,51 @@ function normalizeMultiTimelineDocument(rawDoc){
   if (!cleaned.tracks.length) cleaned.tracks = createEmptyMultiTimelineDocument().tracks;
   // Recompute duration from clip extents so it stays correct after edits.
   cleaned.duration = cleaned.clips.reduce((d, c) => Math.max(d, Number(c.project_out || 0) || 0), 0);
+  // One-time link-group migration: any pre-existing V/A pair (same storyCardId,
+  // same project_in/out, different track kinds, both lacking a linkGroupId)
+  // gets stamped with a shared linkGroupId so the editor sees them as a unit.
+  // Idempotent: clips that already have a linkGroupId or no V/A partner are
+  // left untouched.
+  try{ migrateMultiTimelineLinkGroups(cleaned); }catch(_e){}
   return cleaned;
+}
+
+// Group V+A clips that share storyCardId and project range but no linkGroupId.
+// Runs on every load and every collab apply; cheap because the loop is O(N²)
+// only over unlinked clips, and the first pass tags them all so subsequent
+// passes are O(N) (every clip is already grouped).
+function migrateMultiTimelineLinkGroups(doc){
+  if (!doc || !Array.isArray(doc.clips)) return 0;
+  const tracks = doc.tracks || [];
+  const trackKind = (id) => (tracks.find(t => t.id === id)?.kind) || '';
+  const candidates = doc.clips.filter(c => !c.linkGroupId && c.storyCardId);
+  if (!candidates.length) return 0;
+  // Build a tolerant matcher: same storyCardId AND project ranges that match
+  // to within a frame (≈40 ms). Don't require exact float equality — older
+  // exports may have drifted after a snap pass.
+  const eps = 0.05;
+  let migrated = 0;
+  const used = new Set();
+  candidates.forEach(c => {
+    if (used.has(c.id)) return;
+    const kind = trackKind(c.trackId);
+    if (kind !== 'video' && kind !== 'audio') return;
+    const partnerKind = (kind === 'video') ? 'audio' : 'video';
+    const partner = candidates.find(p => p.id !== c.id
+      && !used.has(p.id)
+      && p.storyCardId === c.storyCardId
+      && trackKind(p.trackId) === partnerKind
+      && Math.abs(Number(p.project_in) - Number(c.project_in)) <= eps
+      && Math.abs(Number(p.project_out) - Number(c.project_out)) <= eps);
+    if (!partner) return;
+    const gid = makeMultiTimelineId('grp');
+    c.linkGroupId = gid;
+    partner.linkGroupId = gid;
+    used.add(c.id);
+    used.add(partner.id);
+    migrated += 2;
+  });
+  return migrated;
 }
 
 function applyMultiTimelineDocument(rawDoc, opts={}){
@@ -18908,15 +20025,21 @@ function exportStoryToMultiTimeline(){
       const dur = Math.max(0.04, vClip.project_out - vClip.project_in);
       vClip.project_in = projectCursor;
       vClip.project_out = projectCursor + dur;
-      multiTimelineCommitClip(vClip, { snap:false });
-
       // Sibling A1 audio at the same project position with the same source range.
       // The editor decides later whether to keep, mute, or detach.
       const aClip = multiTimelineBuildClipFromCard(card, { trackId: a1.id, kind:'audio', rowIndex, cardIndex });
+      // Stamp a shared linkGroupId on the V+A pair so they behave as one unit
+      // for selection / drag / trim / razor / delete. Computed BEFORE the
+      // commits so both clips carry the same id.
+      const groupId = aClip ? makeMultiTimelineId('grp') : '';
+      if (groupId){ vClip.linkGroupId = groupId; }
+      multiTimelineCommitClip(vClip, { snap:false });
+
       if (aClip){
         aClip.project_in = projectCursor;
         aClip.project_out = projectCursor + dur;
         aClip.label = vClip.label.replace(/^Story\s+/, 'Story · A · ');
+        aClip.linkGroupId = groupId;
         multiTimelineCommitClip(aClip, { snap:false });
       }
 
@@ -19074,6 +20197,12 @@ function multiTimelineDropCardOnTrack(card, track, projectIn){
           Number(c.project_in) < aClip.project_out &&
           Number(c.project_out) > aClip.project_in);
         if (!overlap){
+          // Link the V and A siblings into a single edit group — selection,
+          // drag, trim, razor and delete will operate on them together until
+          // the user explicitly Detaches Audio from the right-click menu.
+          const groupId = makeMultiTimelineId('grp');
+          clip.linkGroupId = groupId;
+          aClip.linkGroupId = groupId;
           multiTimelineCommitClip(aClip, { snap:false });
         } else {
           const status = multiTimelineModeEl?.querySelector('#mtlStatus');
@@ -19301,11 +20430,59 @@ function mtlSelectionList(){
   return (doc.clips || []).filter(c => ids.has(c.id));
 }
 function mtlClearSelection(){ __mtlSelected.clear(); requestMultiTimelineRender(); }
+// Group helpers for linked V+A clips (and any future linked group). A clip
+// with linkGroupId === '' is a singleton; any non-empty linkGroupId means
+// "this clip is part of a group, treat all members as a single edit unit."
+function mtlGroupMembersForId(clipId){
+  // Returns the array of clip records that share this clip's linkGroupId.
+  // If the clip is unlinked, returns just the clip itself.
+  const doc = ensureMultiTimelineDocument();
+  const clip = (doc.clips || []).find(c => c.id === clipId);
+  if (!clip) return [];
+  const gid = String(clip.linkGroupId || '');
+  if (!gid) return [clip];
+  return (doc.clips || []).filter(c => String(c.linkGroupId || '') === gid);
+}
+
+function mtlExpandSelectionToGroups(idsLike){
+  // Given a list/set of clip ids, return the expanded set including every
+  // sibling in each clip's group. Used everywhere an operation needs to
+  // honor link sync: if you selected one clip, you actually selected its
+  // group.
+  const doc = ensureMultiTimelineDocument();
+  const seedIds = (idsLike instanceof Set) ? new Set(idsLike) : new Set(idsLike || []);
+  const groups = new Set();
+  const out = new Set();
+  (doc.clips || []).forEach(c => {
+    if (!seedIds.has(c.id)) return;
+    out.add(c.id);
+    const gid = String(c.linkGroupId || '');
+    if (gid) groups.add(gid);
+  });
+  if (groups.size){
+    (doc.clips || []).forEach(c => {
+      if (groups.has(String(c.linkGroupId || ''))) out.add(c.id);
+    });
+  }
+  return out;
+}
+
 function mtlSelectClipId(id, opts={}){
   if (!id) return;
-  if (opts.additive){ if (__mtlSelected.has(id)) __mtlSelected.delete(id); else __mtlSelected.add(id); }
-  else { __mtlSelected.clear(); __mtlSelected.add(id); }
-  __multiTimelineSelectedClipId = [...__mtlSelected].slice(-1)[0] || '';
+  // Clicking any clip in a group selects every member of the group.
+  const members = mtlGroupMembersForId(id);
+  const memberIds = members.map(m => m.id);
+  if (opts.additive){
+    // Cmd/Ctrl/Shift-click: toggle the group as a unit. If any member is
+    // already in the selection, removing the whole group; otherwise adding.
+    const anySelected = memberIds.some(mid => __mtlSelected.has(mid));
+    if (anySelected) memberIds.forEach(mid => __mtlSelected.delete(mid));
+    else memberIds.forEach(mid => __mtlSelected.add(mid));
+  } else {
+    __mtlSelected.clear();
+    memberIds.forEach(mid => __mtlSelected.add(mid));
+  }
+  __multiTimelineSelectedClipId = id;
   requestMultiTimelineRender();
 }
 
@@ -19495,6 +20672,11 @@ function mtlDeleteSelected({ ripple=false }={}){
   const doc = ensureMultiTimelineDocument();
   if (!__mtlSelected.size) return;
   mtlSnapshotForUndo('delete');
+  // Expand selection to include all linked-group members so V+A pairs (and
+  // any other linked group) always delete together. Clicking V1 selects V1+A1
+  // already in mtlSelectClipId, but selection can also be built up via Cmd+A,
+  // marquee drag, or scripted paths — expand here defensively.
+  __mtlSelected = mtlExpandSelectionToGroups(__mtlSelected);
   if (ripple){
     // Group deletions by track so we close gaps within a track only.
     const byTrack = new Map();
@@ -19532,10 +20714,20 @@ function mtlRazorAtPlayhead(){
   const t = multiTimelinePlayhead;
   // If anything is selected, razor only those; else razor every clip the
   // playhead crosses (Avid behavior).
-  const candidates = __mtlSelected.size ? mtlSelectionList()
+  let candidates = __mtlSelected.size ? mtlSelectionList()
     : (doc.clips || []).filter(c => Number(c.project_in) < t && Number(c.project_out) > t);
   if (!candidates.length) return;
+  // Expand to whole linked groups: razoring a V1 clip must also cut its
+  // A1 sibling at the playhead, even if A1 isn't currently selected and the
+  // playhead happens not to lie inside A1 (shouldn't normally happen because
+  // linked clips share a range, but the guard keeps the semantics clean).
+  const expandedIds = mtlExpandSelectionToGroups(new Set(candidates.map(c => c.id)));
+  candidates = (doc.clips || []).filter(c => expandedIds.has(c.id));
   mtlSnapshotForUndo('razor');
+  // Map of original linkGroupId → new linkGroupId for the right-hand pieces.
+  // Built lazily as we encounter linked clips so each original group spawns
+  // exactly one new group id for its right-hand survivors.
+  const rightGroupForOriginal = new Map();
   candidates.forEach(c => {
     if (Number(c.project_in) >= t || Number(c.project_out) <= t) return; // playhead not strictly inside
     const sourceCutT = mtlSourceTimeForProjectTime(c, t);
@@ -19543,6 +20735,18 @@ function mtlRazorAtPlayhead(){
     right.id = makeMultiTimelineId('clip');
     right.project_in = multiTimelineSnapToFrame(t);
     right.source_in = multiTimelineSnapToFrame(sourceCutT);
+    // If this clip is in a linked group, the right piece joins a NEW group
+    // shared by all right pieces from that original group. Left pieces
+    // (the original clip records, just trimmed shorter) keep the old group
+    // id. So a V+A pair razored at the playhead produces two pairs, each
+    // independently linked.
+    const originalGroup = String(c.linkGroupId || '');
+    if (originalGroup){
+      if (!rightGroupForOriginal.has(originalGroup)){
+        rightGroupForOriginal.set(originalGroup, makeMultiTimelineId('grp'));
+      }
+      right.linkGroupId = rightGroupForOriginal.get(originalGroup);
+    }
     c.project_out = multiTimelineSnapToFrame(t);
     c.source_out = multiTimelineSnapToFrame(sourceCutT);
     doc.clips.push(right);
@@ -19568,41 +20772,76 @@ function mtlBeginClipDrag(ev, clip, mode){
   let snapshotTaken = false;
   const ensureSnap = () => { if (!snapshotTaken){ mtlSnapshotForUndo(mode); snapshotTaken = true; } };
 
+  // For slide and trim, propagate to every linked-group member. Capture each
+  // member's start state so deltas can be applied consistently regardless of
+  // mouse movement. Slip is intentionally NOT propagated: slip only adjusts
+  // the source-time range, which is per-clip by definition (each member of a
+  // V+A pair has its own source — V holds video, A holds audio — even when
+  // pointed at the same media file).
+  const propagates = (mode === 'slide' || mode === 'trim-left' || mode === 'trim-right');
+  const groupMembers = propagates ? mtlGroupMembersForId(clip.id) : [clip];
+  const memberStartState = new Map();
+  groupMembers.forEach(m => memberStartState.set(m.id, {
+    project_in: Number(m.project_in),
+    project_out: Number(m.project_out),
+    source_in: Number(m.source_in),
+    source_out: Number(m.source_out),
+  }));
+  // Exclude every group member from snapping so they don't snap to each other.
+  const snapExcludeIds = new Set(groupMembers.map(m => m.id));
+
   const onMove = (mev) => {
     const dxPx = mev.clientX - startX;
     const dxSec = dxPx / Math.max(0.1, multiTimelinePxPerSec);
 
     if (mode === 'slide'){
       ensureSnap();
-      const targetIn = mtlMaybeSnap(startProjectIn + dxSec, new Set([clip.id]));
+      const targetIn = mtlMaybeSnap(startProjectIn + dxSec, snapExcludeIds);
       const delta = targetIn - startProjectIn;
-      clip.project_in  = multiTimelineSnapToFrame(targetIn);
-      clip.project_out = multiTimelineSnapToFrame(startProjectOut + delta);
+      // Apply the same delta to every group member so the pair stays sync'd.
+      groupMembers.forEach(m => {
+        const ss = memberStartState.get(m.id);
+        m.project_in  = multiTimelineSnapToFrame(ss.project_in + delta);
+        m.project_out = multiTimelineSnapToFrame(ss.project_out + delta);
+      });
     } else if (mode === 'slip'){
       ensureSnap();
-      // Source range slides inside the clip; project range is fixed.
+      // Source range slides inside the clip; project range is fixed. Per-clip
+      // (the V and A members of a pair slip independently because slip is a
+      // source-only operation by definition).
       const newSourceIn = Math.max(0, startSourceIn - dxSec);
       const newSourceOut = newSourceIn + (startSourceOut - startSourceIn);
       clip.source_in  = multiTimelineSnapToFrame(newSourceIn);
       clip.source_out = multiTimelineSnapToFrame(newSourceOut);
     } else if (mode === 'trim-left'){
       ensureSnap();
-      const targetIn = mtlMaybeSnap(startProjectIn + dxSec, new Set([clip.id]));
+      const targetIn = mtlMaybeSnap(startProjectIn + dxSec, snapExcludeIds);
       // Don't pass the right edge or go below zero source.
       const minIn = Math.max(0, startProjectIn - startSourceIn);
       const maxIn = startProjectOut - 0.04;
       const projectIn = Math.max(minIn, Math.min(maxIn, targetIn));
-      const sourceIn = startSourceIn + (projectIn - startProjectIn);
-      clip.project_in = multiTimelineSnapToFrame(projectIn);
-      clip.source_in  = multiTimelineSnapToFrame(sourceIn);
+      const delta = projectIn - startProjectIn;
+      // Apply the trim delta to every group member.
+      groupMembers.forEach(m => {
+        const ss = memberStartState.get(m.id);
+        const newProjectIn = ss.project_in + delta;
+        const newSourceIn = ss.source_in + delta;
+        m.project_in = multiTimelineSnapToFrame(newProjectIn);
+        m.source_in  = multiTimelineSnapToFrame(newSourceIn);
+      });
     } else if (mode === 'trim-right'){
       ensureSnap();
-      const targetOut = mtlMaybeSnap(startProjectOut + dxSec, new Set([clip.id]));
+      const targetOut = mtlMaybeSnap(startProjectOut + dxSec, snapExcludeIds);
       const minOut = startProjectIn + 0.04;
       const projectOut = Math.max(minOut, targetOut);
-      const sourceOut = startSourceOut + (projectOut - startProjectOut);
-      clip.project_out = multiTimelineSnapToFrame(projectOut);
-      clip.source_out  = multiTimelineSnapToFrame(sourceOut);
+      const delta = projectOut - startProjectOut;
+      groupMembers.forEach(m => {
+        const ss = memberStartState.get(m.id);
+        const newProjectOut = ss.project_out + delta;
+        const newSourceOut = ss.source_out + delta;
+        m.project_out = multiTimelineSnapToFrame(newProjectOut);
+        m.source_out  = multiTimelineSnapToFrame(newSourceOut);
+      });
     }
     requestMultiTimelineRender();
   };
@@ -19613,8 +20852,13 @@ function mtlBeginClipDrag(ev, clip, mode){
     // Resolve overlap conflicts after slide/trim by clamping rather than rolling
     // back: a slide that lands on top of another clip is corrected to butt
     // against it. Source operations (slip) don't change layout so they skip.
-    if (snapshotTaken && (mode === 'slide' || mode === 'trim-left' || mode === 'trim-right')){
-      mtlResolveTrackOverlap(clip, { startProjectIn, startProjectOut });
+    if (snapshotTaken && propagates){
+      // Resolve overlap for each group member independently — each member
+      // is on its own track, so neighbor sets don't overlap between them.
+      groupMembers.forEach(m => {
+        const ss = memberStartState.get(m.id);
+        mtlResolveTrackOverlap(m, { startProjectIn: ss.project_in, startProjectOut: ss.project_out });
+      });
     }
     multiTimelineRecomputeDuration();
     requestMultiTimelineRender();
@@ -19683,6 +20927,130 @@ function mtlAttachClipInteractions(block, clip){
     ev.stopPropagation();
     mtlSeekToProjectTime(Number(clip.project_in));
   });
+  block.addEventListener('contextmenu', (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    mtlShowClipContextMenu(ev, clip);
+  });
+}
+
+/* ----- Clip context menu (right-click on a clip block) ------------------- */
+
+let __mtlClipContextMenuEl = null;
+
+function ensureClipContextMenu(){
+  if (__mtlClipContextMenuEl && document.body.contains(__mtlClipContextMenuEl)) return __mtlClipContextMenuEl;
+  const el = document.createElement('div');
+  el.id = 'mtlClipContextMenu';
+  el.className = 'mtl-clip-context-menu';
+  el.style.display = 'none';
+  document.body.appendChild(el);
+  // Dismiss when clicking anywhere outside the menu.
+  document.addEventListener('mousedown', (ev) => {
+    if (!__mtlClipContextMenuEl || __mtlClipContextMenuEl.style.display === 'none') return;
+    if (!__mtlClipContextMenuEl.contains(ev.target)) hideClipContextMenu();
+  });
+  __mtlClipContextMenuEl = el;
+  return el;
+}
+
+function hideClipContextMenu(){
+  if (__mtlClipContextMenuEl) __mtlClipContextMenuEl.style.display = 'none';
+}
+
+function mtlShowClipContextMenu(ev, clip){
+  const menu = ensureClipContextMenu();
+  const members = mtlGroupMembersForId(clip.id);
+  const isLinked = members.length > 1;
+  const memberSummary = isLinked
+    ? members.map(m => {
+        const t = (ensureMultiTimelineDocument().tracks || []).find(x => x.id === m.trackId);
+        return `${t?.kind || '?'}${t?.index ? t.index : ''}`;
+      }).join(' + ')
+    : '';
+
+  // Action set depends on whether this clip is in a group and what kind it is.
+  const rows = [];
+  if (isLinked){
+    rows.push({ id:'unlink', label:`Unlink (${memberSummary})`, title:'Separate this group so V and A can be edited independently' });
+  } else if (clip.kind === 'video' || clip.kind === 'audio'){
+    // Singleton V or A: offer to link to any candidate sibling clip directly
+    // below/above on the matching A/V track that overlaps the same project
+    // range. Only show if such a partner exists.
+    const partner = mtlFindRelinkPartnerFor(clip);
+    if (partner) rows.push({ id:'relink', label:'Link to partner clip', title:'Sync this clip with the matching V/A clip at the same project time' });
+  }
+  rows.push({ id:'delete', label:'Delete clip', title:'Remove this clip (and linked siblings)' });
+  rows.push({ id:'ripple-delete', label:'Ripple delete', title:'Remove and close gap on each track' });
+
+  menu.innerHTML = rows.map(r => `<button type="button" data-mtl-ctx="${r.id}" title="${escapeHtml(r.title)}">${escapeHtml(r.label)}</button>`).join('');
+  menu.querySelectorAll('button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const action = btn.dataset.mtlCtx;
+      hideClipContextMenu();
+      if (action === 'unlink') mtlUnlinkGroup(clip.id);
+      else if (action === 'relink') mtlRelinkPartnerOf(clip);
+      else if (action === 'delete'){
+        // Select this group (already group-aware) and delete.
+        mtlSelectClipId(clip.id);
+        mtlDeleteSelected({ ripple:false });
+      }
+      else if (action === 'ripple-delete'){
+        mtlSelectClipId(clip.id);
+        mtlDeleteSelected({ ripple:true });
+      }
+    });
+  });
+
+  // Position so the menu stays within the viewport.
+  menu.style.display = 'block';
+  const r = menu.getBoundingClientRect();
+  const maxX = window.innerWidth - r.width - 8;
+  const maxY = window.innerHeight - r.height - 8;
+  menu.style.left = Math.min(maxX, Math.max(8, ev.clientX)) + 'px';
+  menu.style.top  = Math.min(maxY, Math.max(8, ev.clientY)) + 'px';
+}
+
+function mtlUnlinkGroup(clipId){
+  const doc = ensureMultiTimelineDocument();
+  const clip = (doc.clips || []).find(c => c.id === clipId);
+  if (!clip) return;
+  const gid = String(clip.linkGroupId || '');
+  if (!gid) return;
+  mtlSnapshotForUndo('unlink');
+  (doc.clips || []).forEach(c => {
+    if (String(c.linkGroupId || '') === gid) c.linkGroupId = '';
+  });
+  requestMultiTimelineRender();
+}
+
+// Find a candidate sibling clip on the matching V/A track for relinking. The
+// partner is a clip on the matched-index track with overlapping project range
+// and no current linkGroupId (so we don't accidentally re-link half of an
+// existing group).
+function mtlFindRelinkPartnerFor(clip){
+  const doc = ensureMultiTimelineDocument();
+  const myTrack = (doc.tracks || []).find(t => t.id === clip.trackId);
+  if (!myTrack) return null;
+  const partnerKind = (myTrack.kind === 'video') ? 'audio' : (myTrack.kind === 'audio') ? 'video' : null;
+  if (!partnerKind) return null;
+  const partnerTrack = (doc.tracks || []).find(t => t.kind === partnerKind && Number(t.index) === Number(myTrack.index));
+  if (!partnerTrack) return null;
+  const eps = 0.05;
+  return (doc.clips || []).find(c => c.trackId === partnerTrack.id
+    && !c.linkGroupId
+    && Math.abs(Number(c.project_in) - Number(clip.project_in)) <= eps
+    && Math.abs(Number(c.project_out) - Number(clip.project_out)) <= eps) || null;
+}
+
+function mtlRelinkPartnerOf(clip){
+  const partner = mtlFindRelinkPartnerFor(clip);
+  if (!partner) return;
+  mtlSnapshotForUndo('relink');
+  const gid = makeMultiTimelineId('grp');
+  clip.linkGroupId = gid;
+  partner.linkGroupId = gid;
+  requestMultiTimelineRender();
 }
 
 /* ----- Ruler click → seek; lane background → marquee select ------------- */
@@ -19770,6 +21138,10 @@ renderMultiTimelineClipsForTrack = function patchedRenderClipsForTrack(laneEl, t
     if (__mtlSelected.has(clip.id)) block.classList.add('selected');
     if (clip.id === __mtlActiveV1ClipId) block.classList.add('playing');
     if (!clip.media_pool_key && (clip.kind === 'video' || clip.kind === 'audio')) block.classList.add('unlinked');
+    if (clip.linkGroupId){
+      block.classList.add('linked');
+      block.dataset.linkGroup = String(clip.linkGroupId);
+    }
     block.style.left = left + 'px';
     block.style.width = width + 'px';
     block.style.background = colors.fill;
