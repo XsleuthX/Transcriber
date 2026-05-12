@@ -38,6 +38,7 @@ let COLLAB_REVISION = 0;
 let COLLAB_TIMER = null;
 let COLLAB_LAST_HASH = '';
 let COLLAB_APPLYING = false;
+let COLLAB_DEFERRED_REMOTE_STATE = null;
 let COLLAB_WS = null;
 let COLLAB_WS_CONNECTED = false;
 let COLLAB_WS_TIMER = null;
@@ -2167,7 +2168,20 @@ function ensureCueIds(list=entries){
   (list || []).forEach(e => { if (e && !e.id) e.id = makeCueId(); });
 }
 function getCueList(track='A'){
-  return (track === 'B') ? entriesB : entries;
+  const t = (track === 'B') ? 'B' : 'A';
+  // Story Mode can edit mini-transcript cues from an inactive Media Pool asset.
+  // When __storyRelinkSourceKey is temporarily set, resolve cues from that
+  // asset snapshot instead of the currently visible global entries/entriesB.
+  try{
+    if (typeof __storyRelinkSourceKey !== 'undefined' && __storyRelinkSourceKey && typeof storyTranscriptSnapshotForKey === 'function'){
+      const snap = storyTranscriptSnapshotForKey(__storyRelinkSourceKey);
+      if (snap){
+        const list = t === 'B' ? snap.transcriptB : snap.transcriptA;
+        if (Array.isArray(list)) return list;
+      }
+    }
+  }catch(_e){}
+  return t === 'B' ? entriesB : entries;
 }
 function getCueIndexById(cueId, track='A'){
   const list = getCueList(track);
@@ -2280,7 +2294,20 @@ function notifyTxtCueEdit(index, { structural=false, track='A' } = {}){
   try{ scheduleCollabPush?.(); }catch(_e){}
   try{ sendCollabTxtCursor(); }catch(_e){}
   try{ sendCollabTxtTyping(); }catch(_e){}
-  try{ maybeSendCollabStateOverWebSocket?.({ force: !!structural }); }catch(_e){}
+  // Structural TXT actions are complete operations (Split/Merge/Push/Add/Delete).
+  // Commit them immediately so Subtitle Mode, overlay, Media Pool per-asset
+  // transcript state, Story links, and collaborators see the result without
+  // requiring a mode switch. Text typing still waits for blur/finalize.
+  if (structural){
+    const commitStructural = () => {
+      try{
+        if (typeof mediaPoolFinalizeTranscriptEdit === 'function') mediaPoolFinalizeTranscriptEdit();
+        else maybeSendCollabStateOverWebSocket?.({ force:true });
+      }catch(_e){}
+    };
+    if (typeof queueMicrotask === 'function') queueMicrotask(commitStructural);
+    else setTimeout(commitStructural, 0);
+  }
   try{ applyTxtCollabAwareness(); }catch(_e){}
   // Live-connect Story Cards: any structural change to cue ids/positions
   // (split, merge, delete, reorder, insert) may cascade into card splits or
@@ -2552,6 +2579,9 @@ function bindTxtEditorHost(box){
     try{ applyTxtCollabAwareness(); }catch(_e){}
   });
   box.addEventListener('paste', (ev) => {
+    // A paste event targeted at .txt-line bubbles up to this host.  The row-level
+    // handler may already have inserted the plain text; do not insert it again.
+    if (ev.__txtHandled) return;
     if (isTrackLocked(normalizeTxtTrack(box.dataset.track || getTxtSingleTrack())) || VIEW_ONLY_SESSION) return;
     const info = getTxtSelectionInfo();
     if (!info.line || info.index < 0) return;
@@ -2926,6 +2956,7 @@ function renderTxtCueRows(track='A', box, { focusIndex=null, focusCueId=null, ca
       if (locked) return;
       const clip = ev.clipboardData || window.clipboardData;
       const txt = clip ? (clip.getData('text/plain') || '') : '';
+      ev.__txtHandled = true;
       if (txt.includes('\n') || txt.includes('\r')){
         ev.preventDefault();
         const caret = getCaretOffset(line);
@@ -3674,6 +3705,43 @@ function storyTranscriptSnapshotForKey(key){
     if (st) return st;
   }catch(_e){}
   return null;
+}
+function storyRunWithSourceKey(sourceKey, fn){
+  const previousKey = __storyRelinkSourceKey;
+  const key = String(sourceKey || '');
+  if (key) __storyRelinkSourceKey = key;
+  try{ return fn ? fn() : undefined; }
+  finally{ __storyRelinkSourceKey = previousKey; }
+}
+function storyMiniSourceKeyForCard(card){
+  try{ return storySourceKeyForCard(card) || ''; }catch(_e){ return ''; }
+}
+function storyPersistMiniTranscriptState(ctx={}, opts={}){
+  const key = String(ctx?.sourceKey || storyMiniSourceKeyForCard(ctx?.card) || '');
+  try{
+    if (key && __mediaPoolCurrentKey && key === __mediaPoolCurrentKey){
+      mediaPoolSaveCurrentTranscript?.();
+    } else if (key && __mediaPoolAssetStates?.[key]){
+      const st = __mediaPoolAssetStates[key];
+      const a = Array.isArray(st.transcriptA) ? st.transcriptA : [];
+      const b = Array.isArray(st.transcriptB) ? st.transcriptB : [];
+      ensureCueIds?.(a); ensureCueIds?.(b);
+      st.hasTranscript = a.length > 0 || b.some(x => String(x?.text || '').trim());
+      st.transcriptCount = a.length;
+      st.savedAt = Date.now();
+      mediaPoolPersistAssetStates?.();
+    } else {
+      mediaPoolSaveCurrentTranscript?.();
+    }
+    renderMediaPoolTray?.();
+    renderMediaPoolProjectList?.();
+    if (opts.forceCollab) maybeSendCollabStateOverWebSocket?.({ force:true });
+  }catch(_e){}
+}
+function storyMiniRunWithSource(ctx, fn){
+  const key = String(ctx?.sourceKey || storyMiniSourceKeyForCard(ctx?.card) || '');
+  if (ctx && key) ctx.sourceKey = key;
+  return storyRunWithSourceKey(key, fn);
 }
 function storyListForTrack(track){
   const t = normalizeStoryTrack(track);
@@ -6153,23 +6221,26 @@ function renderStoryAssembly(){
 }
 
 function storyRenderMiniTranscript(row, card){
-  const refs = storyEffectiveCueRefs(card);
-  const track = storyEffectiveTrack(card);
-  const cues = refs.map(id => storyCueById(id, track)).filter(Boolean);
-  if (!cues.length) return '<div class="story-mini-empty">No linked cues in this card.</div>';
-  return `
-    <div class="story-mini-transcript" data-story-mini="1">
-      <div class="story-mini-head"><span>Mini Transcript · Track ${escapeHtml(track)}</span><button class="btn btn-gold btn-mini" data-story-action="done-mini-transcript" type="button">Done</button></div>
-      <div class="story-mini-list">
-        ${cues.map((cue, i) => {
-          const idx = getCueIndexById(cue.id, track);
-          return `<div class="story-mini-cue" data-cue-id="${escapeStoryAttr(cue.id)}" data-cue-index="${idx}" data-track="${escapeStoryAttr(track)}">
-            <button class="story-mini-time" data-story-action="edit-mini-time" title="Click to edit cue In / Out" type="button">${fmtTC(cue.start)} → ${fmtTC(cue.end)}</button>
-            <div class="story-mini-text" style="${escapeStoryAttr(storyCardBodyInlineStyle(card))}" contenteditable="${VIEW_ONLY_SESSION ? 'false' : 'true'}" tabindex="0" spellcheck="false">${escapeHtml(cue.text || '')}</div>
-          </div>`;
-        }).join('')}
-      </div>
-    </div>`;
+  const sourceKey = storyMiniSourceKeyForCard(card);
+  return storyRunWithSourceKey(sourceKey, () => {
+    const refs = storyEffectiveCueRefs(card);
+    const track = storyEffectiveTrack(card);
+    const cues = refs.map(id => storyCueById(id, track)).filter(Boolean);
+    if (!cues.length) return '<div class="story-mini-empty">No linked cues in this card.</div>';
+    return `
+      <div class="story-mini-transcript" data-story-mini="1" data-source-key="${escapeStoryAttr(sourceKey)}">
+        <div class="story-mini-head"><span>Mini Transcript · Track ${escapeHtml(track)}</span><button class="btn btn-gold btn-mini" data-story-action="done-mini-transcript" type="button">Done</button></div>
+        <div class="story-mini-list">
+          ${cues.map((cue, i) => {
+            const idx = getCueIndexById(cue.id, track);
+            return `<div class="story-mini-cue" data-cue-id="${escapeStoryAttr(cue.id)}" data-cue-index="${idx}" data-track="${escapeStoryAttr(track)}" data-source-key="${escapeStoryAttr(sourceKey)}">
+              <button class="story-mini-time" data-story-action="edit-mini-time" title="Click to edit cue In / Out" type="button">${fmtTC(cue.start)} → ${fmtTC(cue.end)}</button>
+              <div class="story-mini-text" style="${escapeStoryAttr(storyCardBodyInlineStyle(card))}" contenteditable="${VIEW_ONLY_SESSION ? 'false' : 'true'}" tabindex="0" spellcheck="false">${escapeHtml(cue.text || '')}</div>
+            </div>`;
+          }).join('')}
+        </div>
+      </div>`;
+  });
 }
 function storyFindCard(rowId, cardId){
   const row = getStoryRow(rowId);
@@ -6188,15 +6259,18 @@ function storyScheduleExternalCueSync(){
     try{ updateTxtBox?.(); }catch(_e){}
   }, 500);
 }
-function storyUpdateCueFromMiniText(cueId, track, text){
-  const cue = storyCueById(cueId, track);
-  if (!cue) return;
-  cue.text = String(text ?? '');
-  try{ updateOverlay?.(getActiveIndex?.(getMediaCurrentTime?.() || 0, track), track); }catch(_e){}
-  // Keep the edit live in data immediately, but avoid immediate full transcript
-  // re-render so the mini editor caret/selection remains stable.
-  storyScheduleExternalCueSync();
-  storyCommitSharedState();
+function storyUpdateCueFromMiniText(cueId, track, text, sourceKey=''){
+  return storyRunWithSourceKey(sourceKey, () => {
+    const cue = storyCueById(cueId, track);
+    if (!cue) return;
+    cue.text = String(text ?? '');
+    try{ updateOverlay?.(getActiveIndex?.(getMediaCurrentTime?.() || 0, track), track); }catch(_e){}
+    // Keep the edit live in data immediately, but avoid immediate full transcript
+    // re-render so the mini editor caret/selection remains stable.
+    storyScheduleExternalCueSync();
+    storyPersistMiniTranscriptState({ sourceKey, track }, { forceCollab:false });
+    storyCommitSharedState();
+  });
 }
 function sendCollabStoryCursor(rowId, cardId, cueId='', mode='card', opts={}){
   if (!COLLAB_SESSION_ID || VIEW_ONLY_SESSION || !rowId || !cardId) return;
@@ -6566,7 +6640,8 @@ function onStoryInput(ev){
     // a live view into the cue, and that's how cue cards have always behaved.
     // (Scenario B / auto-convert-on-body-edit was removed; it caused too many
     // conflicts in the editing logic.)
-    storyUpdateCueFromMiniText(cueId, track, miniText.textContent || '');
+    const miniCtx = storyMiniFindContextFromNode(miniText);
+    storyUpdateCueFromMiniText(cueId, track, miniText.textContent || '', miniCtx?.sourceKey || storyMiniSourceKeyForCard(card));
     if (card){ card.bodyManual = false; card.body = ''; storyUpdateCardTimecodeDom(cardEl0, card); }
     sendCollabStoryCursor(rowEl0?.dataset?.rowId, cardEl0?.dataset?.cardId, cueId, 'mini');
     return;
@@ -7308,7 +7383,8 @@ function onStoryClick(ev){
     // If the user is actively selecting text inside the mini transcript, do not
     // treat mouseup/click as a seek action that may collapse the selection.
     if (!(inMiniText && sel && !sel.isCollapsed)){
-      const cue = storyCueById(miniCueClicked.dataset.cueId, miniCueClicked.dataset.track || 'A');
+      const miniCtx = storyMiniFindContextFromNode(miniCueClicked);
+      const cue = storyRunWithSourceKey(miniCtx?.sourceKey || '', () => storyCueById(miniCueClicked.dataset.cueId, miniCueClicked.dataset.track || 'A'));
       if (cue) seekMediaTo(Math.max(0, Number(cue.start || 0)) + 0.001, { play:false });
     }
   }
@@ -7325,7 +7401,7 @@ function onStoryClick(ev){
   if (action === 'move-card-down' && cardEl){ const i = row.cards.findIndex(c => c.id === cardEl.dataset.cardId); if (i >= 0 && i < row.cards.length - 1){ [row.cards[i+1], row.cards[i]] = [row.cards[i], row.cards[i+1]]; renderStoryAssembly(); storyCommitSharedState(true); } return; }
   if (action === 'delete-card' && cardEl){ row.cards = row.cards.filter(c => c.id !== cardEl.dataset.cardId); renderStoryAssembly(); storyCommitSharedState(true); return; }
   if (action === 'done-mini-transcript' && cardEl){ const card = row.cards.find(c => c.id === cardEl.dataset.cardId); if (card){ card.editMode = false; card.bodyManual = false; card.body = ''; try{ renderBySubsMode?.(); updateTxtBox?.(); }catch(_e){} renderStoryAssembly(); storyCommitSharedState(true); } return; }
-  if (action === 'seek-mini-cue' || action === 'edit-mini-time') { const cueEl = ev.target.closest('.story-mini-cue'); const cue = storyCueById(cueEl?.dataset?.cueId, cueEl?.dataset?.track || 'A'); if (action === 'edit-mini-time') { const ctx = storyMiniFindContextFromNode(cueEl); if (ctx) showStoryMiniTimePopover(ev, ctx); } else if (cue) seekMediaTo(Math.max(0, Number(cue.start || 0)) + 0.001, { play:false }); return; }
+  if (action === 'seek-mini-cue' || action === 'edit-mini-time') { const cueEl = ev.target.closest('.story-mini-cue'); const ctx = storyMiniFindContextFromNode(cueEl); const cue = storyRunWithSourceKey(ctx?.sourceKey || '', () => storyCueById(cueEl?.dataset?.cueId, cueEl?.dataset?.track || 'A')); if (action === 'edit-mini-time') { if (ctx) showStoryMiniTimePopover(ev, ctx); } else if (cue) seekMediaTo(Math.max(0, Number(cue.start || 0)) + 0.001, { play:false }); return; }
   if (action === 'toggle-card-notes' && cardEl){ const card = row.cards.find(c => c.id === cardEl.dataset.cardId); if (card){ card.notesOpen = !card.notesOpen; renderStoryAssembly(); storyCommitSharedState(); } return; }
   if (action === 'link-to-cues' && cardEl){
     // Re-link a generic card to whatever cues currently overlap its time range
@@ -8620,10 +8696,11 @@ function onStoryKeydown(ev){
   const miniText = ev.target?.closest?.('.story-mini-text');
   if (!miniText) return;
   if (ev.key === 'Enter' && !ev.shiftKey){
-    const ctx = storyMiniFindContextFromNode(miniText);
+    let ctx = storyMiniFindContextFromNode(miniText);
+    ctx = storyMiniResolveCtx(ctx);
     if (!ctx || isTrackLocked(ctx.track) || VIEW_ONLY_SESSION) return;
     ev.preventDefault();
-    storyMiniSplitCue(ctx, getCaretOffset(miniText));
+    storyMiniRunWithSource(ctx, () => storyMiniSplitCue(ctx, getCaretOffset(miniText)));
   }
 }
 
@@ -8645,9 +8722,9 @@ function onStoryContextMenu(ev){
     return;
   }
 
-  const miniText = ev.target?.closest?.('.story-mini-text');
-  if (miniText){
-    const ctx = storyMiniFindContextFromNode(miniText);
+  const miniCueForMenu = ev.target?.closest?.('.story-mini-cue');
+  if (miniCueForMenu){
+    const ctx = storyMiniFindContextFromNode(miniCueForMenu);
     if (ctx){ ev.preventDefault(); showStoryMiniContextMenu(ev, ctx); }
     return;
   }
@@ -8845,19 +8922,22 @@ function showStoryMiniTimePopover(ev, ctx){
   pop.querySelector('#storyMiniTcCancel').onclick = hideStoryMiniTimePopover;
   pop.querySelector('#storyMiniTcApply').onclick = () => {
     const liveCtx = pop.__ctx || ctx;
-    const liveCue = storyCueById(liveCtx.cueId, liveCtx.track);
-    if (!liveCue || isTrackLocked(liveCtx.track) || VIEW_ONLY_SESSION) return;
-    const f2 = getFPS();
-    const s = parseDisplayedTcToSeconds(inInput.value, f2);
-    const e = parseDisplayedTcToSeconds(outInput.value, f2);
-    if (s == null || e == null){ alert('Invalid timecode. Use HH:MM:SS:FF.'); return; }
-    if (e <= s){ alert('Out timecode must be after In timecode.'); return; }
-    liveCue.start = Math.max(0, s);
-    liveCue.end = Math.max(liveCue.start + (1 / f2), e);
-    hideStoryMiniTimePopover();
-    storyMiniRenderAfter(liveCtx, liveCtx.cueId, 0);
-    try{ renderBySubsMode?.(); updateTxtBox?.(); }catch(_e){}
-    seekMediaTo(Math.max(0, liveCue.start) + 0.001, { play:false });
+    return storyMiniRunWithSource(liveCtx, () => {
+      const liveCue = storyCueById(liveCtx.cueId, liveCtx.track);
+      if (!liveCue || isTrackLocked(liveCtx.track) || VIEW_ONLY_SESSION) return;
+      const f2 = getFPS();
+      const s = parseDisplayedTcToSeconds(inInput.value, f2);
+      const e = parseDisplayedTcToSeconds(outInput.value, f2);
+      if (s == null || e == null){ alert('Invalid timecode. Use HH:MM:SS:FF.'); return; }
+      if (e <= s){ alert('Out timecode must be after In timecode.'); return; }
+      liveCue.start = Math.max(0, s);
+      liveCue.end = Math.max(liveCue.start + (1 / f2), e);
+      hideStoryMiniTimePopover();
+      storyPersistMiniTranscriptState(liveCtx, { forceCollab:true });
+      storyMiniRenderAfter(liveCtx, liveCtx.cueId, 0);
+      try{ renderBySubsMode?.(); updateTxtBox?.(); }catch(_e){}
+      seekMediaTo(Math.max(0, liveCue.start) + 0.001, { play:false });
+    });
   };
   const anchor = ev?.target?.closest?.('.story-mini-time') || ev?.target || ev?.currentTarget;
   positionStoryMiniTimePopover(anchor);
@@ -8878,14 +8958,68 @@ function storyMiniFindContextFromNode(node){
   const card = row?.cards?.find(c => c.id === cardEl.dataset.cardId);
   const track = normalizeStoryTrack(cueEl.dataset.track || card?.track || 'A');
   const cueId = cueEl.dataset.cueId || '';
-  const index = getCueIndexById(cueId, track);
+  const sourceKey = String(cueEl.dataset.sourceKey || cueEl.closest('.story-mini-transcript')?.dataset?.sourceKey || storyMiniSourceKeyForCard(card) || '');
+  const index = storyRunWithSourceKey(sourceKey, () => getCueIndexById(cueId, track));
   const textEl = cueEl.querySelector('.story-mini-text');
-  return { row, card, rowId:row?.id || rowEl.dataset.rowId, cardId:card?.id || cardEl.dataset.cardId, cueEl, cardEl, textEl, cueId, track, index };
+  return { row, card, rowId:row?.id || rowEl.dataset.rowId, cardId:card?.id || cardEl.dataset.cardId, cueEl, cardEl, textEl, cueId, track, index, sourceKey };
+}
+function storyMiniResolveCtx(ctx){
+  if (!ctx) return null;
+  const sourceKey = String(ctx.sourceKey || storyMiniSourceKeyForCard(ctx.card) || '');
+  const track = normalizeStoryTrack(ctx.track || 'A');
+  const cueId = String(ctx.cueId || '');
+  let index = Number(ctx.index ?? -1);
+  try{ index = storyRunWithSourceKey(sourceKey, () => getCueIndexById(cueId, track)); }catch(_e){}
+
+  // After split/merge/delete, the old DOM node can be stale.  Re-acquire the
+  // current mini row by cue id so the next operation always targets the live cue.
+  let cueEl = ctx.cueEl || null;
+  let textEl = ctx.textEl || null;
+  try{
+    const safeCard = CSS.escape(String(ctx.cardId || ctx.card?.id || ''));
+    const safeCue = CSS.escape(cueId);
+    const liveCueEl = storyModeEl?.querySelector(`.story-card[data-card-id="${safeCard}"] .story-mini-cue[data-cue-id="${safeCue}"]`);
+    if (liveCueEl){
+      cueEl = liveCueEl;
+      textEl = liveCueEl.querySelector('.story-mini-text') || textEl;
+    }
+  }catch(_e){}
+  return { ...ctx, sourceKey, track, cueId, index, cueEl, textEl };
 }
 function storyMiniCommitVisibleText(ctx){
-  if (!ctx?.textEl || ctx.index < 0) return;
-  const cue = storyCueById(ctx.cueId, ctx.track);
-  if (cue) cue.text = ctx.textEl.textContent || '';
+  if (!ctx) return;
+  const root = ctx.cueEl?.closest?.('.story-mini-transcript') || ctx.cardEl?.querySelector?.('.story-mini-transcript') || null;
+  const changedKeys = new Set();
+
+  // Commit every visible mini cue in this card, not just the row that was
+  // right-clicked.  This keeps multiple edits accurate before structural tools
+  // like merge/push/delete shift cue text around.
+  if (root){
+    root.querySelectorAll('.story-mini-cue').forEach(row => {
+      const cueId = row.dataset?.cueId || '';
+      const track = normalizeStoryTrack(row.dataset?.track || ctx.track || 'A');
+      const sourceKey = String(row.dataset?.sourceKey || root.dataset?.sourceKey || ctx.sourceKey || '');
+      const textEl = row.querySelector('.story-mini-text');
+      if (!cueId || !textEl) return;
+      storyRunWithSourceKey(sourceKey, () => {
+        const cue = storyCueById(cueId, track);
+        if (cue) cue.text = textEl.textContent || '';
+      });
+      if (sourceKey) changedKeys.add(sourceKey);
+    });
+  } else if (ctx.textEl && ctx.index >= 0) {
+    storyMiniRunWithSource(ctx, () => {
+      const cue = storyCueById(ctx.cueId, ctx.track);
+      if (cue) cue.text = ctx.textEl.textContent || '';
+    });
+    if (ctx.sourceKey) changedKeys.add(String(ctx.sourceKey));
+  }
+
+  if (changedKeys.size){
+    changedKeys.forEach(key => storyPersistMiniTranscriptState({ ...ctx, sourceKey:key }, { forceCollab:false }));
+  } else {
+    storyPersistMiniTranscriptState(ctx, { forceCollab:false });
+  }
 }
 function storyUniqueRefs(refs){
   const out=[]; (refs || []).forEach(id => { if (id && !out.includes(id)) out.push(id); }); return out;
@@ -8916,6 +9050,7 @@ function storyMiniInsertCueRefAfter(card, afterCueId, newCueId){
 }
 function storyMiniRenderAfter(ctx, focusCueId='', caretOffset=0){
   if (ctx?.card){ ctx.card.bodyManual = false; ctx.card.body = ''; ctx.card.editMode = true; }
+  storyPersistMiniTranscriptState(ctx, { forceCollab:true });
   renderStoryAssembly();
   storyCommitSharedState(true);
   setTimeout(() => {
@@ -8928,100 +9063,6 @@ function storyMiniRenderAfter(ctx, focusCueId='', caretOffset=0){
       if (text){ focusNoScroll(text); setCaretOffset(text, Math.max(0, Number(caretOffset)||0)); }
     }catch(_e){}
   }, 60);
-}
-function storyMiniSplitCue(ctx, caretOffset=null){
-  if (!ctx || ctx.index < 0 || isTrackLocked(ctx.track) || VIEW_ONLY_SESSION) return;
-  storyMiniCommitVisibleText(ctx);
-  const list = getCueList(ctx.track); ensureCueIds(list);
-  const cue = list[ctx.index]; if (!cue) return;
-  const full = String(ctx.textEl?.textContent ?? cue.text ?? '');
-  const caret = Math.max(0, Math.min(caretOffset == null ? getCaretOffset(ctx.textEl) : Number(caretOffset), full.length));
-  const left = full.slice(0, caret).trimEnd();
-  const right = full.slice(caret).trimStart();
-  const f = getFPS();
-  const splitF = allowedTxtSplitFrame(cue, caret, full);
-  const splitSec = framesToSec(splitF, f);
-  const originalEnd = Math.max(Number(cue.end || 0), splitSec + (1 / f));
-  cue.text = left;
-  cue.end = splitSec;
-  const newCue = { id:makeCueId(), start:splitSec, end:originalEnd, text:right, orig:{start:splitSec,end:originalEnd,text:right}, origIndex:null, isNew:true };
-  list.splice(ctx.index + 1, 0, newCue);
-  storyMiniInsertCueRefAfter(ctx.card, cue.id, newCue.id);
-  storyMiniRenderAfter(ctx, newCue.id, 0);
-  try{ renderBySubsMode?.(); updateTxtBox?.(); }catch(_e){}
-}
-function storyMiniMergeWithPrevious(ctx){
-  if (!ctx || ctx.index <= 0 || isTrackLocked(ctx.track) || VIEW_ONLY_SESSION) return;
-  storyMiniCommitVisibleText(ctx);
-  const list = getCueList(ctx.track); ensureCueIds(list);
-  const prev = list[ctx.index - 1], cur = list[ctx.index]; if (!prev || !cur) return;
-  const focusOffset = String(prev.text || '').trimEnd().length + (String(prev.text || '').trim() && String(cur.text || '').trim() ? 1 : 0);
-  prev.text = joinCueText(prev.text, cur.text);
-  prev.end = Math.max(Number(prev.end || 0), Number(cur.end || 0));
-  list.splice(ctx.index, 1);
-  storyReplaceCueRefsEverywhere(cur.id, prev.id);
-  storyMiniRenderAfter(ctx, prev.id, focusOffset);
-  try{ renderBySubsMode?.(); updateTxtBox?.(); }catch(_e){}
-}
-function storyMiniMergeWithNext(ctx){
-  if (!ctx || ctx.index < 0 || isTrackLocked(ctx.track) || VIEW_ONLY_SESSION) return;
-  storyMiniCommitVisibleText(ctx);
-  const list = getCueList(ctx.track); ensureCueIds(list);
-  if (ctx.index >= list.length - 1) return;
-  const cur = list[ctx.index], next = list[ctx.index + 1]; if (!cur || !next) return;
-  const focusOffset = String(cur.text || '').trimEnd().length + (String(cur.text || '').trim() && String(next.text || '').trim() ? 1 : 0);
-  cur.text = joinCueText(cur.text, next.text);
-  cur.end = Math.max(Number(cur.end || 0), Number(next.end || 0));
-  list.splice(ctx.index + 1, 1);
-  storyReplaceCueRefsEverywhere(next.id, cur.id);
-  storyMiniRenderAfter(ctx, cur.id, focusOffset);
-  try{ renderBySubsMode?.(); updateTxtBox?.(); }catch(_e){}
-}
-function storyMiniPushTextUp(ctx){
-  if (!ctx || ctx.index <= 0 || isTrackLocked(ctx.track) || VIEW_ONLY_SESSION) return;
-  storyMiniCommitVisibleText(ctx);
-  const list = getCueList(ctx.track);
-  for (let i = ctx.index - 1; i < list.length - 1; i++) list[i].text = list[i + 1].text ?? '';
-  list[list.length - 1].text = '';
-  const focus = list[ctx.index - 1]?.id || ctx.cueId;
-  storyMiniRenderAfter(ctx, focus, String(list[ctx.index - 1]?.text || '').length);
-  try{ renderBySubsMode?.(); updateTxtBox?.(); }catch(_e){}
-}
-function storyMiniPushTextDown(ctx){
-  if (!ctx || ctx.index < 0 || isTrackLocked(ctx.track) || VIEW_ONLY_SESSION) return;
-  storyMiniCommitVisibleText(ctx);
-  const list = getCueList(ctx.track);
-  if (ctx.index >= list.length - 1) return;
-  for (let i = list.length - 1; i >= ctx.index + 1; i--) list[i].text = list[i - 1].text ?? '';
-  list[ctx.index].text = '';
-  const focus = list[ctx.index + 1]?.id || ctx.cueId;
-  storyMiniRenderAfter(ctx, focus, String(list[ctx.index + 1]?.text || '').length);
-  try{ renderBySubsMode?.(); updateTxtBox?.(); }catch(_e){}
-}
-function storyMiniAddBlankBelow(ctx){
-  if (!ctx || ctx.index < 0 || isTrackLocked(ctx.track) || VIEW_ONLY_SESSION) return;
-  storyMiniCommitVisibleText(ctx);
-  const list = getCueList(ctx.track); ensureCueIds(list);
-  const f = getFPS();
-  const here = list[ctx.index];
-  const next = list[ctx.index + 1];
-  const start = here ? Number(here.end || 0) : (list.at(-1)?.end || 0);
-  let end = start + 1.0;
-  if (next && end >= next.start) end = Math.max(start + (1 / f), Number(next.start || start) - (1 / f));
-  const newCue = { id:makeCueId(), start, end, text:'', orig:{start,end,text:''}, origIndex:null, isNew:true };
-  list.splice(ctx.index + 1, 0, newCue);
-  storyMiniInsertCueRefAfter(ctx.card, here?.id || ctx.cueId, newCue.id);
-  storyMiniRenderAfter(ctx, newCue.id, 0);
-  try{ renderBySubsMode?.(); updateTxtBox?.(); }catch(_e){}
-}
-function storyMiniDeleteCue(ctx){
-  if (!ctx || ctx.index < 0 || isTrackLocked(ctx.track) || VIEW_ONLY_SESSION) return;
-  const list = getCueList(ctx.track); const cue = list[ctx.index]; if (!cue) return;
-  list.splice(ctx.index, 1);
-  storyReplaceCueRefsEverywhere(cue.id, '');
-  const focus = list[Math.max(0, Math.min(ctx.index, list.length - 1))]?.id || '';
-  storyMiniRenderAfter(ctx, focus, 0);
-  try{ renderBySubsMode?.(); updateTxtBox?.(); }catch(_e){}
 }
 function ensureStoryMiniContextMenu(){
   if (storyMiniCtxMenu) return storyMiniCtxMenu;
@@ -9045,15 +9086,17 @@ function ensureStoryMiniContextMenu(){
   storyMiniCtxMenu.addEventListener('click', ev => {
     const action = ev.target?.dataset?.storyMiniAction;
     if (!action || !storyMiniCtxTarget) return;
-    const ctx = storyMiniCtxTarget;
+    const ctx = storyMiniResolveCtx(storyMiniCtxTarget);
     hideStoryMiniContextMenu();
-    if (action === 'split') return storyMiniSplitCue(ctx);
-    if (action === 'merge-prev') return storyMiniMergeWithPrevious(ctx);
-    if (action === 'merge-next') return storyMiniMergeWithNext(ctx);
-    if (action === 'push-up') return storyMiniPushTextUp(ctx);
-    if (action === 'push-down') return storyMiniPushTextDown(ctx);
-    if (action === 'add-blank') return storyMiniAddBlankBelow(ctx);
-    if (action === 'delete') return storyMiniDeleteCue(ctx);
+    return storyMiniRunWithSource(ctx, () => {
+      if (action === 'split') return storyMiniSplitCue(ctx);
+      if (action === 'merge-prev') return storyMiniMergeWithPrevious(ctx);
+      if (action === 'merge-next') return storyMiniMergeWithNext(ctx);
+      if (action === 'push-up') return storyMiniPushTextUp(ctx);
+      if (action === 'push-down') return storyMiniPushTextDown(ctx);
+      if (action === 'add-blank') return storyMiniAddBlankBelow(ctx);
+      if (action === 'delete') return storyMiniDeleteCue(ctx);
+    });
   });
   window.addEventListener('click', hideStoryMiniContextMenu);
   window.addEventListener('scroll', hideStoryMiniContextMenu, true);
@@ -9062,6 +9105,7 @@ function ensureStoryMiniContextMenu(){
 }
 function showStoryMiniContextMenu(ev, ctx){
   if (!ctx || isTrackLocked(ctx.track) || VIEW_ONLY_SESSION) return;
+  ctx.sourceKey = ctx.sourceKey || storyMiniSourceKeyForCard(ctx.card) || '';
   storyMiniCtxTarget = ctx;
   const menu = ensureStoryMiniContextMenu();
   menu.style.left = (ev.pageX ?? ev.clientX + window.scrollX) + 'px';
@@ -9069,6 +9113,113 @@ function showStoryMiniContextMenu(ev, ctx){
   menu.style.display = 'block';
 }
 function hideStoryMiniContextMenu(){ if (storyMiniCtxMenu){ storyMiniCtxMenu.style.display='none'; } storyMiniCtxTarget=null; }
+
+// Story mini transcript: robust transaction-based structural edits.
+// These overrides intentionally use cue_id as the source of truth after every
+// re-render.  The visible mini panel commits all current rows first, then the
+// operation re-resolves the live cue/index from the asset transcript before it
+// mutates the underlying cue list.  This prevents second/third edits from using
+// stale DOM indexes after split/merge/delete.
+function storyMiniPrepareTxn(ctx){
+  ctx = storyMiniResolveCtx(ctx);
+  if (!ctx || isTrackLocked(ctx.track) || VIEW_ONLY_SESSION) return null;
+  storyMiniCommitVisibleText(ctx);
+  ctx = storyMiniResolveCtx(ctx);
+  const list = storyMiniRunWithSource(ctx, () => { const l = getCueList(ctx.track); ensureCueIds(l); return l; });
+  const index = storyMiniRunWithSource(ctx, () => getCueIndexById(ctx.cueId, ctx.track));
+  if (!Array.isArray(list) || index < 0 || index >= list.length) return null;
+  return { ...ctx, list, index, cue:list[index] };
+}
+function storyMiniFinishTxn(ctx, focusCueId='', caretOffset=0){
+  if (!ctx) return;
+  storyMiniRunWithSource(ctx, () => { ensureCueIds(getCueList(ctx.track)); });
+  storyMiniRenderAfter(ctx, focusCueId || ctx.cueId || '', caretOffset || 0);
+  try{ renderBySubsMode?.(); updateTxtBox?.(); }catch(_e){}
+}
+function storyMiniSplitCue(ctx, caretOffset=null){
+  const tx = storyMiniPrepareTxn(ctx);
+  if (!tx) return;
+  const cue = tx.cue;
+  const full = String(tx.textEl?.textContent ?? cue.text ?? '');
+  const caret = Math.max(0, Math.min(caretOffset == null ? getCaretOffset(tx.textEl) : Number(caretOffset), full.length));
+  const left = full.slice(0, caret).trimEnd();
+  const right = full.slice(caret).trimStart();
+  const f = getFPS();
+  const splitF = allowedTxtSplitFrame(cue, caret, full);
+  const splitSec = framesToSec(splitF, f);
+  const originalEnd = Math.max(Number(cue.end || 0), splitSec + (1 / f));
+  cue.text = left;
+  cue.end = splitSec;
+  const newCue = { id:makeCueId(), start:splitSec, end:originalEnd, text:right, orig:{start:splitSec,end:originalEnd,text:right}, origIndex:null, isNew:true };
+  tx.list.splice(tx.index + 1, 0, newCue);
+  storyMiniInsertCueRefAfter(tx.card, cue.id, newCue.id);
+  storyMiniFinishTxn(tx, newCue.id, 0);
+}
+function storyMiniMergeWithPrevious(ctx){
+  const tx = storyMiniPrepareTxn(ctx);
+  if (!tx || tx.index <= 0) return;
+  const prev = tx.list[tx.index - 1], cur = tx.list[tx.index];
+  if (!prev || !cur) return;
+  const focusOffset = String(prev.text || '').trimEnd().length + (String(prev.text || '').trim() && String(cur.text || '').trim() ? 1 : 0);
+  prev.text = joinCueText(prev.text, cur.text);
+  prev.end = Math.max(Number(prev.end || 0), Number(cur.end || 0));
+  tx.list.splice(tx.index, 1);
+  storyReplaceCueRefsEverywhere(cur.id, prev.id);
+  storyMiniFinishTxn(tx, prev.id, focusOffset);
+}
+function storyMiniMergeWithNext(ctx){
+  const tx = storyMiniPrepareTxn(ctx);
+  if (!tx || tx.index < 0 || tx.index >= tx.list.length - 1) return;
+  const cur = tx.list[tx.index], next = tx.list[tx.index + 1];
+  if (!cur || !next) return;
+  const focusOffset = String(cur.text || '').trimEnd().length + (String(cur.text || '').trim() && String(next.text || '').trim() ? 1 : 0);
+  cur.text = joinCueText(cur.text, next.text);
+  cur.end = Math.max(Number(cur.end || 0), Number(next.end || 0));
+  tx.list.splice(tx.index + 1, 1);
+  storyReplaceCueRefsEverywhere(next.id, cur.id);
+  storyMiniFinishTxn(tx, cur.id, focusOffset);
+}
+function storyMiniPushTextUp(ctx){
+  const tx = storyMiniPrepareTxn(ctx);
+  if (!tx || tx.index <= 0) return;
+  for (let i = tx.index - 1; i < tx.list.length - 1; i++) tx.list[i].text = tx.list[i + 1].text ?? '';
+  tx.list[tx.list.length - 1].text = '';
+  const focus = tx.list[tx.index - 1]?.id || tx.cueId;
+  storyMiniFinishTxn(tx, focus, String(tx.list[tx.index - 1]?.text || '').length);
+}
+function storyMiniPushTextDown(ctx){
+  const tx = storyMiniPrepareTxn(ctx);
+  if (!tx || tx.index < 0 || tx.index >= tx.list.length - 1) return;
+  for (let i = tx.list.length - 1; i >= tx.index + 1; i--) tx.list[i].text = tx.list[i - 1].text ?? '';
+  tx.list[tx.index].text = '';
+  const focus = tx.list[tx.index + 1]?.id || tx.cueId;
+  storyMiniFinishTxn(tx, focus, String(tx.list[tx.index + 1]?.text || '').length);
+}
+function storyMiniAddBlankBelow(ctx){
+  const tx = storyMiniPrepareTxn(ctx);
+  if (!tx || tx.index < 0) return;
+  const f = getFPS();
+  const here = tx.list[tx.index];
+  const next = tx.list[tx.index + 1];
+  const start = here ? Number(here.end || 0) : (tx.list.at(-1)?.end || 0);
+  let end = start + 1.0;
+  if (next && end >= next.start) end = Math.max(start + (1 / f), Number(next.start || start) - (1 / f));
+  const newCue = { id:makeCueId(), start, end, text:'', orig:{start,end,text:''}, origIndex:null, isNew:true };
+  tx.list.splice(tx.index + 1, 0, newCue);
+  storyMiniInsertCueRefAfter(tx.card, here?.id || tx.cueId, newCue.id);
+  storyMiniFinishTxn(tx, newCue.id, 0);
+}
+function storyMiniDeleteCue(ctx){
+  const tx = storyMiniPrepareTxn(ctx);
+  if (!tx || tx.index < 0) return;
+  const cue = tx.list[tx.index];
+  if (!cue) return;
+  tx.list.splice(tx.index, 1);
+  storyReplaceCueRefsEverywhere(cue.id, '');
+  const focus = tx.list[Math.max(0, Math.min(tx.index, tx.list.length - 1))]?.id || '';
+  storyMiniFinishTxn(tx, focus, 0);
+}
+
 
 function storyTimelineRangeForCard(card){
   if (!card) return null;
@@ -9904,7 +10055,7 @@ function ensureYouTubeImportModal(){
       }
       if (ccOn){
         if (!permissionConfirmed){ alert('Please confirm you own this video or have permission to import its captions.'); return; }
-        await startYouTubeCCImport(url, permissionConfirmed, selectedCaptionChoice);
+        await startYouTubeCCImport(url, permissionConfirmed, selectedCaptionChoice, { metadata: meta });
       }
       if (downloadOn){
         if (!permissionConfirmed){ alert('Please confirm you own this video or have permission to download it.'); return; }
@@ -10301,12 +10452,26 @@ function escapeHtml(s){
   return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-async function openYouTubeImportModal(){
+async function openYouTubeImportModal(opts={}){
+  opts = opts || {};
   ensureYouTubeImportModal();
   const wrap = document.getElementById('youtubeImportModal');
   const defaults = await fetchYouTubeDefaults();
   const out = document.getElementById('ytOutputDir');
   if (out && defaults?.default_download_dir) out.value = defaults.default_download_dir;
+
+  // Media Pool → full YouTube importer bridge.  When the user has already
+  // selected/pasted a YouTube URL in the Media Pool tab, carry that value into
+  // the full importer so CC/download actions stay bound to the same video id.
+  const urlInput = document.getElementById('ytUrlInput');
+  const carriedUrl = String(opts.url || opts.webpage_url || '').trim();
+  if (urlInput && carriedUrl) urlInput.value = carriedUrl;
+  const perm = document.getElementById('ytPermission');
+  if (perm && opts.permissionConfirmed != null) perm.checked = !!opts.permissionConfirmed;
+  if (opts.metadata || opts.probedMeta){
+    try{ renderYouTubeProbe(opts.metadata || opts.probedMeta); }catch(_e){}
+  }
+
   wrap?.classList.remove('hidden');
   refreshYouTubeExportStatus();
   setTimeout(()=>document.getElementById('ytUrlInput')?.focus(), 50);
@@ -10422,7 +10587,56 @@ function rearrangeTopToolbar(){
   nodes.forEach(el => toolbar.appendChild(el));
 }
 
-async function startYouTubeCCImport(url, permissionConfirmed, captionChoiceOverride=null){
+
+function mediaPoolFindYouTubeAssetByUrl(url, metadata={}){
+  const videoId = String(metadata?.id || metadata?.video_id || metadata?.youtube_id || parseYouTubeVideoId(url) || '').trim();
+  const normUrl = String(url || '').trim();
+  const assets = (typeof getMediaPoolAssets === 'function') ? getMediaPoolAssets() : (__mediaPoolAssets || []);
+  return (assets || []).find(a => {
+    const type = String(a?.source_type || a?.sourceType || '').toLowerCase();
+    if (type !== 'youtube') return false;
+    const aid = String(a?.asset_id || a?.youtube_id || a?.id || '').trim();
+    const aurl = String(a?.url || a?.webpage_url || a?.metadata?.webpage_url || '').trim();
+    return (!!videoId && aid === videoId) || (!!normUrl && aurl === normUrl);
+  }) || null;
+}
+function mediaPoolEnsureYouTubeAssetForTranscript(url, metadata={}, permissionConfirmed=false){
+  let asset = mediaPoolFindYouTubeAssetByUrl(url, metadata);
+  if (!asset){
+    mediaPoolUpsertAsset(makeYouTubePoolAsset(url, metadata, { permissionConfirmed }));
+    asset = mediaPoolFindYouTubeAssetByUrl(url, metadata);
+  } else {
+    asset.permission_confirmed = !!permissionConfirmed || !!asset.permission_confirmed;
+    asset.url = asset.url || url;
+    asset.webpage_url = asset.webpage_url || metadata?.webpage_url || url;
+    asset.metadata = Object.assign({}, asset.metadata || {}, metadata || {});
+    mediaPoolUpsertAsset(asset);
+    asset = mediaPoolFindYouTubeAssetByUrl(url, metadata) || asset;
+  }
+  return asset;
+}
+function mediaPoolStoreTranscriptForKey(key, aList, bList, initialAList, initialBList, baseName=''){
+  if (!key) return;
+  const snap = {
+    transcriptA: mediaPoolCloneCueList(aList || []),
+    transcriptB: mediaPoolCloneCueList(bList || []),
+    initialA: mediaPoolCloneCueList(initialAList || []),
+    initialB: mediaPoolCloneCueList(initialBList || []),
+    baseName: String(baseName || ''),
+    savedAt: Date.now(),
+  };
+  const prev = __mediaPoolAssetStates[key] || {};
+  __mediaPoolAssetStates[key] = { ...prev, ...snap, hasTranscript:mediaPoolTranscriptHasContent(snap), transcriptCount:(snap.transcriptA || []).length };
+  const asset = (__mediaPoolAssets || []).find(a => mediaPoolAssetKey(a) === key);
+  if (asset){
+    asset.has_transcript = __mediaPoolAssetStates[key].hasTranscript;
+    asset.transcript_count = __mediaPoolAssetStates[key].transcriptCount;
+  }
+  mediaPoolPersistAssetStates?.();
+  mediaPoolPersistAssets?.();
+}
+
+async function startYouTubeCCImport(url, permissionConfirmed, captionChoiceOverride=null, bindOpts={}){
   const caption_choice = captionChoiceOverride || document.getElementById('ytCaptionChoice')?.value || 'auto';
   progressStart('Importing YouTube closed captions…');
   const res = await fetch(`${API_BASE}/api/youtube_cc_start`, {
@@ -10451,7 +10665,31 @@ async function startYouTubeCCImport(url, permissionConfirmed, captionChoiceOverr
   const box = document.getElementById('alignSrtText');
   if (box) box.value = srtText;
   window.currentBaseName = (data?.title || 'youtube_cc').replace(/[\/:*?"<>|]+/g, ' ').trim() || 'youtube_cc';
+
+  // Bind imported CC to the matching YouTube Media Pool asset.  This keeps
+  // source_type/source id/source asset id identical whether the video came from
+  // the Media Pool URL field, search result, or the full importer.
+  try{
+    const metaForAsset = Object.assign({}, data?.metadata || {}, bindOpts?.metadata || {}, {
+      id: data?.video_id || bindOpts?.videoId || parseYouTubeVideoId(url),
+      title: data?.title || bindOpts?.title || data?.metadata?.title || 'YouTube video',
+      webpage_url: data?.metadata?.webpage_url || url
+    });
+    const asset = mediaPoolEnsureYouTubeAssetForTranscript(url, metaForAsset, permissionConfirmed);
+    if (asset){
+      const key = mediaPoolAssetKey(asset);
+      __mediaPoolCurrentKey = key;
+      currentMediaSource = Object.assign({}, currentMediaSource || {}, {
+        type:'youtube', url, videoId:metaForAsset.id || parseYouTubeVideoId(url), metadata:metaForAsset, permissionConfirmed:!!permissionConfirmed, mediaPoolKey:key
+      });
+      mediaPoolStoreTranscriptForKey(key, entries, entriesB, initialEntries, initialEntriesB, window.currentBaseName);
+    }
+  }catch(_e){
+    try{ mediaPoolSaveCurrentTranscript?.(); }catch(_e2){}
+  }
+
   renderBySubsMode();
+  try{ renderMediaPoolTray?.(); renderMediaPoolProjectList?.(); renderNativeMediaPoolSource?.('youtube'); }catch(_e){}
   progressDone(true);
   setStatusSafe(`Imported ${entries.length} YouTube CC cue(s)${data?.language ? ' (' + data.language + ', ' + data.caption_kind + ')' : ''}.`);
   return data;
@@ -12437,6 +12675,35 @@ let __mediaPoolCurrentKey = '';
 let __mediaPoolAssetStates = {}; // media_pool_key -> { lastTime, transcriptA, transcriptB, initialA, initialB }
 let __mediaPoolApplyingTranscript = false;
 let __mediaPoolTranscriptSaveTimer = null;
+let __mediaPoolLastTranscriptDigest = '';
+
+function mediaPoolTranscriptDigest(){
+  try{
+    const slim = (list) => (Array.isArray(list) ? list : []).map(e => ({
+      id:String(e?.id || ''),
+      start:Number(e?.start || 0),
+      end:Number(e?.end || 0),
+      text:String(e?.text || '')
+    }));
+    return JSON.stringify({ key:__mediaPoolCurrentKey || '', a:slim(entries), b:slim(entriesB) });
+  }catch(_e){ return String(Date.now()); }
+}
+
+function mediaPoolRefreshOverlayFromCurrentTime(){
+  try{
+    const track = (activeOverlayTrack === 'B' || subsMode === 'B') ? 'B' : 'A';
+    const t = (typeof getMediaCurrentTime === 'function') ? getMediaCurrentTime() : (player?.currentTime || 0);
+    const idx = getActiveIndex(t, track);
+    updateOverlay(idx, track);
+  }catch(_e){}
+}
+
+function mediaPoolSyncVisibleTranscriptEditors(){
+  // TXT / Transcript Mode uses .txt-line editors, while Subtitle Mode uses .text rows.
+  // Flush both, so clicking outside a cue immediately updates entries/entriesB.
+  try{ syncTxtBoxToEntries?.(); }catch(_e){}
+  try{ flushEditsFromDOM?.(); }catch(_e){}
+}
 
 function mediaPoolLoadAssetStates(){
   try{
@@ -12480,7 +12747,10 @@ function mediaPoolNormalizeCueList(list){
   }));
 }
 function mediaPoolCaptureTranscriptSnapshot(){
-  try{ flushEditsFromDOM?.(); }catch(_e){}
+  // Capture from the currently visible editor first. TXT/Transcript Mode uses
+  // .txt-line rows, so flushEditsFromDOM() alone is not enough; without this,
+  // structural TXT actions only appeared after switching back to Subtitle Mode.
+  try{ mediaPoolSyncVisibleTranscriptEditors?.(); }catch(_e){ try{ flushEditsFromDOM?.(); }catch(_e2){} }
   return {
     transcriptA: mediaPoolCloneCueList(entries),
     transcriptB: mediaPoolCloneCueList(entriesB),
@@ -12549,6 +12819,38 @@ function mediaPoolRestoreAssetTimelineClips(asset){
 }
 let __mediaPoolApplyingTimelineClips = false;
 
+
+function collabIsTranscriptEditorFocused(){
+  const active = document.activeElement;
+  if (!active || !active.closest) return false;
+  return !!active.closest('#transcript .text, #transcriptB .text, #txtBigBox .txt-line, #txtBoxA .txt-line, #txtBoxB .txt-line, .story-mini-text');
+}
+function collabStoreDeferredRemoteState(msg){
+  if (!msg || !msg.state) return;
+  COLLAB_DEFERRED_REMOTE_STATE = {
+    state: msg.state,
+    revision: Number(msg.revision || 0),
+    updated_by: msg.updated_by || msg.user_id || '',
+  };
+  try{ setCollabSyncStatus?.('remote pending'); }catch(_e){}
+}
+function collabApplyDeferredRemoteStateIfSafe(){
+  if (!COLLAB_DEFERRED_REMOTE_STATE || collabIsTranscriptEditorFocused()) return false;
+  const pending = COLLAB_DEFERRED_REMOTE_STATE;
+  COLLAB_DEFERRED_REMOTE_STATE = null;
+  if (!pending.state || Number(pending.revision || 0) < COLLAB_REVISION) return false;
+  COLLAB_APPLYING = true;
+  try{
+    applySharedSessionState(pending.state, { preserveMedia: true, remoteUpdate: true });
+    try{ refreshOpenCueComments(); }catch(_e){}
+    COLLAB_REVISION = Math.max(COLLAB_REVISION, Number(pending.revision || 0));
+    COLLAB_LAST_HASH = hashSessionState(buildShareSessionState());
+    setCollabSyncStatus?.('updated');
+    return true;
+  } finally {
+    COLLAB_APPLYING = false;
+  }
+}
 function mediaPoolSaveCurrentTranscript(){
   if (__mediaPoolApplyingTranscript || !__mediaPoolCurrentKey) return;
   mediaPoolCaptureTranscriptForKey(__mediaPoolCurrentKey);
@@ -12561,6 +12863,32 @@ function mediaPoolMarkTranscriptDirty(){
     try{ renderMediaPoolTray(); }catch(_e){}
     try{ renderMediaPoolProjectList(); }catch(_e){}
   }, 350);
+}
+function mediaPoolFinalizeTranscriptEdit(){
+  if (__mediaPoolApplyingTranscript) return;
+  mediaPoolSyncVisibleTranscriptEditors();
+  clearTimeout(__mediaPoolTranscriptSaveTimer);
+
+  const digest = mediaPoolTranscriptDigest();
+  const changed = digest !== __mediaPoolLastTranscriptDigest;
+
+  try{ mediaPoolSaveCurrentTranscript?.(); }catch(_e){}
+  __mediaPoolLastTranscriptDigest = digest;
+
+  // The video caption overlay is driven by entries / entriesB. Refresh it after
+  // TXT/Transcript Mode blur so edited text appears immediately without waiting
+  // for a mode switch or the next player timeupdate.
+  mediaPoolRefreshOverlayFromCurrentTime();
+
+  if (!changed) return;
+
+  try{ renderMediaPoolTray?.(); }catch(_e){}
+  try{ renderMediaPoolProjectList?.(); }catch(_e){}
+  try{ scheduleStoryReconcile?.({ delay:80 }); }catch(_e){}
+  // Send a full collab state only when the transcript content actually changed.
+  // Cursor/caret presence is still handled by lightweight awareness events.
+  try{ maybeSendCollabStateOverWebSocket?.({ force:true }); }catch(_e){}
+  try{ setTimeout(() => collabApplyDeferredRemoteStateIfSafe?.(), 80); }catch(_e){}
 }
 function mediaPoolRestoreAssetTranscript(asset){
   const key = mediaPoolAssetKey(asset);
@@ -12576,6 +12904,8 @@ function mediaPoolRestoreAssetTranscript(asset){
     if (st.baseName) window.currentBaseName = st.baseName;
     try{ ensureCueIds?.(entries); ensureCueIds?.(entriesB); }catch(_e){}
     try{ renderBySubsMode?.(); }catch(_e){ try{ renderTranscript?.(); }catch(_e2){} }
+    __mediaPoolLastTranscriptDigest = mediaPoolTranscriptDigest();
+    mediaPoolRefreshOverlayFromCurrentTime();
   }finally{
     __mediaPoolApplyingTranscript = false;
   }
@@ -12599,7 +12929,7 @@ function mediaPoolWireTranscriptAutosave(){
   document.addEventListener('blur', ev => {
     const t = ev.target;
     if (t && t.closest && (t.closest('#transcript') || t.closest('#transcriptB') || t.closest('#txtBigBox') || t.closest('#txtBoxA') || t.closest('#txtBoxB'))){
-      mediaPoolSaveCurrentTranscript();
+      mediaPoolFinalizeTranscriptEdit();
     }
   }, true);
 }
@@ -12724,6 +13054,7 @@ function mediaPoolUpsertAsset(asset){
 
   renderMediaPoolTray();
   mediaPoolPersistAssets();
+  try{ if (!COLLAB_APPLYING) maybeSendCollabStateOverWebSocket?.({ force:true }); }catch(_e){}
 }
 
 function loadMediaPoolFromStorage(){
@@ -13794,7 +14125,11 @@ function renderNativeMediaPoolSource(source){
         setStatusSafe(`Added YouTube video to Media Pool: ${meta?.title || 'YouTube video'}`);
       }catch(err){ alert('Add YouTube to Pool failed: ' + (err?.message || err)); }
     });
-    host.querySelector('#mediaPoolOpenYouTubeImport')?.addEventListener('click', () => openYouTubeImportModal?.());
+    host.querySelector('#mediaPoolOpenYouTubeImport')?.addEventListener('click', () => {
+      const url = getUrl();
+      const permission = !!host.querySelector('#mediaPoolYouTubePermission')?.checked;
+      openYouTubeImportModal?.({ url, metadata:probedMeta, permissionConfirmed:permission });
+    });
     renderYouTubeMediaPoolResults(youtubeAssets);
     return;
   }
@@ -14910,6 +15245,10 @@ function buildShareSessionState(){
     use_source_tc: !!useSourceTc,
     source_tc_sec: Number(sourceTcSec || 0),
     media_source: getShareableMediaSource(),
+    // Share the Media Pool in collaborative sessions so Iconik/Drive/YouTube
+    // assets loaded by one user appear for the other users too. Local File
+    // objects are stripped by mediaPoolExportProjectSnapshot().
+    media_pool: (typeof mediaPoolExportProjectSnapshot === 'function') ? mediaPoolExportProjectSnapshot() : null,
     entriesA: (entries || []).map(cleanEntryForShare),
     entriesB: (entriesB || []).map(cleanEntryForShare),
     align_text: box ? String(box.value || '') : '',
@@ -15923,6 +16262,10 @@ function handleCollabWebSocketMessage(msg){
     }
 
     if (msg.state && serverRev >= COLLAB_REVISION){
+      if (collabIsTranscriptEditorFocused()){
+        collabStoreDeferredRemoteState(msg);
+        return;
+      }
       COLLAB_APPLYING = true;
       try{
         applySharedSessionState(msg.state, { preserveMedia: true, remoteUpdate: true });
@@ -15944,17 +16287,28 @@ function maybeSendCollabStateOverWebSocket(opts={}){
   const minStateInterval = (isStoryMode && storyIsEditingOrSelecting()) ? 1400 : 500;
   if (!opts.force && now - COLLAB_WS_LAST_SEND_MS < minStateInterval) return;
 
-  const state = buildShareSessionState();
-  const hash = hashSessionState(state);
-  // Playhead events are awareness-only. They do not modify transcript state and
-  // are used only by users who explicitly choose Follow Presenter.
+  // Playhead/caret/presence are awareness-only. They do not modify transcript state.
   sendCollabPlayheadUpdate();
   if (isTimelineMode) sendTimelinePresence('viewing');
   if (isStoryMode){
     const snap = storySnapshotEditingFocus();
     if (snap?.rowId && snap?.cardId) sendCollabStoryCursor(snap.rowId, snap.cardId, snap.cueId || '', snap.field === 'mini' ? 'mini' : 'card');
   }
-  if (hash === COLLAB_LAST_HASH){
+
+  // While a transcript cue is focused, never broadcast a full state snapshot.
+  // That snapshot can echo back and re-render the editor, collapsing the caret.
+  // The final transcript state is pushed by mediaPoolFinalizeTranscriptEdit() on blur.
+  if (collabIsTranscriptEditorFocused() && !opts.force){
+    if (now - COLLAB_WS_LAST_SEND_MS > 5000){
+      COLLAB_WS.send(JSON.stringify({ type:'presence_ping', user_id: COLLAB_USER_ID }));
+      COLLAB_WS_LAST_SEND_MS = now;
+    }
+    return;
+  }
+
+  const state = buildShareSessionState();
+  const hash = hashSessionState(state);
+  if (hash === COLLAB_LAST_HASH && !opts.force){
     // Presence heartbeat keeps live user list fresh without sending transcript state.
     if (now - COLLAB_WS_LAST_SEND_MS > 5000){
       COLLAB_WS.send(JSON.stringify({ type:'presence_ping', user_id: COLLAB_USER_ID }));
@@ -15990,15 +16344,17 @@ function startCollabSync(){
 async function syncCollaborativeSession(){
   if (!COLLAB_SESSION_ID || !COLLAB_USER_ID || VIEW_ONLY_SESSION || COLLAB_APPLYING) return;
 
+  const transcriptFocused = collabIsTranscriptEditorFocused();
   const localState = buildShareSessionState();
   const localHash = hashSessionState(localState);
   const localDirty = localHash !== COLLAB_LAST_HASH;
+  const canPushStateNow = localDirty && !transcriptFocused;
 
   const payload = {
     user_id: COLLAB_USER_ID,
     client_revision: COLLAB_REVISION,
-    dirty: localDirty,
-    state: localDirty ? localState : null
+    dirty: canPushStateNow,
+    state: canPushStateNow ? localState : null
   };
 
   const res = await fetch(`${API_BASE}/api/collab_session/${encodeURIComponent(COLLAB_SESSION_ID)}/sync`, {
@@ -16015,7 +16371,7 @@ async function syncCollaborativeSession(){
   // If this browser just pushed a local change, accept the new server revision.
   // Because hashSessionState is now stable, this only happens when actual
   // transcript/session data changed, not on every polling tick.
-  if (localDirty && updatedBy === COLLAB_USER_ID){
+  if (canPushStateNow && updatedBy === COLLAB_USER_ID){
     COLLAB_REVISION = Math.max(COLLAB_REVISION, serverRev);
     COLLAB_LAST_HASH = localHash;
     setCollabSyncStatus('saved');
@@ -16025,16 +16381,16 @@ async function syncCollaborativeSession(){
   // If another browser has a newer revision, apply it immediately so the UI
   // updates without refresh. This is the automatic frontend refresh path.
   if (serverRev > COLLAB_REVISION && updatedBy !== COLLAB_USER_ID && data.state){
+    if (transcriptFocused){
+      collabStoreDeferredRemoteState({ state:data.state, revision:serverRev, updated_by:updatedBy });
+      return;
+    }
     COLLAB_APPLYING = true;
     try{
-      const active = document.activeElement;
-      const wasEditingText = !!(active && active.closest && active.closest('.text'));
       applySharedSessionState(data.state, { remoteUpdate: true });
       COLLAB_REVISION = serverRev;
       COLLAB_LAST_HASH = hashSessionState(buildShareSessionState());
       setCollabSyncStatus('updated');
-      // Do not try to restore focus after remote apply; it can place the caret
-      // into stale DOM nodes. Last-save-wins is intentional for this PoC.
     } finally {
       COLLAB_APPLYING = false;
     }
@@ -16042,7 +16398,12 @@ async function syncCollaborativeSession(){
   }
 
   COLLAB_REVISION = Math.max(COLLAB_REVISION, serverRev);
-  COLLAB_LAST_HASH = localHash;
+  // If a transcript editor is focused and local state is dirty, the polling
+  // fallback intentionally did NOT push that state. Do not mark it as saved,
+  // otherwise the blur/finalize commit will think there is nothing to send.
+  if (!localDirty || !transcriptFocused){
+    COLLAB_LAST_HASH = localHash;
+  }
   setCollabSyncStatus('live');
 }
 
@@ -16128,6 +16489,12 @@ function applySharedSessionState(state, opts={}){
   if (tcFps) tcFps.textContent = getFPS();
   useSourceTc = !!st.use_source_tc;
   sourceTcSec = Number(st.source_tc_sec || 0);
+
+  if (st.media_pool || st.mediaPool || st.project_media_pool || st.projectMediaPool){
+    try{
+      mediaPoolImportProjectSnapshot?.(st.media_pool || st.mediaPool || st.project_media_pool || st.projectMediaPool);
+    }catch(_e){ console.warn('Collaborative Media Pool import failed', _e); }
+  }
 
   entries = Array.isArray(st.entriesA) ? st.entriesA.map((e, idx) => ({
     id: String(e.id || '') || (typeof makeCueId === 'function' ? makeCueId() : ('cue_A_' + idx + '_' + Date.now())),
