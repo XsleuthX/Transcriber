@@ -5972,6 +5972,15 @@ body.theme-light .tl-marker-ctx-menu button:hover{ background:rgba(184,137,47,.1
   padding:0 8px;
   font-size:12px;
 }
+/* The dropdown popup is rendered by the OS/browser using a white background
+   regardless of theme. Force option text to stay dark so it stays readable
+   against that white popup. Without this, dark-mode users see white-on-white
+   inside the opened dropdown. The closed select keeps its themed colors via
+   the rule above (which targets the .story-source-select itself). */
+.story-source-select option{
+  color:#1a1410;
+  background:#ffffff;
+}
 .story-source-select:focus{
   outline:none;
   border-color:rgba(215,180,106,.65);
@@ -6587,4 +6596,460 @@ body.theme-light .story-source-select{
   background:transparent;
   border-color:var(--ink-dim);
   opacity:.55;
+}
+
+/* ============================================================================
+   Multi-Timeline — linked clip groups (Drop 1)
+   ============================================================================ */
+
+/* Linked clips get a small chain icon at the top-left corner and a 1px tinted
+   accent on the side so it's instantly clear they're in a group. The marker
+   sits above the source/label text and doesn't interfere with selection or
+   playback highlights. */
+.mtl-clip.linked::before{
+  content:"⛓";
+  position:absolute;
+  top:2px; left:4px;
+  font-size:9px;
+  line-height:1;
+  opacity:.65;
+  pointer-events:none;
+  text-shadow:0 1px 1px rgba(0,0,0,.5);
+}
+.mtl-clip.linked{
+  /* Subtle inset accent on the left edge to reinforce the group affordance. */
+  box-shadow: inset 2px 0 0 rgba(255,255,255,.18);
+}
+.mtl-clip.linked.selected{
+  box-shadow: inset 2px 0 0 rgba(255,255,255,.45), 0 0 0 1.5px var(--gold);
+}
+
+/* Right-click context menu on clip blocks. */
+.mtl-clip-context-menu{
+  position:fixed;
+  z-index:9700;
+  min-width:170px;
+  display:flex; flex-direction:column;
+  background:linear-gradient(180deg, rgba(28,30,38,.98), rgba(20,22,28,.98));
+  border:1px solid var(--line);
+  border-radius:8px;
+  padding:5px;
+  box-shadow:0 18px 50px rgba(0,0,0,.55);
+}
+.mtl-clip-context-menu button{
+  appearance:none; border:0; background:transparent;
+  color:var(--ink);
+  text-align:left;
+  font-size:12.5px;
+  padding:7px 12px;
+  border-radius:5px;
+  cursor:pointer;
+}
+.mtl-clip-context-menu button:hover{
+  background:rgba(215,180,106,.14);
+  color:#fff;
+}
+
+/* ============================================================================
+   Story Card → convert-to-Generic confirmation modal (Drop 1 fix)
+   ============================================================================ */
+
+.story-convert-confirm-overlay{
+  position:fixed; inset:0;
+  background:rgba(8,10,14,.72);
+  display:flex; align-items:center; justify-content:center;
+  z-index:9800;
+  backdrop-filter:blur(4px);
+  -webkit-backdrop-filter:blur(4px);
+}
+.story-convert-confirm-card{
+  width:min(460px, 92vw);
+  background:linear-gradient(180deg, rgba(20,22,28,.98), rgba(14,16,21,.98));
+  border:1px solid var(--line);
+  border-radius:14px;
+  padding:18px 20px 16px;
+  color:var(--ink);
+  box-shadow:0 30px 80px rgba(0,0,0,.65);
+}
+.story-convert-confirm-title{
+  font-family:'Fraunces', serif;
+  font-size:17px; font-weight:650; letter-spacing:.2px;
+  color:#f0e9d8;
+  margin-bottom:10px;
+}
+.story-convert-confirm-body{
+  font-size:13px; line-height:1.5; color:var(--ink);
+}
+.story-convert-confirm-body p{ margin:6px 0 8px; }
+.story-convert-confirm-tc{
+  text-align:center;
+  font-family:'JetBrains Mono', ui-monospace, monospace;
+  font-size:14px;
+  background:rgba(215,180,106,.08);
+  border:1px solid rgba(215,180,106,.22);
+  border-radius:6px;
+  padding:8px;
+}
+.story-convert-confirm-note{
+  font-size:11.5px;
+  color:var(--ink-dim);
+  margin-top:10px;
+}
+.story-convert-confirm-actions{
+  display:flex; justify-content:flex-end; gap:8px;
+  margin-top:14px;
+}
+.story-convert-confirm-actions button{
+  appearance:none; border:1px solid var(--line);
+  background:rgba(255,255,255,.04);
+  color:var(--ink);
+  padding:7px 14px;
+  border-radius:7px;
+  font-size:13px;
+  cursor:pointer;
+}
+.story-convert-confirm-actions button:hover{ background:rgba(255,255,255,.08); }
+.story-convert-confirm-actions button.primary{
+  background:linear-gradient(180deg, var(--gold), var(--gold-2));
+  color:#1a1410;
+  border-color:transparent;
+  font-weight:650;
+}
+.story-convert-confirm-actions button.primary:hover{
+  filter:brightness(1.06);
+}
+body.theme-light .story-convert-confirm-card{
+  background:#fffdf8;
+  color:#1a1410;
+  border-color:#d8cdb3;
+}
+body.theme-light .story-convert-confirm-title{ color:#1a1410; }
+body.theme-light .story-convert-confirm-note{ color:#7a6f54; }
+
+/* ============================================================================
+   Source Timeline — empty-state banner (Drop 1 fix #3)
+   ============================================================================ */
+
+.tl-no-asset-banner{
+  position:absolute;
+  inset:0;
+  display:flex; flex-direction:column;
+  align-items:center; justify-content:center;
+  gap:8px;
+  padding:30px;
+  text-align:center;
+  background:linear-gradient(180deg, rgba(20,22,28,.55), rgba(14,16,21,.40));
+  pointer-events:none;
+  z-index:60;
+}
+.tl-no-asset-title{
+  font-family:'Fraunces', serif;
+  font-size:20px; font-weight:650; letter-spacing:.3px;
+  color:#f0e9d8;
+  text-shadow:0 1px 2px rgba(0,0,0,.45);
+}
+.tl-no-asset-body{
+  max-width:420px;
+  font-size:13px; line-height:1.5;
+  color:var(--ink-dim);
+}
+body.theme-light .tl-no-asset-banner{
+  background:linear-gradient(180deg, rgba(255,253,248,.65), rgba(245,238,224,.55));
+}
+body.theme-light .tl-no-asset-title{ color:#1a1410; text-shadow:none; }
+body.theme-light .tl-no-asset-body{ color:#5a4f38; }
+/* Dim the clip-list panel when there's no active asset so the user can't
+   click into a disabled UI. The banner sits over the timeline body. */
+.tl-no-asset .tl-clip-list-section{ opacity:.45; pointer-events:none; }
+
+/* ============================================================================
+   Story Card lifecycle — Drop 2 polish
+   ============================================================================ */
+
+/* --- Fade-in chip on cards just converted via Scenario B --- */
+/* Appears under the timecode after a cue/clip card flips to generic from a
+   body edit. Auto-fades after ~5s (cleanup timer in storyConvertCard...).
+   The whole chip is a clickable button — clicking it runs Link to Cues. */
+.story-card-just-converted{
+  display:block;
+  width:100%;
+  margin:6px 0 2px;
+  padding:7px 10px;
+  font-size:11.5px;
+  line-height:1.35;
+  text-align:left;
+  color:#f0e9d8;
+  background:linear-gradient(180deg, rgba(215,180,106,.16), rgba(215,180,106,.06));
+  border:1px solid rgba(215,180,106,.32);
+  border-radius:7px;
+  cursor:pointer;
+  animation: storyChipInOut 5500ms ease-out forwards;
+}
+.story-card-just-converted:hover{
+  background:linear-gradient(180deg, rgba(215,180,106,.22), rgba(215,180,106,.10));
+  border-color:rgba(215,180,106,.55);
+}
+.story-card-just-converted-action{
+  display:inline-block;
+  margin-left:6px;
+  padding:1px 7px;
+  border-radius:999px;
+  background:rgba(215,180,106,.28);
+  color:#fff;
+  font-weight:650;
+  font-size:10.5px;
+}
+@keyframes storyChipInOut{
+  0%   { opacity:0; transform:translateY(-3px); }
+  6%   { opacity:1; transform:translateY(0); }
+  88%  { opacity:1; transform:translateY(0); }
+  100% { opacity:0; transform:translateY(-2px); }
+}
+body.theme-light .story-card-just-converted{
+  color:#5a3a1d;
+  background:linear-gradient(180deg, rgba(184,137,47,.16), rgba(184,137,47,.05));
+  border-color:rgba(184,137,47,.45);
+}
+body.theme-light .story-card-just-converted-action{
+  background:#b8892f;
+  color:#fff;
+}
+
+/* --- Right-click context menu on generic Story Cards --- */
+.story-generic-context-menu{
+  position:fixed;
+  z-index:9700;
+  min-width:230px;
+  display:flex; flex-direction:column;
+  background:linear-gradient(180deg, rgba(28,30,38,.98), rgba(20,22,28,.98));
+  border:1px solid var(--line);
+  border-radius:8px;
+  padding:5px;
+  box-shadow:0 18px 50px rgba(0,0,0,.55);
+}
+.story-generic-context-menu button{
+  appearance:none; border:0; background:transparent;
+  color:var(--ink);
+  text-align:left;
+  font-size:12.5px;
+  padding:8px 12px;
+  border-radius:5px;
+  cursor:pointer;
+}
+.story-generic-context-menu button:hover:not(:disabled){
+  background:rgba(215,180,106,.14);
+  color:#fff;
+}
+.story-generic-context-menu button:disabled{
+  opacity:.4;
+  cursor:not-allowed;
+}
+body.theme-light .story-generic-context-menu{
+  background:#fffdf8;
+  border-color:#d8cdb3;
+}
+body.theme-light .story-generic-context-menu button{ color:#1a1410; }
+body.theme-light .story-generic-context-menu button:hover:not(:disabled){
+  background:rgba(184,137,47,.14);
+  color:#1a1410;
+}
+
+/* --- Apply & Re-link confirm modal — preview pane + two-action buttons --- */
+.story-convert-confirm-options{
+  margin-top:6px;
+  font-size:12px;
+  color:var(--ink-dim);
+}
+.story-convert-confirm-bullets{
+  margin:4px 0 8px 0;
+  padding-left:18px;
+  font-size:12px;
+  line-height:1.55;
+}
+.story-convert-confirm-bullets li{ margin:3px 0; }
+.story-convert-confirm-bullets b{ color:#f0e9d8; }
+body.theme-light .story-convert-confirm-bullets b{ color:#1a1410; }
+
+.story-convert-confirm-preview{
+  margin:6px 0 0;
+  padding:10px;
+  background:rgba(255,255,255,.035);
+  border:1px solid var(--line);
+  border-radius:8px;
+  max-height:180px;
+  overflow-y:auto;
+}
+.story-convert-confirm-preview-title{
+  font-size:11px; font-weight:650; letter-spacing:.4px;
+  color:var(--gold-2, #e8c979);
+  text-transform:uppercase;
+  margin-bottom:6px;
+}
+.story-convert-confirm-preview-list{
+  margin:0;
+  padding-left:18px;
+  font-size:12px;
+  line-height:1.45;
+}
+.story-convert-confirm-preview-list li{
+  margin:3px 0;
+  color:var(--ink);
+}
+.story-convert-confirm-preview-tc{
+  display:inline-block;
+  margin-right:8px;
+  font-family:'JetBrains Mono', ui-monospace, monospace;
+  font-size:11px;
+  color:var(--ink-dim);
+}
+.story-convert-confirm-preview-empty{
+  font-size:12px;
+  font-style:italic;
+  color:var(--ink-dim);
+  text-align:center;
+  padding:14px 8px;
+}
+body.theme-light .story-convert-confirm-preview{
+  background:#fff8e8;
+  border-color:#e0d4b0;
+}
+body.theme-light .story-convert-confirm-preview-title{
+  color:#a36b1c;
+}
+
+/* Secondary action button (Apply & Convert) — same shape as the cancel
+   button but with a slightly stronger contrast since it's a real commit. */
+.story-convert-confirm-convert{
+  appearance:none; border:1px solid var(--line);
+  background:rgba(255,255,255,.06);
+  color:var(--ink);
+  padding:7px 14px;
+  border-radius:7px;
+  font-size:13px;
+  cursor:pointer;
+}
+.story-convert-confirm-convert:hover{ background:rgba(255,255,255,.10); }
+.story-convert-confirm-ok:disabled,
+.story-convert-confirm-convert:disabled{
+  opacity:.45;
+  cursor:not-allowed;
+}
+body.theme-light .story-convert-confirm-convert{
+  background:#fff8e8;
+  color:#1a1410;
+  border-color:#d8cdb3;
+}
+
+/* ============================================================================
+   Story Cue Range Preview Floater (Drop 2 follow-up)
+   ----------------------------------------------------------------------------
+   Floating, draggable companion to the Edit Story Card timecode popover for
+   cue/clip cards. Live-updates as the user types In/Out so they can see what
+   re-linking will bind the card to.
+   ============================================================================ */
+.story-cue-range-preview-floater{
+  position:fixed;
+  z-index:9750;
+  width:320px;
+  height:auto;
+  min-width:220px;
+  min-height:140px;
+  max-height:80vh;
+  display:flex; flex-direction:column;
+  background:linear-gradient(180deg, rgba(28,30,38,.98), rgba(18,20,26,.98));
+  border:1px solid var(--line);
+  border-radius:10px;
+  box-shadow:0 20px 50px rgba(0,0,0,.55);
+  font-size:12.5px;
+  color:var(--ink);
+  overflow:hidden;
+  /* Both-axis resize handle in the bottom-right corner. The browser draws a
+     small diagonal grip; we leave space for it via padding on the body. */
+  resize:both;
+}
+.story-cue-range-preview-header{
+  display:flex; align-items:center; justify-content:space-between;
+  padding:8px 10px 7px;
+  background:rgba(255,255,255,.04);
+  border-bottom:1px solid var(--line);
+  cursor:move;
+  user-select:none;
+}
+.story-cue-range-preview-title{
+  font-weight:650;
+  font-size:11px;
+  letter-spacing:.5px;
+  text-transform:uppercase;
+  color:var(--gold-2, #e8c979);
+}
+.story-cue-range-preview-close{
+  appearance:none; border:0; background:transparent;
+  color:var(--ink-dim);
+  font-size:18px; line-height:1;
+  width:22px; height:22px;
+  border-radius:4px;
+  cursor:pointer;
+}
+.story-cue-range-preview-close:hover{ background:rgba(255,255,255,.08); color:var(--ink); }
+
+.story-cue-range-preview-body{
+  flex:1 1 auto;
+  overflow-y:auto;
+  padding:6px 4px;
+}
+.story-cue-range-preview-list{
+  margin:0;
+  padding:0 8px 4px 28px;
+  list-style:decimal;
+}
+.story-cue-range-preview-list li{
+  margin:6px 0;
+  line-height:1.45;
+}
+.story-cue-range-preview-tc{
+  display:inline-block;
+  margin-right:8px;
+  font-family:'JetBrains Mono', ui-monospace, monospace;
+  font-size:11px;
+  color:var(--ink-dim);
+}
+.story-cue-range-preview-text{
+  color:var(--ink);
+}
+.story-cue-range-preview-empty{
+  padding:16px 12px;
+  font-style:italic;
+  font-size:12px;
+  color:var(--ink-dim);
+  text-align:center;
+}
+body.theme-light .story-cue-range-preview-floater{
+  background:#fffdf8;
+  color:#1a1410;
+  border-color:#d8cdb3;
+}
+body.theme-light .story-cue-range-preview-header{
+  background:#f9f1e0;
+  border-bottom-color:#d8cdb3;
+}
+body.theme-light .story-cue-range-preview-title{
+  color:#a36b1c;
+}
+body.theme-light .story-cue-range-preview-tc{
+  color:#7a6f54;
+}
+body.theme-light .story-cue-range-preview-empty{
+  color:#7a6f54;
+}
+
+/* Visual separator before the "Convert To Generic Card" entry in the cue-body
+   context menu, so the kind-transition action is visually distinct from the
+   per-cue actions above it. */
+.story-context-menu-separator{
+  height:1px;
+  margin:4px 6px;
+  background:var(--line);
+}
+body.theme-light .story-context-menu-separator{
+  background:#d8cdb3;
 }
