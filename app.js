@@ -352,6 +352,8 @@ function setDualMode(on){
 }
 
 
+let __subtitleSplitSuppressFinalizeUntil = 0;
+
 // Robust Subtitle Mode split helper used by Enter in the cue editor.
 // This mirrors Transcript Mode's Split Cue at Caret logic: the text after the
 // caret always becomes the newly-created cue, and the new cue ends at the
@@ -423,12 +425,20 @@ function splitSubtitleCueAtCaret(index, track='A', textEl=null, containerEl=null
     ? ((subsMode === 'B') ? transcriptEl : (document.getElementById('transcriptB') || transcriptEl))
     : transcriptEl;
   const newTxt = targetBox?.querySelector?.(`[data-index="${index + 1}"] .text`);
-  if (newTxt){
-    focusNoScroll(newTxt);
-    setCaretOffset(newTxt, 0);
-  }
 
-  try{ mediaPoolFinalizeTranscriptEdit?.(); }catch(_e){}
+  // Re-rendering removes the focused old row, which can fire blur-level autosave
+  // while the split is only half-finished. Suppress that stale finalize briefly,
+  // then save/focus after the browser has settled on the newly rendered rows.
+  __subtitleSplitSuppressFinalizeUntil = Date.now() + 180;
+  setTimeout(() => {
+    __subtitleSplitSuppressFinalizeUntil = 0;
+    try{ mediaPoolFinalizeTranscriptEdit?.(); }catch(_e){}
+    if (newTxt && document.body.contains(newTxt)){
+      focusNoScroll(newTxt);
+      setCaretOffset(newTxt, 0);
+    }
+  }, 0);
+
   try{ notifyTxtCueEdit?.(index + 1, { structural:true, track }); }catch(_e){}
   mediaPoolRefreshOverlayFromCurrentTime?.();
   return true;
@@ -583,10 +593,12 @@ function renderTranscriptB(targetEl=null){
       selectRowIn('B', i, { scroll: false });
       sendCollabActiveCue('B', i);
       if (!isCueRemoteLocked('B', i)) sendCollabCueLock('B', i);
-      try{ sendCollabCaret('B', i, getCaretOffset(textEl)); }catch(_e){}
+      try{ sendCollabCaret('B', i, rememberEditableCaret(textEl)); }catch(_e){}
     });
     textEl.addEventListener('blur', () => { sendCollabCueUnlock('B', i); });
-    textEl.addEventListener('keyup', () => { try{ sendCollabCaret('B', i, getCaretOffset(textEl)); }catch(_e){} });
+    textEl.addEventListener('mouseup', () => { rememberEditableCaret(textEl); });
+    textEl.addEventListener('pointerup', () => { rememberEditableCaret(textEl); });
+    textEl.addEventListener('keyup', () => { try{ sendCollabCaret('B', i, rememberEditableCaret(textEl)); }catch(_e){} });
 
 
     // --- 1) Force paste as plain text (strip source formatting) ---
@@ -601,67 +613,14 @@ function renderTranscriptB(targetEl=null){
 
 
     // --- 2) Enter to split caption at caret ---
+    textEl.addEventListener('beforeinput', (ev) => {
+      if (ev.inputType === 'insertParagraph'){
+        handleSubtitleEnterSplit(ev, i, 'B', textEl, bEl, getBeforeInputRange(ev));
+      }
+    });
     textEl.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter' && !ev.shiftKey){
-        if (locked) return;
-        ev.preventDefault();
-        const caret = getCaretOffset(textEl);
-        const full  = textEl.textContent || '';
-        const left  = full.slice(0, caret).trimEnd();
-        const right = full.slice(caret).trimStart();
-
-        // Snapshot original timing
-        const origStart = entriesB[i].start;
-        const origEnd   = entriesB[i].end;
-        // The new cue should inherit the right-hand portion of the current
-        // cue's original duration. Do not extend it to the next cue's IN,
-        // because gaps between cues should remain gaps.
-
-        const f = getFPS();
-        const startF = secToFrames(origStart, f);
-        const endF   = secToFrames(origEnd,   f);
-        let midF = Math.floor((startF + endF) / 2);
-
-        // Ensure valid durations (at least 1 frame if possible)
-        if (midF <= startF) midF = startF + 1;
-
-        const midSec = framesToSec(midF, f);
-
-        // Apply text updates
-        entriesB[i].text = left;
-
-        // 1) Rule: keep IN; set OUT to midpoint
-        entriesB[i].end = midSec;
-
-        // 2) New cue: IN = midpoint; OUT = the original cue's OUT
-        let newStart = midSec;
-        let newEnd   = origEnd;
-        if (newEnd <= newStart) newEnd = newStart + (1 / f);
-
-        const newCap = {
-          start: newStart,
-          end:   newEnd,
-          text:  right,
-          orig:  { start: newStart, end: newEnd, text: right },
-          origIndex: null,
-          isNew: true
-        };
-
-        const st = bEl.scrollTop;
-        entriesB.splice(i+1, 0, newCap);
-        activeOverlayTrack = 'B';
-        renderTranscriptB(bEl);
-        bEl.scrollTop = st;
-        applyLockState('B');
-        if (subsMode === 'DUAL')
-        suppressAutoScrollUntil = nowMs() + 800;
-        holdManualSelection(i+1, 2000);
-        selectRowIn('B', i+1, { scroll:false });
-        const newTxt = bEl.querySelector(`[data-index="${i+1}"] .text`);
-        if (newTxt){
-          focusNoScroll(newTxt);
-          setCaretOffset(newTxt, 0);
-        }
+      if (ev.key === 'Enter' && !ev.shiftKey && !shouldUseBeforeInputForEnterSplit()){
+        handleSubtitleEnterSplit(ev, i, 'B', textEl, bEl);
       }
     });
     textEl.addEventListener('blur', clearManualSelection);
@@ -744,13 +703,29 @@ const framesToSec = (fr, f=getFPS()) => Math.max(0, fr / f);
 
 /* ---------- Selection & caret helpers (for contentEditable) ---------- */
 function getCaretOffset(el){
+  const textLen = String(el?.textContent || '').length;
   const sel = window.getSelection();
-  if (!sel || sel.rangeCount === 0) return 0;
+  if (!sel || sel.rangeCount === 0 || !el || !el.contains(sel.anchorNode)) return Number.isFinite(Number(el?.__lastCaretOffset)) ? Math.max(0, Math.min(Number(el.__lastCaretOffset), textLen)) : 0;
   const range = sel.getRangeAt(0);
   const preRange = range.cloneRange();
   preRange.selectNodeContents(el);
   preRange.setEnd(range.endContainer, range.endOffset);
-  return preRange.toString().length;
+  const off = Math.max(0, Math.min(preRange.toString().length, textLen));
+  el.__lastCaretOffset = off;
+  return off;
+}
+function rememberEditableCaret(el, fallback=null){
+  if (!el) return 0;
+  const textLen = String(el.textContent || '').length;
+  const fb = Number.isFinite(Number(fallback)) ? Number(fallback) : (Number.isFinite(Number(el.__lastCaretOffset)) ? Number(el.__lastCaretOffset) : textLen);
+  const off = getSafeCaretOffset(el, fb);
+  el.__lastCaretOffset = Math.max(0, Math.min(Number(off || 0), textLen));
+  return el.__lastCaretOffset;
+}
+function getCueIndexFromTextElement(textEl, fallbackIndex=0){
+  const raw = textEl?.closest?.('[data-index]')?.dataset?.index;
+  const idx = Number(raw);
+  return Number.isFinite(idx) ? idx : Number(fallbackIndex || 0);
 }
 function setCaretOffset(el, offset){
   const range = document.createRange();
@@ -832,6 +807,53 @@ function getEditableSplitParts(el, fallbackText='', fallbackCaret=null){
   if (Number.isFinite(remembered)) caret = remembered;
   caret = Math.max(0, Math.min(Number(caret || 0), full.length));
   return { full, left: full.slice(0, caret), right: full.slice(caret), caret };
+}
+function getEditableSplitPartsFromRange(el, sourceRange=null, fallbackText='', fallbackCaret=null){
+  const full = String(el?.textContent ?? fallbackText ?? '');
+  if (el && sourceRange){
+    try{
+      const startContainer = sourceRange.startContainer;
+      const endContainer = sourceRange.endContainer;
+      if (el.contains(startContainer) && el.contains(endContainer)){
+        const before = document.createRange();
+        before.selectNodeContents(el);
+        before.setEnd(startContainer, sourceRange.startOffset);
+        const after = document.createRange();
+        after.selectNodeContents(el);
+        after.setStart(endContainer, sourceRange.endOffset);
+        const left = before.toString();
+        const right = after.toString();
+        const caret = Math.max(0, Math.min(left.length, full.length));
+        el.__lastCaretOffset = caret;
+        return { full, left, right, caret };
+      }
+    }catch(_e){}
+  }
+  return getEditableSplitParts(el, fallbackText, fallbackCaret);
+}
+function getBeforeInputRange(ev){
+  try{
+    const ranges = typeof ev.getTargetRanges === 'function' ? ev.getTargetRanges() : null;
+    return ranges && ranges.length ? ranges[0] : null;
+  }catch(_e){ return null; }
+}
+function handleSubtitleEnterSplit(ev, fallbackIndex, track, textEl, box, sourceRange=null){
+  if (ev?.__subtitleSplitHandled) return true;
+  if (isTrackLocked(track) || VIEW_ONLY_SESSION) return false;
+  ev?.preventDefault?.();
+  ev?.stopImmediatePropagation?.();
+  if (ev) ev.__subtitleSplitHandled = true;
+
+  const list = track === 'B' ? entriesB : entries;
+  const rowIndex = getCueIndexFromTextElement(textEl, fallbackIndex);
+  const fallbackCaret = Number.isFinite(Number(textEl?.__lastCaretOffset))
+    ? Number(textEl.__lastCaretOffset)
+    : Math.min(String(textEl?.textContent || list[rowIndex]?.text || '').length, getCaretOffset(textEl));
+  const parts = getEditableSplitPartsFromRange(textEl, sourceRange, textEl?.textContent || list[rowIndex]?.text || '', fallbackCaret);
+  return splitSubtitleCueAtCaret(rowIndex, track, textEl, box, parts.caret, parts);
+}
+function shouldUseBeforeInputForEnterSplit(){
+  return typeof InputEvent !== 'undefined' && typeof InputEvent.prototype?.getTargetRanges === 'function';
 }
 
 function insertPlainTextAtCursor(text){
@@ -1055,10 +1077,12 @@ function renderTranscript(){
       selectRow(i, { scroll: false });
       sendCollabActiveCue('A', i);
       if (!isCueRemoteLocked('A', i)) sendCollabCueLock('A', i);
-      try{ sendCollabCaret('A', i, getCaretOffset(textEl)); }catch(_e){}
+      try{ sendCollabCaret('A', i, rememberEditableCaret(textEl)); }catch(_e){}
     });
     textEl.addEventListener('blur', () => { sendCollabCueUnlock('A', i); });
-    textEl.addEventListener('keyup', () => { try{ sendCollabCaret('A', i, getCaretOffset(textEl)); }catch(_e){} });
+    textEl.addEventListener('mouseup', () => { rememberEditableCaret(textEl); });
+    textEl.addEventListener('pointerup', () => { rememberEditableCaret(textEl); });
+    textEl.addEventListener('keyup', () => { try{ sendCollabCaret('A', i, rememberEditableCaret(textEl)); }catch(_e){} });
 
 
     // --- 1) Force paste as plain text (strip source formatting) ---
@@ -1073,65 +1097,14 @@ function renderTranscript(){
 
 
     // --- 2) Enter to split caption at caret ---
+    textEl.addEventListener('beforeinput', (ev) => {
+      if (ev.inputType === 'insertParagraph'){
+        handleSubtitleEnterSplit(ev, i, 'A', textEl, transcriptEl, getBeforeInputRange(ev));
+      }
+    });
     textEl.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter' && !ev.shiftKey){
-        if (locked) return;
-        ev.preventDefault();
-        const caret = getCaretOffset(textEl);
-        const full  = textEl.textContent || '';
-        const left  = full.slice(0, caret).trimEnd();
-        const right = full.slice(caret).trimStart();
-
-        // Snapshot original timing
-        const origStart = entries[i].start;
-        const origEnd   = entries[i].end;
-        // The new cue should inherit the right-hand portion of the current
-        // cue's original duration. Do not extend it to the next cue's IN,
-        // because gaps between cues should remain gaps.
-
-        const f = getFPS();
-        const startF = secToFrames(origStart, f);
-        const endF   = secToFrames(origEnd,   f);
-        let midF = Math.floor((startF + endF) / 2);
-
-        // Ensure valid durations (at least 1 frame if possible)
-        if (midF <= startF) midF = startF + 1;
-
-        const midSec = framesToSec(midF, f);
-
-        // Apply text updates
-        entries[i].text = left;
-
-        // 1) Rule: keep IN; set OUT to midpoint
-        entries[i].end = midSec;
-
-        // 2) New cue: IN = midpoint; OUT = the original cue's OUT
-        let newStart = midSec;
-        let newEnd   = origEnd;
-        if (newEnd <= newStart) newEnd = newStart + (1 / f);
-
-        const newCap = {
-          start: newStart,
-          end:   newEnd,
-          text:  right,
-          orig:  { start: newStart, end: newEnd, text: right },
-          origIndex: null,
-          isNew: true
-        };
-
-        const st = transcriptEl.scrollTop;
-        entries.splice(i+1, 0, newCap);
-        renderTranscript();
-        transcriptEl.scrollTop = st;
-        if (subsMode === 'DUAL')
-        suppressAutoScrollUntil = nowMs() + 800;
-        holdManualSelection(i+1, 2000);
-        selectRow(i+1, { scroll:false });
-        const newTxt = transcriptEl.querySelector(`[data-index="${i+1}"] .text`);
-        if (newTxt){
-          focusNoScroll(newTxt);
-          setCaretOffset(newTxt, 0);
-        }
+      if (ev.key === 'Enter' && !ev.shiftKey && !shouldUseBeforeInputForEnterSplit()){
+        handleSubtitleEnterSplit(ev, i, 'A', textEl, transcriptEl);
       }
     });
     textEl.addEventListener('blur', clearManualSelection);
@@ -3149,31 +3122,37 @@ function renderTxtCueRows(track='A', box, { focusIndex=null, focusCueId=null, ca
 
       if ((ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) || ev.key === 'F4'){
         ev.preventDefault();
+        ev.__txtHandled = true;
         seekTxtLineToCue({ play:false });
         return;
       }
       if (ev.key === 'Enter' && !ev.shiftKey){
         ev.preventDefault();
+        ev.__txtHandled = true;
         splitTxtCue(i, caret, track);
         return;
       }
       if (ev.key === 'Backspace' && collapsed && caret <= 0){
         ev.preventDefault();
+        ev.__txtHandled = true;
         mergeTxtCueWithPrevious(i, track);
         return;
       }
       if (ev.key === 'Delete' && collapsed && caret >= full.length){
         ev.preventDefault();
+        ev.__txtHandled = true;
         mergeTxtCueWithNext(i, track);
         return;
       }
       if (ev.altKey && ev.key === 'ArrowUp'){
         ev.preventDefault();
+        ev.__txtHandled = true;
         pushTxtCueUp(i, track);
         return;
       }
       if (ev.altKey && ev.key === 'ArrowDown'){
         ev.preventDefault();
+        ev.__txtHandled = true;
         pushTxtCueDown(i, track);
         return;
       }
@@ -13126,6 +13105,7 @@ function mediaPoolMarkTranscriptDirty(){
 }
 function mediaPoolFinalizeTranscriptEdit(){
   if (__mediaPoolApplyingTranscript) return;
+  if (Date.now() < __subtitleSplitSuppressFinalizeUntil) return;
   mediaPoolSyncVisibleTranscriptEditors();
   clearTimeout(__mediaPoolTranscriptSaveTimer);
 
