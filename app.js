@@ -352,6 +352,89 @@ function setDualMode(on){
 }
 
 
+// Robust Subtitle Mode split helper used by Enter in the cue editor.
+// This mirrors Transcript Mode's Split Cue at Caret logic: the text after the
+// caret always becomes the newly-created cue, and the new cue ends at the
+// original cue OUT, not at the next cue's IN. This prevents the next cue's text
+// from appearing to "take over" after a split.
+function splitSubtitleCueAtCaret(index, track='A', textEl=null, containerEl=null, caretOverride=null, splitParts=null){
+  track = (track === 'B') ? 'B' : 'A';
+  if (isTrackLocked(track) || VIEW_ONLY_SESSION) return false;
+  const list = (track === 'B') ? entriesB : entries;
+  const cue = list[index];
+  if (!cue) return false;
+
+  const box = containerEl || ((track === 'B') ? (document.getElementById('transcriptB') || transcriptEl) : transcriptEl);
+  const row = textEl ? textEl.closest?.('[data-index]') : box?.querySelector?.(`[data-index="${index}"]`);
+  const txtEl = textEl || row?.querySelector?.('.text');
+  const parts = splitParts || getEditableSplitParts(txtEl, cue.text || '', caretOverride);
+  const full = String(parts?.full ?? txtEl?.textContent ?? cue.text ?? '');
+  let caret = Number.isFinite(Number(parts?.caret))
+    ? Number(parts.caret)
+    : (Number.isFinite(Number(caretOverride)) ? Number(caretOverride) : full.length);
+  try{
+    if (!Number.isFinite(Number(parts?.caret)) && !Number.isFinite(Number(caretOverride)) && txtEl) caret = getSafeCaretOffset(txtEl, full.length);
+  }catch(_e){}
+  caret = Math.max(0, Math.min(Number(caret || 0), full.length));
+
+  const left = String(parts?.left ?? full.slice(0, caret)).trimEnd();
+  const right = String(parts?.right ?? full.slice(caret)).trimStart();
+  const f = getFPS();
+  const originalEnd = Math.max(Number(cue.end || 0), Number(cue.start || 0) + (1 / f));
+  let splitSec;
+  try{
+    splitSec = framesToSec(allowedTxtSplitFrame(cue, caret, full), f);
+  }catch(_e){
+    const startF = secToFrames(Number(cue.start || 0), f);
+    const endF = Math.max(startF + 2, secToFrames(originalEnd, f));
+    splitSec = framesToSec(Math.floor((startF + endF) / 2), f);
+  }
+  splitSec = Math.max(Number(cue.start || 0) + (1 / f), Math.min(originalEnd - (1 / f), Number(splitSec || 0)));
+
+  cue.text = left;
+  cue.end = splitSec;
+
+  const newCue = {
+    id: (typeof makeCueId === 'function' ? makeCueId() : undefined),
+    start: splitSec,
+    end: originalEnd,
+    text: right,
+    orig: { start: splitSec, end: originalEnd, text: right },
+    origIndex: null,
+    isNew: true,
+  };
+  if (newCue.end <= newCue.start) newCue.end = newCue.start + (1 / f);
+
+  const st = box?.scrollTop || 0;
+  list.splice(index + 1, 0, newCue);
+  activeOverlayTrack = track;
+  if (track === 'B') renderTranscriptB(box); else renderTranscript();
+  if (box) box.scrollTop = st;
+  try{ if (track === 'B') applyLockState('B'); }catch(_e){}
+
+  suppressAutoScrollUntil = nowMs() + 800;
+  holdManualSelection(index + 1, 2000);
+  try{
+    if (track === 'B') selectRowIn('B', index + 1, { scroll:false });
+    else selectRow(index + 1, { scroll:false });
+  }catch(_e){}
+
+  const targetBox = (track === 'B')
+    ? ((subsMode === 'B') ? transcriptEl : (document.getElementById('transcriptB') || transcriptEl))
+    : transcriptEl;
+  const newTxt = targetBox?.querySelector?.(`[data-index="${index + 1}"] .text`);
+  if (newTxt){
+    focusNoScroll(newTxt);
+    setCaretOffset(newTxt, 0);
+  }
+
+  try{ mediaPoolFinalizeTranscriptEdit?.(); }catch(_e){}
+  try{ notifyTxtCueEdit?.(index + 1, { structural:true, track }); }catch(_e){}
+  mediaPoolRefreshOverlayFromCurrentTime?.();
+  return true;
+}
+
+
 // SUBS mode: A / B / DUAL
 let subsMode = 'A'; // default
 
@@ -530,8 +613,9 @@ function renderTranscriptB(targetEl=null){
         // Snapshot original timing
         const origStart = entriesB[i].start;
         const origEnd   = entriesB[i].end;
-        const hasNext   = (i + 1) < entriesB.length;
-        const nextIn    = hasNext ? entriesB[i+1].start : origEnd;
+        // The new cue should inherit the right-hand portion of the current
+        // cue's original duration. Do not extend it to the next cue's IN,
+        // because gaps between cues should remain gaps.
 
         const f = getFPS();
         const startF = secToFrames(origStart, f);
@@ -549,9 +633,9 @@ function renderTranscriptB(targetEl=null){
         // 1) Rule: keep IN; set OUT to midpoint
         entriesB[i].end = midSec;
 
-        // 2) New cue: IN = midpoint; OUT = next line's IN (or original OUT if no next)
+        // 2) New cue: IN = midpoint; OUT = the original cue's OUT
         let newStart = midSec;
-        let newEnd   = hasNext ? nextIn : origEnd;
+        let newEnd   = origEnd;
         if (newEnd <= newStart) newEnd = newStart + (1 / f);
 
         const newCap = {
@@ -694,6 +778,62 @@ function setCaretOffset(el, offset){
   }
   walk(el);
 }
+
+function getSafeCaretOffset(el, fallback=null){
+  // More defensive than getCaretOffset(): it only reads a caret that is
+  // actually inside `el`. Context menus, buttons, and re-renders can steal the
+  // selection; in that case we fall back to the last remembered caret rather
+  // than silently splitting at the end and losing the right-hand text.
+  const textLen = String(el?.textContent || '').length;
+  const fb = Number.isFinite(Number(fallback)) ? Number(fallback) : textLen;
+  try{
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount && el && el.contains(sel.anchorNode)){
+      const range = sel.getRangeAt(0).cloneRange();
+      const pre = range.cloneRange();
+      pre.selectNodeContents(el);
+      pre.setEnd(range.startContainer, range.startOffset);
+      const off = pre.toString().length;
+      el.__lastCaretOffset = off;
+      return Math.max(0, Math.min(off, textLen));
+    }
+  }catch(_e){}
+  const remembered = Number(el?.__lastCaretOffset);
+  if (Number.isFinite(remembered)) return Math.max(0, Math.min(remembered, textLen));
+  return Math.max(0, Math.min(fb, textLen));
+}
+
+
+function getEditableSplitParts(el, fallbackText='', fallbackCaret=null){
+  // Return the exact text before/after the live browser caret inside a
+  // contenteditable cue. This is safer than slicing by a later caret value,
+  // because Enter/focus changes can disturb Selection before the split helper
+  // finishes. It also works when the cue text has nested DOM/text nodes.
+  const full = String(el?.textContent ?? fallbackText ?? '');
+  let caret = Number.isFinite(Number(fallbackCaret)) ? Number(fallbackCaret) : full.length;
+  try{
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount && el && (el.contains(sel.anchorNode) || el.contains(sel.focusNode))){
+      const range = sel.getRangeAt(0);
+      const before = document.createRange();
+      before.selectNodeContents(el);
+      before.setEnd(range.startContainer, range.startOffset);
+      const after = document.createRange();
+      after.selectNodeContents(el);
+      after.setStart(range.endContainer, range.endOffset);
+      const left = before.toString();
+      const right = after.toString();
+      caret = left.length;
+      el.__lastCaretOffset = caret;
+      return { full, left, right, caret };
+    }
+  }catch(_e){}
+  const remembered = Number(el?.__lastCaretOffset);
+  if (Number.isFinite(remembered)) caret = remembered;
+  caret = Math.max(0, Math.min(Number(caret || 0), full.length));
+  return { full, left: full.slice(0, caret), right: full.slice(caret), caret };
+}
+
 function insertPlainTextAtCursor(text){
   const sel = window.getSelection();
   if (!sel || sel.rangeCount === 0) return;
@@ -828,9 +968,19 @@ function selectRow(index, {scroll=true} = {}) {
 }
 
 
+function isTranscriptSurfaceVisible(el){
+  if (!el || !document.body.contains(el)) return false;
+  if (el.closest('[hidden]')) return false;
+  try{
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+  }catch(_e){}
+  return !!(el.offsetParent || el.getClientRects().length);
+}
+
 function flushEditsFromDOM() {
   const flushPanel = (panelEl, fallbackTrack='A') => {
-    if (!panelEl) return;
+    if (!panelEl || !isTranscriptSurfaceVisible(panelEl)) return;
     const track = normalizeStoryTrack(panelEl.dataset?.panel || fallbackTrack || 'A');
     const list = track === 'B' ? entriesB : entries;
     [...panelEl.children].forEach(row => {
@@ -935,8 +1085,9 @@ function renderTranscript(){
         // Snapshot original timing
         const origStart = entries[i].start;
         const origEnd   = entries[i].end;
-        const hasNext   = (i + 1) < entries.length;
-        const nextIn    = hasNext ? entries[i+1].start : origEnd;
+        // The new cue should inherit the right-hand portion of the current
+        // cue's original duration. Do not extend it to the next cue's IN,
+        // because gaps between cues should remain gaps.
 
         const f = getFPS();
         const startF = secToFrames(origStart, f);
@@ -954,9 +1105,9 @@ function renderTranscript(){
         // 1) Rule: keep IN; set OUT to midpoint
         entries[i].end = midSec;
 
-        // 2) New cue: IN = midpoint; OUT = next line's IN (or original OUT if no next)
+        // 2) New cue: IN = midpoint; OUT = the original cue's OUT
         let newStart = midSec;
-        let newEnd   = hasNext ? nextIn : origEnd;
+        let newEnd   = origEnd;
         if (newEnd <= newStart) newEnd = newStart + (1 / f);
 
         const newCap = {
@@ -2158,6 +2309,7 @@ let txtBoxBEl = null;
 let txtCtxMenu = null;
 let txtCtxIndex = -1;
 let txtCtxTrack = 'A';
+let txtCtxCaretOffset = null;
 let txtTimePopover = null;
 let __txtIdSeq = 1;
 
@@ -2184,7 +2336,16 @@ function getCueList(track='A'){
   return t === 'B' ? entriesB : entries;
 }
 function getCueIndexById(cueId, track='A'){
-  const list = getCueList(track);
+  // Source-aware when Story Mode temporarily resolves an inactive Media Pool asset.
+  // The normal getCueList() always points at the active transcript only; mini
+  // transcript edits need to resolve indexes against the card's own source.
+  let list = null;
+  try{
+    if (typeof __storyRelinkSourceKey !== 'undefined' && __storyRelinkSourceKey && typeof storyListForTrack === 'function'){
+      list = storyListForTrack(track);
+    }
+  }catch(_e){ list = null; }
+  if (!Array.isArray(list)) list = getCueList(track);
   return list.findIndex(e => String(e?.id || '') === String(cueId || ''));
 }
 function getTxtSingleTrack(){ return (subsMode === 'B') ? 'B' : 'A'; }
@@ -2339,6 +2500,7 @@ function renderTxtAfterStructure(track, focusIndex, caretOffset=0){
   renderTxtBySubsMode({ focusTrack:track, focusIndex, caretOffset });
 }
 function splitTxtCue(index, caretOffset, track='A'){
+  try{ syncTxtBoxToEntries?.(); }catch(_e){}
   track = normalizeTxtTrack(track);
   const list = getCueList(track);
   ensureCueIds(list);
@@ -2380,6 +2542,7 @@ function joinCueText(a, b){
   return left + ' ' + right;
 }
 function mergeTxtCueWithPrevious(index, track='A'){
+  try{ syncTxtBoxToEntries?.(); }catch(_e){}
   track = normalizeTxtTrack(track);
   const list = getCueList(track);
   ensureCueIds(list);
@@ -2394,6 +2557,7 @@ function mergeTxtCueWithPrevious(index, track='A'){
   notifyTxtCueEdit(index - 1, { structural:true, track });
 }
 function mergeTxtCueWithNext(index, track='A'){
+  try{ syncTxtBoxToEntries?.(); }catch(_e){}
   track = normalizeTxtTrack(track);
   const list = getCueList(track);
   ensureCueIds(list);
@@ -2408,6 +2572,7 @@ function mergeTxtCueWithNext(index, track='A'){
   notifyTxtCueEdit(index, { structural:true, track });
 }
 function pushTxtCueUp(index, track='A'){
+  try{ syncTxtBoxToEntries?.(); }catch(_e){}
   track = normalizeTxtTrack(track);
   const list = getCueList(track);
   if (index <= 0 || index >= list.length || isTrackLocked(track) || VIEW_ONLY_SESSION) return;
@@ -2418,6 +2583,7 @@ function pushTxtCueUp(index, track='A'){
   notifyTxtCueEdit(index - 1, { structural:true, track });
 }
 function pushTxtCueDown(index, track='A'){
+  try{ syncTxtBoxToEntries?.(); }catch(_e){}
   track = normalizeTxtTrack(track);
   const list = getCueList(track);
   if (index < 0 || index >= list.length - 1 || isTrackLocked(track) || VIEW_ONLY_SESSION) return;
@@ -2428,6 +2594,7 @@ function pushTxtCueDown(index, track='A'){
   notifyTxtCueEdit(index + 1, { structural:true, track });
 }
 function insertTxtCueAfter(index, text='', track='A'){
+  try{ syncTxtBoxToEntries?.(); }catch(_e){}
   // Allow context-menu legacy call shape insertTxtCueAfter(index) and direct calls.
   if (typeof text === 'string' && (text === 'A' || text === 'B')) { track = text; text = ''; }
   track = normalizeTxtTrack(track);
@@ -2449,6 +2616,7 @@ function insertTxtCueAfter(index, text='', track='A'){
   notifyTxtCueEdit(newIndex, { structural:true, track });
 }
 function deleteTxtCue(index, track='A'){
+  try{ syncTxtBoxToEntries?.(); }catch(_e){}
   track = normalizeTxtTrack(track);
   const list = getCueList(track);
   if (index < 0 || index >= list.length || isTrackLocked(track) || VIEW_ONLY_SESSION) return;
@@ -3300,7 +3468,11 @@ function ensureTxtContextMenu(){
   };
   addBtn('Split Cue at Caret', (idx, tr) => {
     const info = getTxtSelectionInfo();
-    splitTxtCue(idx, info.index === idx && info.track === tr ? info.caret : String(getCueList(tr)[idx]?.text || '').length, tr);
+    const captured = Number.isFinite(Number(txtCtxCaretOffset)) ? Number(txtCtxCaretOffset) : null;
+    const caret = captured != null
+      ? captured
+      : (info.index === idx && info.track === tr ? info.caret : String(getCueList(tr)[idx]?.text || '').length);
+    splitTxtCue(idx, caret, tr);
   });
   addBtn('Merge with Previous', mergeTxtCueWithPrevious);
   addBtn('Merge with Next', mergeTxtCueWithNext);
@@ -3323,11 +3495,18 @@ function showTxtContextMenu(ev, index, track='A'){
   ensureTxtContextMenu();
   txtCtxIndex = index;
   txtCtxTrack = track;
+  txtCtxCaretOffset = null;
+  try{
+    const line = ev.target?.closest?.('.txt-line');
+    if (line) txtCtxCaretOffset = getSafeCaretOffset(line, String(line?.textContent || '').length);
+  }catch(_e){}
   txtCtxMenu.style.left = (ev.pageX ?? ev.clientX + window.scrollX) + 'px';
   txtCtxMenu.style.top = (ev.pageY ?? ev.clientY + window.scrollY) + 'px';
   txtCtxMenu.style.display = 'block';
 }
 function hideTxtContextMenu(){
+  // Keep txtCtxCaretOffset until the context-menu action has used it.
+  // showTxtContextMenu() resets it for the next menu open.
   if (txtCtxMenu){ txtCtxMenu.style.display = 'none'; txtCtxIndex = -1; }
 }
 
@@ -3784,6 +3963,34 @@ function storyCueRange(cueRefs=[], track='A'){
   if (!cues.length) return null;
   return { start:Math.min(...cues.map(c => Number(c.start || 0))), end:Math.max(...cues.map(c => Number(c.end || 0))), cues };
 }
+
+function storySetCardCueRefs(card, refs, track){
+  if (!card) return [];
+  const clean = storyUniqueRefs((refs || []).map(x => String(x || '')).filter(Boolean));
+  const t = normalizeStoryTrack(track || card.track || 'A');
+  card.track = t;
+  card.cueRefs = [...clean];
+  // Keep every ref cache in lockstep.  renderStoryCard(), storyCardRange(),
+  // context-menu sends, Align-To-Audio / Translation / AI Assistant can read
+  // from sourceCueRefs or altCueRefs before cueRefs, so updating cueRefs alone
+  // leaves cards visually and functionally stale after Apply.
+  card.sourceCueRefs = [...clean];
+  card.altCueRefs = { A:[], B:[] };
+  card.altCueRefs[t] = [...clean];
+  const range = clean.length ? storyCueRange(clean, t) : null;
+  if (range){
+    card.start = Number(range.start);
+    card.end = Number(range.end);
+    card.source_in = Number(range.start);
+    card.source_out = Number(range.end);
+  }
+  card.bodyManual = false;
+  card.body = '';
+  card.relinkPending = false;
+  card.relinkStatus = clean.length ? 'linked' : 'no-match';
+  return clean;
+}
+
 // Link a generic card back to live cues by deriving cueRefs from cues that
 // overlap the card's current start/end. Used by:
 //   - The fade-in chip after Scenario B's auto-convert
@@ -3829,12 +4036,7 @@ function storyLinkCardToCuesInRange(row, card, opts={}){
   const newlySet = new Set(refs);
   const surviving = remembered.filter(r => newlySet.has(r)).length;
   card.kind = card.originalKind === 'clip' ? 'clip' : 'cue';
-  card.cueRefs = refs;
-  card.track = track;
-  card.bodyManual = false;
-  card.body = '';
-  card.relinkPending = false;
-  card.relinkStatus = 'linked';
+  refs = storySetCardCueRefs(card, refs, track);
   renderStoryAssembly();
   storyCommitSharedState(true);
   if (remembered.length){
@@ -5198,7 +5400,28 @@ function showStoryMode(){
   syncStoryTopSubControls();
   renderStoryAssembly();
 }
+
+function ensureStorySourceReadableStyle(){
+  if (document.getElementById('storySourceReadableStyle')) return;
+  const st = document.createElement('style');
+  st.id = 'storySourceReadableStyle';
+  st.textContent = `
+    #storyMode .story-card-source-row,
+    #storyMode .story-card-source-row label,
+    #storyMode .story-card-source-row select,
+    #storyMode .story-source-select{
+      color:#111827 !important;
+    }
+    #storyMode .story-source-select{
+      background:#ffffff !important;
+      border-color:rgba(17,24,39,.18) !important;
+    }
+  `;
+  document.head.appendChild(st);
+}
+
 function ensureStoryMode(){
+  try{ ensureStorySourceReadableStyle(); }catch(_e){}
   if (storyModeEl && document.body.contains(storyModeEl)) return storyModeEl;
   const parent = document.querySelector('.transcript-panel') || document.body;
   storyModeEl = document.createElement('div');
@@ -6232,7 +6455,7 @@ function storyRenderMiniTranscript(row, card){
         <div class="story-mini-head"><span>Mini Transcript · Track ${escapeHtml(track)}</span><button class="btn btn-gold btn-mini" data-story-action="done-mini-transcript" type="button">Done</button></div>
         <div class="story-mini-list">
           ${cues.map((cue, i) => {
-            const idx = getCueIndexById(cue.id, track);
+            const idx = storyRunWithSourceKey(sourceKey, () => getCueIndexById(cue.id, track));
             return `<div class="story-mini-cue" data-cue-id="${escapeStoryAttr(cue.id)}" data-cue-index="${idx}" data-track="${escapeStoryAttr(track)}" data-source-key="${escapeStoryAttr(sourceKey)}">
               <button class="story-mini-time" data-story-action="edit-mini-time" title="Click to edit cue In / Out" type="button">${fmtTC(cue.start)} → ${fmtTC(cue.end)}</button>
               <div class="story-mini-text" style="${escapeStoryAttr(storyCardBodyInlineStyle(card))}" contenteditable="${VIEW_ONLY_SESSION ? 'false' : 'true'}" tabindex="0" spellcheck="false">${escapeHtml(cue.text || '')}</div>
@@ -6980,25 +7203,25 @@ function showStoryCardTimePopover(ev, rowId, cardId){
         alert('No transcript cues fall within the new range.\n\nAdjust In / Out so at least one cue overlaps.');
         return;
       }
-      liveCard.start = Math.max(0, s2);
-      liveCard.end = Math.max(liveCard.start + (1 / f), e2);
       liveCard.kind = liveCard.originalKind === 'clip' ? 'clip' : 'cue';
-      liveCard.cueRefs = r.refs.slice();
-      liveCard.track = r.track;
-      liveCard.bodyManual = false;
-      liveCard.body = '';
-      liveCard.relinkPending = false;
-      liveCard.relinkStatus = 'linked';
+      const cleanRefs = storySetCardCueRefs(liveCard, r.refs, r.track);
+      // Preserve the user's requested range too.  The rendered cue-card range
+      // is derived from linked cue boundaries, but these fields are useful for
+      // source-aware exports and fallback playback.
+      liveCard.requested_start = Math.max(0, s2);
+      liveCard.requested_end = Math.max(liveCard.requested_start + (1 / f), e2);
       hideStoryCardTimePopover();
       renderStoryAssembly();
       storyCommitSharedState(true);
       seekMediaTo(Math.max(0, liveCard.start) + 0.001, { play:false });
-      setStatusSafe?.(`Card re-linked to ${r.refs.length} cue${r.refs.length === 1 ? '' : 's'} on Track ${r.track}.`);
+      setStatusSafe?.(`Card re-linked to ${cleanRefs.length} cue${cleanRefs.length === 1 ? '' : 's'} on Track ${r.track}.`);
       return;
     }
     // Generic / caption commit directly.
     liveCard.start = Math.max(0, s2);
     liveCard.end = Math.max(liveCard.start + (1 / f), e2);
+    liveCard.source_in = liveCard.start;
+    liveCard.source_out = liveCard.end;
     hideStoryCardTimePopover();
     renderStoryAssembly();
     storyCommitSharedState(true);
@@ -8700,7 +8923,7 @@ function onStoryKeydown(ev){
     ctx = storyMiniResolveCtx(ctx);
     if (!ctx || isTrackLocked(ctx.track) || VIEW_ONLY_SESSION) return;
     ev.preventDefault();
-    storyMiniRunWithSource(ctx, () => storyMiniSplitCue(ctx, getCaretOffset(miniText)));
+    storyMiniRunWithSource(ctx, () => storyMiniSplitCue(ctx, getSafeCaretOffset(miniText, String(miniText?.textContent || '').length)));
   }
 }
 
@@ -8961,7 +9184,9 @@ function storyMiniFindContextFromNode(node){
   const sourceKey = String(cueEl.dataset.sourceKey || cueEl.closest('.story-mini-transcript')?.dataset?.sourceKey || storyMiniSourceKeyForCard(card) || '');
   const index = storyRunWithSourceKey(sourceKey, () => getCueIndexById(cueId, track));
   const textEl = cueEl.querySelector('.story-mini-text');
-  return { row, card, rowId:row?.id || rowEl.dataset.rowId, cardId:card?.id || cardEl.dataset.cardId, cueEl, cardEl, textEl, cueId, track, index, sourceKey };
+  let caretOffset = null;
+  try{ if (textEl && document.activeElement === textEl) caretOffset = getCaretOffset(textEl); }catch(_e){}
+  return { row, card, rowId:row?.id || rowEl.dataset.rowId, cardId:card?.id || cardEl.dataset.cardId, cueEl, cardEl, textEl, cueId, track, index, sourceKey, caretOffset };
 }
 function storyMiniResolveCtx(ctx){
   if (!ctx) return null;
@@ -8970,6 +9195,7 @@ function storyMiniResolveCtx(ctx){
   const cueId = String(ctx.cueId || '');
   let index = Number(ctx.index ?? -1);
   try{ index = storyRunWithSourceKey(sourceKey, () => getCueIndexById(cueId, track)); }catch(_e){}
+  let caretOffset = Number.isFinite(Number(ctx.caretOffset)) ? Number(ctx.caretOffset) : null;
 
   // After split/merge/delete, the old DOM node can be stale.  Re-acquire the
   // current mini row by cue id so the next operation always targets the live cue.
@@ -8984,7 +9210,10 @@ function storyMiniResolveCtx(ctx){
       textEl = liveCueEl.querySelector('.story-mini-text') || textEl;
     }
   }catch(_e){}
-  return { ...ctx, sourceKey, track, cueId, index, cueEl, textEl };
+  if (caretOffset == null && textEl && document.activeElement === textEl){
+    try{ caretOffset = getCaretOffset(textEl); }catch(_e){ caretOffset = null; }
+  }
+  return { ...ctx, sourceKey, track, cueId, index, cueEl, textEl, caretOffset };
 }
 function storyMiniCommitVisibleText(ctx){
   if (!ctx) return;
@@ -9025,28 +9254,41 @@ function storyUniqueRefs(refs){
   const out=[]; (refs || []).forEach(id => { if (id && !out.includes(id)) out.push(id); }); return out;
 }
 function storyReplaceCueRefsEverywhere(oldIds, replacementId=''){
-  const oldSet = new Set(Array.isArray(oldIds) ? oldIds : [oldIds]);
-  storyRows.forEach(row => (row.cards || []).forEach(card => {
-    ['cueRefs','sourceCueRefs'].forEach(key => {
-      if (!Array.isArray(card[key])) return;
-      const next=[];
-      card[key].forEach(id => {
-        if (oldSet.has(id)) { if (replacementId) next.push(replacementId); }
-        else next.push(id);
-      });
-      card[key] = storyUniqueRefs(next);
+  const oldSet = new Set((Array.isArray(oldIds) ? oldIds : [oldIds]).map(x => String(x || '')).filter(Boolean));
+  const replaceList = (arr) => {
+    if (!Array.isArray(arr)) return arr;
+    const next=[];
+    arr.forEach(id => {
+      const sid = String(id || '');
+      if (oldSet.has(sid)) { if (replacementId) next.push(String(replacementId)); }
+      else if (sid) next.push(sid);
     });
+    return storyUniqueRefs(next);
+  };
+  storyRows.forEach(row => (row.cards || []).forEach(card => {
+    card.cueRefs = replaceList(card.cueRefs) || [];
+    card.sourceCueRefs = replaceList(card.sourceCueRefs) || [];
+    if (card.altCueRefs && typeof card.altCueRefs === 'object'){
+      ['A','B'].forEach(t => {
+        if (Array.isArray(card.altCueRefs[t])) card.altCueRefs[t] = replaceList(card.altCueRefs[t]) || [];
+      });
+    }
   }));
 }
-function storyMiniInsertCueRefAfter(card, afterCueId, newCueId){
+function storyMiniInsertCueRefAfter(card, afterCueId, newCueId, track='A'){
   if (!card || !newCueId) return;
-  ['cueRefs','sourceCueRefs'].forEach(key => {
-    const refs = Array.isArray(card[key]) ? [...card[key]] : [];
+  const insertInto = (arr) => {
+    const refs = Array.isArray(arr) ? [...arr] : [];
     const ix = refs.indexOf(afterCueId);
     if (ix >= 0) refs.splice(ix + 1, 0, newCueId);
     else refs.push(newCueId);
-    card[key] = storyUniqueRefs(refs);
-  });
+    return storyUniqueRefs(refs);
+  };
+  card.cueRefs = insertInto(card.cueRefs);
+  card.sourceCueRefs = insertInto(card.sourceCueRefs);
+  const t = normalizeStoryTrack(track || card.track || 'A');
+  if (!card.altCueRefs || typeof card.altCueRefs !== 'object') card.altCueRefs = { A:[], B:[] };
+  card.altCueRefs[t] = insertInto(card.altCueRefs[t] && card.altCueRefs[t].length ? card.altCueRefs[t] : card.cueRefs);
 }
 function storyMiniRenderAfter(ctx, focusCueId='', caretOffset=0){
   if (ctx?.card){ ctx.card.bodyManual = false; ctx.card.body = ''; ctx.card.editMode = true; }
@@ -9106,6 +9348,13 @@ function ensureStoryMiniContextMenu(){
 function showStoryMiniContextMenu(ev, ctx){
   if (!ctx || isTrackLocked(ctx.track) || VIEW_ONLY_SESSION) return;
   ctx.sourceKey = ctx.sourceKey || storyMiniSourceKeyForCard(ctx.card) || '';
+  // Capture the caret at right-click time.  By the time the user clicks the
+  // context-menu button, browser focus/selection may already be on the menu,
+  // causing split-at-caret to split at 0 or at a stale position.
+  try{
+    const textEl = ev.target?.closest?.('.story-mini-text') || ctx.textEl;
+    if (textEl) ctx.caretOffset = getSafeCaretOffset(textEl, String(textEl?.textContent || '').length);
+  }catch(_e){}
   storyMiniCtxTarget = ctx;
   const menu = ensureStoryMiniContextMenu();
   menu.style.left = (ev.pageX ?? ev.clientX + window.scrollX) + 'px';
@@ -9125,14 +9374,14 @@ function storyMiniPrepareTxn(ctx){
   if (!ctx || isTrackLocked(ctx.track) || VIEW_ONLY_SESSION) return null;
   storyMiniCommitVisibleText(ctx);
   ctx = storyMiniResolveCtx(ctx);
-  const list = storyMiniRunWithSource(ctx, () => { const l = getCueList(ctx.track); ensureCueIds(l); return l; });
+  const list = storyMiniRunWithSource(ctx, () => { const l = storyListForTrack(ctx.track); ensureCueIds(l); return l; });
   const index = storyMiniRunWithSource(ctx, () => getCueIndexById(ctx.cueId, ctx.track));
   if (!Array.isArray(list) || index < 0 || index >= list.length) return null;
   return { ...ctx, list, index, cue:list[index] };
 }
 function storyMiniFinishTxn(ctx, focusCueId='', caretOffset=0){
   if (!ctx) return;
-  storyMiniRunWithSource(ctx, () => { ensureCueIds(getCueList(ctx.track)); });
+  storyMiniRunWithSource(ctx, () => { ensureCueIds(storyListForTrack(ctx.track)); });
   storyMiniRenderAfter(ctx, focusCueId || ctx.cueId || '', caretOffset || 0);
   try{ renderBySubsMode?.(); updateTxtBox?.(); }catch(_e){}
 }
@@ -9141,7 +9390,9 @@ function storyMiniSplitCue(ctx, caretOffset=null){
   if (!tx) return;
   const cue = tx.cue;
   const full = String(tx.textEl?.textContent ?? cue.text ?? '');
-  const caret = Math.max(0, Math.min(caretOffset == null ? getCaretOffset(tx.textEl) : Number(caretOffset), full.length));
+  const savedCaret = Number.isFinite(Number(tx.caretOffset)) ? Number(tx.caretOffset) : null;
+  const rawCaret = caretOffset == null ? (savedCaret == null ? getSafeCaretOffset(tx.textEl, String(tx.textEl?.textContent ?? cue.text ?? '').length) : savedCaret) : Number(caretOffset);
+  const caret = Math.max(0, Math.min(rawCaret, full.length));
   const left = full.slice(0, caret).trimEnd();
   const right = full.slice(caret).trimStart();
   const f = getFPS();
@@ -9152,7 +9403,7 @@ function storyMiniSplitCue(ctx, caretOffset=null){
   cue.end = splitSec;
   const newCue = { id:makeCueId(), start:splitSec, end:originalEnd, text:right, orig:{start:splitSec,end:originalEnd,text:right}, origIndex:null, isNew:true };
   tx.list.splice(tx.index + 1, 0, newCue);
-  storyMiniInsertCueRefAfter(tx.card, cue.id, newCue.id);
+  storyMiniInsertCueRefAfter(tx.card, cue.id, newCue.id, tx.track);
   storyMiniFinishTxn(tx, newCue.id, 0);
 }
 function storyMiniMergeWithPrevious(ctx){
@@ -9206,7 +9457,7 @@ function storyMiniAddBlankBelow(ctx){
   if (next && end >= next.start) end = Math.max(start + (1 / f), Number(next.start || start) - (1 / f));
   const newCue = { id:makeCueId(), start, end, text:'', orig:{start,end,text:''}, origIndex:null, isNew:true };
   tx.list.splice(tx.index + 1, 0, newCue);
-  storyMiniInsertCueRefAfter(tx.card, here?.id || tx.cueId, newCue.id);
+  storyMiniInsertCueRefAfter(tx.card, here?.id || tx.cueId, newCue.id, tx.track);
   storyMiniFinishTxn(tx, newCue.id, 0);
 }
 function storyMiniDeleteCue(ctx){
@@ -12699,10 +12950,19 @@ function mediaPoolRefreshOverlayFromCurrentTime(){
 }
 
 function mediaPoolSyncVisibleTranscriptEditors(){
-  // TXT / Transcript Mode uses .txt-line editors, while Subtitle Mode uses .text rows.
-  // Flush both, so clicking outside a cue immediately updates entries/entriesB.
-  try{ syncTxtBoxToEntries?.(); }catch(_e){}
-  try{ flushEditsFromDOM?.(); }catch(_e){}
+  // Only commit the editor surface that is actually visible.
+  // Previous builds flushed hidden Subtitle rows after TXT/Transcript edits,
+  // which could overwrite the just-edited entries with stale pre-edit text.
+  try{
+    if (isTxtMode || getTxtVisibleBoxes?.().length){
+      syncTxtBoxToEntries?.();
+    }
+  }catch(_e){}
+  try{
+    if (!isTxtMode){
+      flushEditsFromDOM?.();
+    }
+  }catch(_e){}
 }
 
 function mediaPoolLoadAssetStates(){
