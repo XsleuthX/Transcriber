@@ -352,8 +352,6 @@ function setDualMode(on){
 }
 
 
-let __subtitleSplitSuppressFinalizeUntil = 0;
-
 // Robust Subtitle Mode split helper used by Enter in the cue editor.
 // This mirrors Transcript Mode's Split Cue at Caret logic: the text after the
 // caret always becomes the newly-created cue, and the new cue ends at the
@@ -410,7 +408,16 @@ function splitSubtitleCueAtCaret(index, track='A', textEl=null, containerEl=null
   const st = box?.scrollTop || 0;
   list.splice(index + 1, 0, newCue);
   activeOverlayTrack = track;
-  if (track === 'B') renderTranscriptB(box); else renderTranscript();
+  // Set the guard BEFORE renderTranscript so that the blur event fired by
+  // innerHTML='' (which triggers flushEditsFromDOM via the capture-phase blur
+  // listener) does not read stale OLD DOM rows back into the model — which
+  // would overwrite the correctly-split entries with the pre-split text.
+  window.__subtitleStructuralEditInProgress = true;
+  try {
+    if (track === 'B') renderTranscriptB(box); else renderTranscript();
+  } finally {
+    window.__subtitleStructuralEditInProgress = false;
+  }
   if (box) box.scrollTop = st;
   try{ if (track === 'B') applyLockState('B'); }catch(_e){}
 
@@ -425,20 +432,12 @@ function splitSubtitleCueAtCaret(index, track='A', textEl=null, containerEl=null
     ? ((subsMode === 'B') ? transcriptEl : (document.getElementById('transcriptB') || transcriptEl))
     : transcriptEl;
   const newTxt = targetBox?.querySelector?.(`[data-index="${index + 1}"] .text`);
+  if (newTxt){
+    focusNoScroll(newTxt);
+    setCaretOffset(newTxt, 0);
+  }
 
-  // Re-rendering removes the focused old row, which can fire blur-level autosave
-  // while the split is only half-finished. Suppress that stale finalize briefly,
-  // then save/focus after the browser has settled on the newly rendered rows.
-  __subtitleSplitSuppressFinalizeUntil = Date.now() + 180;
-  setTimeout(() => {
-    __subtitleSplitSuppressFinalizeUntil = 0;
-    try{ mediaPoolFinalizeTranscriptEdit?.(); }catch(_e){}
-    if (newTxt && document.body.contains(newTxt)){
-      focusNoScroll(newTxt);
-      setCaretOffset(newTxt, 0);
-    }
-  }, 0);
-
+  try{ mediaPoolFinalizeTranscriptEdit?.(); }catch(_e){}
   try{ notifyTxtCueEdit?.(index + 1, { structural:true, track }); }catch(_e){}
   mediaPoolRefreshOverlayFromCurrentTime?.();
   return true;
@@ -539,6 +538,8 @@ function renderTranscriptB(targetEl=null){
   const bEl = targetEl || ((subsMode==='B') ? transcriptEl : document.getElementById('transcriptB'));
   if (!bEl) return;
   const st = bEl.scrollTop; // keep scroll
+  const wasGuarded = window.__subtitleStructuralEditInProgress;
+  window.__subtitleStructuralEditInProgress = true;
   bEl.innerHTML=''; 
 
   const f = getFPS();
@@ -593,12 +594,10 @@ function renderTranscriptB(targetEl=null){
       selectRowIn('B', i, { scroll: false });
       sendCollabActiveCue('B', i);
       if (!isCueRemoteLocked('B', i)) sendCollabCueLock('B', i);
-      try{ sendCollabCaret('B', i, rememberEditableCaret(textEl)); }catch(_e){}
+      try{ sendCollabCaret('B', i, getCaretOffset(textEl)); }catch(_e){}
     });
     textEl.addEventListener('blur', () => { sendCollabCueUnlock('B', i); });
-    textEl.addEventListener('mouseup', () => { rememberEditableCaret(textEl); });
-    textEl.addEventListener('pointerup', () => { rememberEditableCaret(textEl); });
-    textEl.addEventListener('keyup', () => { try{ sendCollabCaret('B', i, rememberEditableCaret(textEl)); }catch(_e){} });
+    textEl.addEventListener('keyup', () => { try{ sendCollabCaret('B', i, getCaretOffset(textEl)); }catch(_e){} });
 
 
     // --- 1) Force paste as plain text (strip source formatting) ---
@@ -613,14 +612,17 @@ function renderTranscriptB(targetEl=null){
 
 
     // --- 2) Enter to split caption at caret ---
-    textEl.addEventListener('beforeinput', (ev) => {
-      if (ev.inputType === 'insertParagraph'){
-        handleSubtitleEnterSplit(ev, i, 'B', textEl, bEl, getBeforeInputRange(ev));
-      }
-    });
     textEl.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter' && !ev.shiftKey && !shouldUseBeforeInputForEnterSplit()){
-        handleSubtitleEnterSplit(ev, i, 'B', textEl, bEl);
+      if (ev.key === 'Enter' && !ev.shiftKey){
+        if (locked) return;
+        // Capture the split parts NOW, before preventDefault or any DOM
+        // mutation. Some browsers clear / shift the Selection when Enter is
+        // suppressed, so reading the caret after preventDefault returns 0
+        // and the right-hand text ends up empty (or the next cue's text
+        // bleeds in because the slice is taken from position 0).
+        const parts = getEditableSplitParts(textEl, entriesB[i]?.text || '');
+        ev.preventDefault();
+        splitSubtitleCueAtCaret(i, 'B', textEl, bEl, null, parts);
       }
     });
     textEl.addEventListener('blur', clearManualSelection);
@@ -678,8 +680,9 @@ function renderTranscriptB(targetEl=null){
     attachDragToPill(outPill, i, false, durFrames);
   });
 
-  bEl.scrollTop = st; // restore 
+  bEl.scrollTop = st; // restore
   try{ applyCollabCueAwareness(); }catch(_e){}
+  window.__subtitleStructuralEditInProgress = wasGuarded;
 
   // Live-connect Story Cards (track-B mutations). Digest-gated; cheap.
   try{ scheduleStoryReconcile?.(); }catch(_e){}
@@ -703,29 +706,13 @@ const framesToSec = (fr, f=getFPS()) => Math.max(0, fr / f);
 
 /* ---------- Selection & caret helpers (for contentEditable) ---------- */
 function getCaretOffset(el){
-  const textLen = String(el?.textContent || '').length;
   const sel = window.getSelection();
-  if (!sel || sel.rangeCount === 0 || !el || !el.contains(sel.anchorNode)) return Number.isFinite(Number(el?.__lastCaretOffset)) ? Math.max(0, Math.min(Number(el.__lastCaretOffset), textLen)) : 0;
+  if (!sel || sel.rangeCount === 0) return 0;
   const range = sel.getRangeAt(0);
   const preRange = range.cloneRange();
   preRange.selectNodeContents(el);
   preRange.setEnd(range.endContainer, range.endOffset);
-  const off = Math.max(0, Math.min(preRange.toString().length, textLen));
-  el.__lastCaretOffset = off;
-  return off;
-}
-function rememberEditableCaret(el, fallback=null){
-  if (!el) return 0;
-  const textLen = String(el.textContent || '').length;
-  const fb = Number.isFinite(Number(fallback)) ? Number(fallback) : (Number.isFinite(Number(el.__lastCaretOffset)) ? Number(el.__lastCaretOffset) : textLen);
-  const off = getSafeCaretOffset(el, fb);
-  el.__lastCaretOffset = Math.max(0, Math.min(Number(off || 0), textLen));
-  return el.__lastCaretOffset;
-}
-function getCueIndexFromTextElement(textEl, fallbackIndex=0){
-  const raw = textEl?.closest?.('[data-index]')?.dataset?.index;
-  const idx = Number(raw);
-  return Number.isFinite(idx) ? idx : Number(fallbackIndex || 0);
+  return preRange.toString().length;
 }
 function setCaretOffset(el, offset){
   const range = document.createRange();
@@ -807,53 +794,6 @@ function getEditableSplitParts(el, fallbackText='', fallbackCaret=null){
   if (Number.isFinite(remembered)) caret = remembered;
   caret = Math.max(0, Math.min(Number(caret || 0), full.length));
   return { full, left: full.slice(0, caret), right: full.slice(caret), caret };
-}
-function getEditableSplitPartsFromRange(el, sourceRange=null, fallbackText='', fallbackCaret=null){
-  const full = String(el?.textContent ?? fallbackText ?? '');
-  if (el && sourceRange){
-    try{
-      const startContainer = sourceRange.startContainer;
-      const endContainer = sourceRange.endContainer;
-      if (el.contains(startContainer) && el.contains(endContainer)){
-        const before = document.createRange();
-        before.selectNodeContents(el);
-        before.setEnd(startContainer, sourceRange.startOffset);
-        const after = document.createRange();
-        after.selectNodeContents(el);
-        after.setStart(endContainer, sourceRange.endOffset);
-        const left = before.toString();
-        const right = after.toString();
-        const caret = Math.max(0, Math.min(left.length, full.length));
-        el.__lastCaretOffset = caret;
-        return { full, left, right, caret };
-      }
-    }catch(_e){}
-  }
-  return getEditableSplitParts(el, fallbackText, fallbackCaret);
-}
-function getBeforeInputRange(ev){
-  try{
-    const ranges = typeof ev.getTargetRanges === 'function' ? ev.getTargetRanges() : null;
-    return ranges && ranges.length ? ranges[0] : null;
-  }catch(_e){ return null; }
-}
-function handleSubtitleEnterSplit(ev, fallbackIndex, track, textEl, box, sourceRange=null){
-  if (ev?.__subtitleSplitHandled) return true;
-  if (isTrackLocked(track) || VIEW_ONLY_SESSION) return false;
-  ev?.preventDefault?.();
-  ev?.stopImmediatePropagation?.();
-  if (ev) ev.__subtitleSplitHandled = true;
-
-  const list = track === 'B' ? entriesB : entries;
-  const rowIndex = getCueIndexFromTextElement(textEl, fallbackIndex);
-  const fallbackCaret = Number.isFinite(Number(textEl?.__lastCaretOffset))
-    ? Number(textEl.__lastCaretOffset)
-    : Math.min(String(textEl?.textContent || list[rowIndex]?.text || '').length, getCaretOffset(textEl));
-  const parts = getEditableSplitPartsFromRange(textEl, sourceRange, textEl?.textContent || list[rowIndex]?.text || '', fallbackCaret);
-  return splitSubtitleCueAtCaret(rowIndex, track, textEl, box, parts.caret, parts);
-}
-function shouldUseBeforeInputForEnterSplit(){
-  return typeof InputEvent !== 'undefined' && typeof InputEvent.prototype?.getTargetRanges === 'function';
 }
 
 function insertPlainTextAtCursor(text){
@@ -1001,6 +941,15 @@ function isTranscriptSurfaceVisible(el){
 }
 
 function flushEditsFromDOM() {
+  // Skip if we're in the middle of a structural cue operation (split/merge).
+  // The sequence is: model mutated → renderTranscript() → innerHTML='' fires
+  // blur → capture-phase blur listener → mediaPoolFinalizeTranscriptEdit →
+  // this function. At that moment the OLD DOM rows may still be partially
+  // present with stale text. Reading them back into the model overwrites the
+  // correct post-split data with the pre-split text (manifests as "new cue
+  // got the next cue's text"). The flag is set in splitSubtitleCueAtCaret and
+  // any other structural operation that calls renderTranscript mid-mutation.
+  if (window.__subtitleStructuralEditInProgress) return;
   const flushPanel = (panelEl, fallbackTrack='A') => {
     if (!panelEl || !isTranscriptSurfaceVisible(panelEl)) return;
     const track = normalizeStoryTrack(panelEl.dataset?.panel || fallbackTrack || 'A');
@@ -1023,6 +972,15 @@ function flushEditsFromDOM() {
 /* ---------- Render transcript ---------- */
 function renderTranscript(){
   const st = transcriptEl.scrollTop; // keep scroll
+  // Guard against the blur event (fired when innerHTML='' removes the
+  // focused element) triggering flushEditsFromDOM via the autosave capture
+  // listener. flushEditsFromDOM would read stale OLD DOM rows back into the
+  // model while the model already has the correct post-structural-edit data,
+  // overwriting entries with the wrong text. The flag is also set in
+  // splitSubtitleCueAtCaret but we set it here too so ALL paths through
+  // renderTranscript are covered (context menu delete, drag reorder, etc.).
+  const wasGuarded = window.__subtitleStructuralEditInProgress;
+  window.__subtitleStructuralEditInProgress = true;
   transcriptEl.innerHTML='';
 
   const f = getFPS();
@@ -1077,12 +1035,10 @@ function renderTranscript(){
       selectRow(i, { scroll: false });
       sendCollabActiveCue('A', i);
       if (!isCueRemoteLocked('A', i)) sendCollabCueLock('A', i);
-      try{ sendCollabCaret('A', i, rememberEditableCaret(textEl)); }catch(_e){}
+      try{ sendCollabCaret('A', i, getCaretOffset(textEl)); }catch(_e){}
     });
     textEl.addEventListener('blur', () => { sendCollabCueUnlock('A', i); });
-    textEl.addEventListener('mouseup', () => { rememberEditableCaret(textEl); });
-    textEl.addEventListener('pointerup', () => { rememberEditableCaret(textEl); });
-    textEl.addEventListener('keyup', () => { try{ sendCollabCaret('A', i, rememberEditableCaret(textEl)); }catch(_e){} });
+    textEl.addEventListener('keyup', () => { try{ sendCollabCaret('A', i, getCaretOffset(textEl)); }catch(_e){} });
 
 
     // --- 1) Force paste as plain text (strip source formatting) ---
@@ -1097,14 +1053,13 @@ function renderTranscript(){
 
 
     // --- 2) Enter to split caption at caret ---
-    textEl.addEventListener('beforeinput', (ev) => {
-      if (ev.inputType === 'insertParagraph'){
-        handleSubtitleEnterSplit(ev, i, 'A', textEl, transcriptEl, getBeforeInputRange(ev));
-      }
-    });
     textEl.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter' && !ev.shiftKey && !shouldUseBeforeInputForEnterSplit()){
-        handleSubtitleEnterSplit(ev, i, 'A', textEl, transcriptEl);
+      if (ev.key === 'Enter' && !ev.shiftKey){
+        if (locked) return;
+        // Capture split parts before preventDefault — see Track B comment above.
+        const parts = getEditableSplitParts(textEl, entries[i]?.text || '');
+        ev.preventDefault();
+        splitSubtitleCueAtCaret(i, 'A', textEl, transcriptEl, null, parts);
       }
     });
     textEl.addEventListener('blur', clearManualSelection);
@@ -1164,6 +1119,8 @@ function renderTranscript(){
 
   transcriptEl.scrollTop = st; // restore
   try{ applyCollabCueAwareness(); }catch(_e){}
+  // DOM is fully rebuilt — safe to let flushEditsFromDOM run again.
+  window.__subtitleStructuralEditInProgress = wasGuarded;
 
   if (isTxtMode) { try { updateTxtBox(); } catch {} }
 
@@ -2412,8 +2369,12 @@ function setTxtCueFocus(index, caretOffset=0, track='A'){
   const row = box?.querySelector?.(`.txt-cue[data-index="${index}"][data-track="${normalizeTxtTrack(track)}"]`) || box?.querySelector?.(`.txt-cue[data-index="${index}"]`);
   const line = row?.querySelector('.txt-line');
   if (!line) return;
-  const boxForFocus = getTxtBoxForTrack(track) || line.closest('.txt-script-editor');
-  focusNoScroll(boxForFocus || line);
+  // Focus the line element directly (not the box container) so that
+  // setCaretOffset can place the selection inside the focused element.
+  // Focusing the parent box and then calling setCaretOffset on a child
+  // line causes the caret to land at position 0 in some browsers,
+  // which is why Backspace-merge would leave the caret at the wrong spot.
+  focusNoScroll(line);
   try{ setCaretOffset(line, Math.max(0, Math.min(Number(caretOffset||0), (line.textContent || '').length))); }catch(_e){}
 }
 function notifyTxtCueEdit(index, { structural=false, track='A' } = {}){
@@ -3122,37 +3083,31 @@ function renderTxtCueRows(track='A', box, { focusIndex=null, focusCueId=null, ca
 
       if ((ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) || ev.key === 'F4'){
         ev.preventDefault();
-        ev.__txtHandled = true;
         seekTxtLineToCue({ play:false });
         return;
       }
       if (ev.key === 'Enter' && !ev.shiftKey){
         ev.preventDefault();
-        ev.__txtHandled = true;
         splitTxtCue(i, caret, track);
         return;
       }
       if (ev.key === 'Backspace' && collapsed && caret <= 0){
         ev.preventDefault();
-        ev.__txtHandled = true;
         mergeTxtCueWithPrevious(i, track);
         return;
       }
       if (ev.key === 'Delete' && collapsed && caret >= full.length){
         ev.preventDefault();
-        ev.__txtHandled = true;
         mergeTxtCueWithNext(i, track);
         return;
       }
       if (ev.altKey && ev.key === 'ArrowUp'){
         ev.preventDefault();
-        ev.__txtHandled = true;
         pushTxtCueUp(i, track);
         return;
       }
       if (ev.altKey && ev.key === 'ArrowDown'){
         ev.preventDefault();
-        ev.__txtHandled = true;
         pushTxtCueDown(i, track);
         return;
       }
@@ -13105,7 +13060,6 @@ function mediaPoolMarkTranscriptDirty(){
 }
 function mediaPoolFinalizeTranscriptEdit(){
   if (__mediaPoolApplyingTranscript) return;
-  if (Date.now() < __subtitleSplitSuppressFinalizeUntil) return;
   mediaPoolSyncVisibleTranscriptEditors();
   clearTimeout(__mediaPoolTranscriptSaveTimer);
 
